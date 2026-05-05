@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.6-2026-05-05-cron-bg"
+APP_VERSION = "v6.4.7-2026-05-05-novo-ordem"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1549,7 +1549,7 @@ def api_listar():
     where_sql = " AND ".join(where_parts)
     sql = f"""SELECT * FROM oportunidades
               WHERE {where_sql}
-              ORDER BY tier ASC, relevancia DESC, data_coleta DESC
+              ORDER BY tier ASC, data_coleta DESC, relevancia DESC
               LIMIT ?"""
     params.append(limite)
 
@@ -1569,6 +1569,34 @@ def api_listar():
                 d = _dict_from_row(c)
                 notas_count[d["oportunidade_id"]] = d["c"]
 
+        # Pega data da ULTIMA execucao de cron por tipo - usado pra marcar itens "novos"
+        # Estrategia: para cada tipo_run (manual/tier1/tier23), pega o data_execucao da ULTIMA
+        # execucao bem-sucedida. Itens cuja data_coleta seja >= esse valor sao "novos".
+        ultima_exec_por_tipo = {}
+        try:
+            execs = conn.execute(
+                "SELECT tipo_run, MAX(data_execucao) AS ult FROM execucoes_cron "
+                "WHERE sucesso = 1 GROUP BY tipo_run"
+            ).fetchall()
+            for e in execs:
+                d = _dict_from_row(e)
+                if d.get("tipo_run") and d.get("ult"):
+                    ultima_exec_por_tipo[d["tipo_run"]] = d["ult"]
+        except Exception:
+            pass
+
+    # Marcador de "novo": item e novo se foi coletado na ultima execucao
+    # Estrategia simples: para cada tier, pega o cutoff da ultima execucao que cobre
+    # esse tier (manual cobre tudo; tier1 cobre Tier 1; tier23 cobre Tier 2+3).
+    cutoff_tier1 = max(
+        ultima_exec_por_tipo.get("tier1", ""),
+        ultima_exec_por_tipo.get("manual", ""),
+    )
+    cutoff_tier23 = max(
+        ultima_exec_por_tipo.get("tier23", ""),
+        ultima_exec_por_tipo.get("manual", ""),
+    )
+
     itens = []
     for r in rows:
         d = _dict_from_row(r)
@@ -1587,6 +1615,12 @@ def api_listar():
         else:
             d["metricas"] = None
         d["notas_count"] = notas_count.get(d["id"], 0)
+
+        # Marcador eh_novo: comparar data_coleta com cutoff da ultima execucao do tier
+        cutoff_aplicavel = cutoff_tier1 if d.get("tier") == 1 else cutoff_tier23
+        data_col = d.get("data_coleta", "")
+        d["eh_novo"] = bool(cutoff_aplicavel and data_col and data_col >= cutoff_aplicavel)
+
         itens.append(d)
 
     return jsonify({"total": len(itens), "itens": itens})
@@ -2134,6 +2168,30 @@ HTML_INDEX = r"""<!DOCTYPE html>
     .card.tier1 { border-top: 3px solid var(--tier1); }
     .card.tier2 { border-top: 3px solid var(--tier2); }
     .card.tier3 { border-top: 3px solid var(--tier3); }
+
+    /* Selo NOVO: flutua no topo central do card, indicando itens da ultima coleta */
+    .card { position: relative; }
+    .selo-novo {
+      position: absolute;
+      top: -10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #16a34a;
+      color: white;
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 1.5px;
+      padding: 3px 12px;
+      border-radius: 10px;
+      box-shadow: 0 2px 6px rgba(22, 163, 74, 0.35);
+      text-transform: uppercase;
+      z-index: 2;
+      animation: pulse-novo 2s ease-in-out infinite;
+    }
+    @keyframes pulse-novo {
+      0%, 100% { box-shadow: 0 2px 6px rgba(22, 163, 74, 0.35); }
+      50% { box-shadow: 0 2px 14px rgba(22, 163, 74, 0.6); }
+    }
 
     .card-flag-row {
       display: flex;
@@ -2826,7 +2884,11 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '<div class="notas-lista" id="notas-lista-' + item.id + '"></div>' +
         '</div>';
 
+      // Selo NOVO no topo central, se item da ultima coleta
+      const seloNovo = item.eh_novo ? '<div class="selo-novo">Novo</div>' : '';
+
       return '<div class="card tier' + item.tier + '" data-id="' + item.id + '">' +
+        seloNovo +
         '<div class="card-flag-row">' +
           '<span class="flag-badge ' + flagSafe + '">' + escapeHtml(flagPretty) + '</span>' +
           '<span class="relevancia ' + relClass + '">' + item.relevancia + '/10</span>' +
