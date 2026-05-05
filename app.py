@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.4-2026-05-05-http-direto"
+APP_VERSION = "v6.4.5-2026-05-05-anti-fake"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,12 +80,15 @@ CATEGORIAS = {
         ],
         "descricao": (
             "Detectar candidatos sendo ELIMINADOS de concursos publicos AGORA. "
-            "Foco: gabaritos definitivos publicados nos ultimos 7 dias, listas de "
+            "Foco: gabaritos definitivos publicados nos ultimos 15 dias, listas de "
             "resultados eliminando candidatos, notas de corte recem-divulgadas. "
-            "NAO incluir simples publicacoes de edital novo (isso e Cat 4)."
+            "ATENCAO CRITICA: trazer APENAS noticias factuais de EVENTOS ESPECIFICOS "
+            "(ex: 'PMERJ divulga gabarito definitivo'). NAO incluir: artigos doutrinarios, "
+            "analises tematicas, posts de blog opinativos, materiais educacionais. "
+            "NAO incluir simples publicacoes de edital novo (isso e categoria radar_volume)."
         ),
         "campos_extras": ["concurso", "banca", "fase_eliminacao", "candidatos_estimados"],
-        "max_idade_dias": 7,
+        "max_idade_dias": 15,
     },
     "taf_fases": {
         "tier": 1,
@@ -108,11 +111,12 @@ CATEGORIAS = {
             "  - 'Heteroidentificacao' (verificacao de auto-declaracao racial)\n"
             "ATENCAO: TAF e FISICO. Psicotecnico e PSICOLOGICO. Sao coisas DIFERENTES. "
             "NAO classifique psicotecnico como TAF. NAO classifique investigacao social "
-            "como TAF. Cada fase tem seu nome proprio. Tambem incluir convocacoes "
-            "recentes (ultimos 7 dias) para essas fases."
+            "como TAF. Cada fase tem seu nome proprio. Trazer APENAS NOTICIAS FACTUAIS "
+            "de eventos especificos (convocacoes, resultados, eliminacoes) dos ultimos "
+            "15 dias. NAO incluir artigos doutrinarios ou analises tematicas."
         ),
         "campos_extras": ["concurso", "fase_eliminacao", "tipo_irregularidade"],
-        "max_idade_dias": 7,
+        "max_idade_dias": 15,
     },
     "recurso_anulacao": {
         "tier": 1,
@@ -125,12 +129,14 @@ CATEGORIAS = {
             "Estrategia Gran QConcursos questao polemica {mes_ano}",
         ],
         "descricao": (
-            "Questoes polemicas de provas RECENTES - candidatas a anulacao. "
-            "Foco em: questoes ja anuladas pela banca, recursos deferidos, "
-            "questoes apontadas como polemicas por professores/cursinhos."
+            "Questoes polemicas de provas RECENTES (ultimos 15 dias) - candidatas a "
+            "anulacao. Foco em: questoes ja anuladas pela banca, recursos deferidos, "
+            "questoes apontadas como polemicas por professores/cursinhos. "
+            "Trazer APENAS NOTICIAS FACTUAIS de eventos especificos. NAO incluir "
+            "artigos doutrinarios ou analises tematicas."
         ),
         "campos_extras": ["concurso", "banca", "questao_numero", "afetados_estimados"],
-        "max_idade_dias": 7,
+        "max_idade_dias": 15,
     },
     "radar_volume": {
         "tier": 2,
@@ -571,10 +577,165 @@ def db_conn():
             conn.close()
 
 
-def hash_for_dedup(titulo, orgao=""):
+def _normalizar_para_hash(s):
+    """Normaliza string para deduplicacao agressiva.
+
+    Aplica:
+    - lowercase
+    - remove acentos
+    - remove pontuacao
+    - remove anos (2024, 2025, 2026, 2027)
+    - remove datas (xx/xx/xxxx, xx-xx-xxxx)
+    - remove palavras vazias do dominio (concurso, edital, gabarito, resultado, novo)
+    - colapsa espacos multiplos em um so
+    """
+    if not s:
+        return ""
+    import unicodedata
+    # lowercase + sem acentos
+    s = unicodedata.normalize('NFKD', s.lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    # remove datas
+    s = re.sub(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b', ' ', s)
+    # remove anos isolados
+    s = re.sub(r'\b20[2-3]\d\b', ' ', s)
+    # remove pontuacao
+    s = re.sub(r'[^\w\s]', ' ', s)
+    # palavras vazias frequentes
+    stopwords = {
+        "concurso", "concursos", "edital", "editais", "gabarito",
+        "gabaritos", "resultado", "resultados", "novo", "nova",
+        "publicado", "publicada", "divulgado", "divulgada", "preliminar",
+        "definitivo", "oficial", "lista", "listas",
+    }
+    palavras = [p for p in s.split() if p and p not in stopwords and len(p) > 1]
+    return " ".join(palavras)
+
+
+def hash_for_dedup(titulo, orgao="", link=""):
+    """Hash agressivo: usa link normalizado se houver, senao titulo+orgao normalizados.
+
+    Isso captura repeticoes mesmo com pequenas variacoes de titulo
+    (ex: 'Concurso PMERJ 2026' e 'PMERJ 2026 Edital' -> mesmo hash).
+    """
     import hashlib
-    base = f"{titulo.strip().lower()[:100]}|{orgao.strip().lower()[:50]}"
+    if link:
+        # Normaliza link: lowercase + tira parametros de query (utm_*, etc)
+        l = link.strip().lower()
+        l = re.sub(r'[?#].*$', '', l)
+        l = l.rstrip('/')
+        base = "L|" + l
+    else:
+        t_norm = _normalizar_para_hash(titulo)[:120]
+        o_norm = _normalizar_para_hash(orgao)[:50]
+        base = f"T|{t_norm}|O|{o_norm}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+
+
+# ===== VALIDACAO DE LINKS =====
+
+# Whitelist de dominios aceitos. Tudo fora dessa lista e rejeitado.
+DOMINIOS_PERMITIDOS = {
+    # Oficiais (governo)
+    "gov.br", "jus.br", "stj.jus.br", "stf.jus.br", "tjsp.jus.br", "tjrj.jus.br",
+    "tjmg.jus.br", "tjpr.jus.br", "tjrs.jus.br", "tjba.jus.br", "tjpe.jus.br",
+    "tjce.jus.br", "tjes.jus.br", "tjgo.jus.br", "tjam.jus.br", "tjpa.jus.br",
+    "trf1.jus.br", "trf2.jus.br", "trf3.jus.br", "trf4.jus.br", "trf5.jus.br",
+    "trf6.jus.br", "tst.jus.br", "tcu.gov.br", "cnj.jus.br", "anvisa.gov.br",
+    "policiacivil.rj.gov.br", "policiacivil.sp.gov.br", "pf.gov.br", "prf.gov.br",
+    "pm.rj.gov.br", "pm.sp.gov.br", "exercito.gov.br", "marinha.mil.br", "fab.mil.br",
+
+    # Portais juridicos
+    "jusbrasil.com.br", "migalhas.com.br", "conjur.com.br", "jota.info",
+    "lexmagister.com.br", "ambito-juridico.com.br", "direitonet.com.br",
+
+    # Portais de concurso (grandes)
+    "pciconcursos.com.br", "qconcursos.com", "estrategiaconcursos.com.br",
+    "grancursosonline.com.br", "tecconcursos.com.br", "aprovaconcursos.com.br",
+    "folhadirigida.com.br", "edital.com.br", "concursosnobrasil.com.br",
+    "acheconcursos.com.br", "pensarcursos.com.br", "academiaconcursos.com.br",
+    "jcconcursos.com.br", "ojaiba.com", "tecconcursos.com.br", "guiadosconcursos.com.br",
+    "oesquadraodeelite.com.br",
+
+    # Imprensa de referencia
+    "g1.globo.com", "globo.com", "uol.com.br", "folha.uol.com.br",
+    "estadao.com.br", "valor.com.br", "veja.com.br", "exame.com",
+    "agenciabrasil.ebc.com.br", "metropoles.com", "correiobraziliense.com.br",
+    "gazetadopovo.com.br", "oglobo.globo.com", "extra.globo.com",
+    "r7.com", "band.com.br", "cnnbrasil.com.br", "poder360.com.br",
+
+    # Bancas (sites oficiais)
+    "cebraspe.org.br", "fgvprojetos.fgv.br", "vunesp.com.br", "ibade.org.br",
+    "idcap.org.br", "aocp.com.br", "consulplan.net", "ibfc.org.br",
+    "fgv.br", "cesgranrio.org.br", "fundatec.org.br", "fcc.org.br",
+    "iades.com.br", "quadrix.org.br", "instituteaocp.org.br",
+
+    # Comunidades / fontes Tier 3
+    "reddit.com", "youtube.com", "youtu.be",
+
+    # Anthropic (caso o cron self-test apareca)
+    "anthropic.com",
+}
+
+
+def _extrair_dominio(url):
+    """Extrai dominio raiz da URL. Ex: https://www.foo.com.br/x -> foo.com.br"""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(url).netloc.lower()
+        # Tira porta se houver
+        netloc = netloc.split(":")[0]
+        # Tira www. inicial
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
+    except Exception:
+        return ""
+
+
+def _dominio_permitido(url):
+    """True se o dominio (ou subdominio) da URL esta na whitelist."""
+    dom = _extrair_dominio(url)
+    if not dom:
+        return False
+    # Match exato
+    if dom in DOMINIOS_PERMITIDOS:
+        return True
+    # Match por sufixo (subdominios). Ex: noticias.estrategiaconcursos.com.br
+    for permitido in DOMINIOS_PERMITIDOS:
+        if dom.endswith("." + permitido):
+            return True
+    return False
+
+
+def _normalizar_url_para_match(url):
+    """Normaliza URL pra comparar com a lista de citacoes. Tira params, fragment, www, trailing slash."""
+    if not url:
+        return ""
+    u = url.strip().lower()
+    u = re.sub(r'[?#].*$', '', u)
+    u = u.rstrip('/')
+    u = u.replace("://www.", "://")
+    return u
+
+
+def _link_em_citacoes(link, citacoes):
+    """True se o link bate com algum link da lista de citacoes (match flexivel)."""
+    if not link or not citacoes:
+        return False
+    target = _normalizar_url_para_match(link)
+    if not target:
+        return False
+    for cit in citacoes:
+        cit_norm = _normalizar_url_para_match(cit)
+        if not cit_norm:
+            continue
+        # Match exato OU prefix (item pode ser pagina mais especifica que a citacao)
+        if target == cit_norm or target.startswith(cit_norm + "/") or cit_norm.startswith(target + "/"):
+            return True
+    return False
 
 
 def render_queries(queries_template, hoje):
@@ -990,11 +1151,24 @@ OBJETIVO: {descricao}
 2. Cada item DEVE ter um LINK REAL E VERIFICAVEL retornado pela ferramenta web_search.
    Se voce nao tem o URL exato da fonte, NAO INCLUA o item.
 3. NUNCA crie URLs ficticios. NUNCA escreva "https://example.com" ou similares.
+   COPIE A URL EXATA retornada pela web_search - nao construa URLs por similaridade,
+   nao "complete" URLs parciais, nao adivinhe slugs. Se a busca nao retornou URL
+   especifica, NAO inclua o item.
 4. RESTRICAO DE DATA RIGIDA: apenas conteudo publicado em {data_limite} ou DEPOIS.
    Se o conteudo nao tem data clara OU e mais antigo, NAO INCLUA.
 5. Cada item deve ser INDIVIDUAL e VERIFICAVEL: titulo deve permitir busca rapida na fonte.
 6. Se nada relevante for encontrado nas buscas, retorne {{"itens": []}} - isso e ACEITAVEL.
    E muito melhor retornar zero itens do que inventar.
+7. APENAS NOTICIAS FACTUAIS DE EVENTOS ESPECIFICOS. NAO incluir:
+   - Artigos doutrinarios ou de analise tematica (ex: "Uma analise jurisprudencial do TAF")
+   - Posts de blog opinativos ou educacionais ("Como recorrer de eliminacao")
+   - Material didatico ou de cursinho explicando conceitos juridicos
+   - Resumos genericos sem evento concreto datado
+   Apenas: "Banca X anulou a questao Y do concurso Z em data W", "TJ-MG concedeu
+   liminar a candidato no concurso Y em DD/MM", etc.
+8. NAO REPETIR ITENS. Se duas materias falam do mesmo evento (ex: dois portais
+   noticiando o mesmo gabarito da PMERJ), inclua APENAS UMA - prefira a fonte mais
+   oficial/relevante.
 
 {FONTES_OFICIAIS}
 
@@ -1052,24 +1226,40 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
             messages=[{"role": "user", "content": prompt}],
         )
 
-        # Coleta texto da resposta
+        # Coleta texto da resposta + URLs reais visitadas pela web_search
         text_parts = []
         web_searches_used = 0
+        urls_citadas = set()  # URLs realmente vistas pelo web_search (anti-invencao)
+
         for block in msg.content:
             btype = getattr(block, "type", "")
             if btype == "server_tool_use" and getattr(block, "name", "") == "web_search":
                 web_searches_used += 1
+            elif btype == "web_search_tool_result":
+                # Resultado da busca: lista de paginas. Captura todos URLs.
+                content = getattr(block, "content", None)
+                if isinstance(content, list):
+                    for result in content:
+                        url = getattr(result, "url", None)
+                        if url:
+                            urls_citadas.add(url)
             elif hasattr(block, "text") and block.text:
                 text_parts.append(block.text)
+                # Tambem extrai URLs de citacoes inline no texto (formato Anthropic)
+                citations = getattr(block, "citations", None)
+                if isinstance(citations, list):
+                    for cit in citations:
+                        url = getattr(cit, "url", None)
+                        if url:
+                            urls_citadas.add(url)
         raw = "".join(text_parts).strip()
 
-        log.info("[%s] web_searches: %d, resposta texto: %d chars",
-                 cat_id, web_searches_used, len(raw))
+        log.info("[%s] web_searches: %d, citacoes: %d, resposta texto: %d chars",
+                 cat_id, web_searches_used, len(urls_citadas), len(raw))
 
         # Parse robusto
         data = parse_json_robusto(raw)
         if data is None:
-            # Loga prefixo da resposta crua pra diagnostico
             log.warning("[%s] JSON nao parseado. Preview: %s", cat_id, raw[:500])
             return [], f"JSON nao parseado (resposta: {len(raw)} chars)"
 
@@ -1078,6 +1268,11 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
 
         if not itens:
             log.info("[%s] IA retornou lista vazia (esperado se nada relevante)", cat_id)
+
+        # Contadores de rejeicao pra log final
+        rejeitados_dominio = 0
+        rejeitados_nao_citado = 0
+        rejeitados_outro = 0
 
         for item in itens:
             if not isinstance(item, dict):
@@ -1088,26 +1283,52 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
             # Validacoes anti-invencao
             if not titulo:
                 log.warning("[%s] item sem titulo, ignorando", cat_id)
+                rejeitados_outro += 1
                 continue
 
-            # Tier 1 e 2: link obrigatorio. Tier 3: link recomendado mas nao obrigatorio
-            # (aceita posts de redes sociais sem URL direto se tiver descricao concreta)
+            # Tier 1 e 2: link obrigatorio + dominio whitelist + match com citacoes web_search
+            # Tier 3: mais flexivel (aceita perfis/canais sem URL exato)
             if tier in (1, 2):
                 if not link or not link.startswith("http"):
                     log.warning("[%s] item sem link real, ignorando: %s", cat_id, titulo[:60])
+                    rejeitados_outro += 1
                     continue
                 if "example.com" in link.lower() or "example.org" in link.lower():
-                    log.warning("[%s] link e example.com, ignorando: %s", cat_id, titulo[:60])
+                    log.warning("[%s] link example.com, ignorando: %s", cat_id, titulo[:60])
+                    rejeitados_outro += 1
+                    continue
+
+                # WHITELIST DE DOMINIO: dominio precisa estar na lista permitida
+                if not _dominio_permitido(link):
+                    dom = _extrair_dominio(link)
+                    log.warning("[%s] dominio fora whitelist (%s), ignorando: %s", cat_id, dom, titulo[:60])
+                    rejeitados_dominio += 1
+                    continue
+
+                # MATCH COM CITACOES: o link DEVE bater com algo que web_search retornou
+                # Isso elimina links inventados (alucinacoes do Claude)
+                if urls_citadas and not _link_em_citacoes(link, urls_citadas):
+                    log.warning("[%s] link nao bate com citacoes web_search (provavel alucinacao): %s",
+                                cat_id, link[:120])
+                    rejeitados_nao_citado += 1
                     continue
             else:
                 # Tier 3: rejeitar APENAS links obviamente fakes
                 if link and ("example.com" in link.lower() or "example.org" in link.lower()):
                     log.warning("[%s] tier3 link fake (example.com), ignorando: %s", cat_id, titulo[:60])
+                    rejeitados_outro += 1
+                    continue
+                # Se tem link, valida dominio (mas nao exige match com citacoes)
+                if link and not _dominio_permitido(link):
+                    dom = _extrair_dominio(link)
+                    log.warning("[%s] tier3 dominio fora whitelist (%s), ignorando: %s", cat_id, dom, titulo[:60])
+                    rejeitados_dominio += 1
                     continue
                 # Se nao tem link mas tem descricao concreta de pelo menos 50 chars, aceita
                 desc = str(item.get("descricao", "")).strip()
                 if not link and len(desc) < 50:
                     log.warning("[%s] tier3 item sem link e descricao curta (<50ch), ignorando: %s", cat_id, titulo[:60])
+                    rejeitados_outro += 1
                     continue
 
             # Build extras dict
@@ -1144,7 +1365,8 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
                 "etapa_concurso": etapa,
             })
 
-        log.info("[%s] %d itens validados (com link real)", cat_id, len(todos_itens))
+        log.info("[%s] %d validados | rejeitados: dominio=%d, nao_citado=%d, outros=%d",
+                 cat_id, len(todos_itens), rejeitados_dominio, rejeitados_nao_citado, rejeitados_outro)
 
     except Exception as e:
         log.error("[%s] erro: %s\n%s", cat_id, e, traceback.format_exc())
@@ -1161,7 +1383,7 @@ def salvar_itens(itens):
     agora = datetime.now(timezone.utc).isoformat()
     with db_conn() as conn:
         for item in itens:
-            h = hash_for_dedup(item["titulo"], item.get("orgao", ""))
+            h = hash_for_dedup(item["titulo"], item.get("orgao", ""), item.get("link", ""))
 
             # Enriquecimento de metricas (YouTube/Reddit) - silencioso se nao configurado
             metricas = enrich_metricas(item.get("link", ""))
