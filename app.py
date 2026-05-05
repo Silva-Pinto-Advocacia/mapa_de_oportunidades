@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.2-2026-05-05-turso-tier3-concorrentes"
+APP_VERSION = "v6.3-2026-05-05-tier3-flexivel"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -519,7 +519,69 @@ def coletar_categoria(api_key, cat_id, hoje):
 
     data_limite = (hoje - timedelta(days=max_idade)).strftime("%d/%m/%Y")
 
-    prompt = f"""Voce e um pesquisador juridico do escritorio Silva Pinto Advocacia, especializado em concursos publicos.
+    # Tier 3 (sentimento + concorrencia) usa prompt MAIS FLEXIVEL.
+    # Conteudo de redes sociais/foruns nem sempre tem data clara ou link "verificavel"
+    # no sentido formal - mas e a materia-prima de Reels e estrategia.
+    if tier == 3:
+        prompt = f"""Voce e um pesquisador de inteligencia de mercado do escritorio Silva Pinto Advocacia, especializado em concursos publicos.
+
+CATEGORIA: {cat['label']} (Tier 3 - inteligencia de mercado)
+OBJETIVO: {descricao}
+
+== REGRAS PARA TIER 3 ==
+
+Diferente dos outros tiers, aqui voce esta cacando conteudo de REDES SOCIAIS, FORUNS, BLOGS e CANAIS DE YOUTUBE. Esse conteudo nem sempre tem data exata ou URL super formal - ESTA OK.
+
+REGRAS:
+1. NUNCA INVENTE perfis, posts ou citacoes que nao apareceram nas buscas. Se a busca nao mostrou nada do perfil X, nao "preencha" inventando.
+2. PREFIRA links reais (instagram.com/p/..., youtube.com/watch?v=..., reddit.com/r/...). Se a web_search retornou esse link, use.
+3. Se nao tem link especifico do post mas voce viu a mencao na busca, use o link do PERFIL como fonte (ex: https://www.instagram.com/advogadodeconcurso/) e mencione na descricao "post recente" ou "video recente".
+4. Datas exatas SAO BEM-VINDAS, mas se o post nao mostra data clara, escreva "recente" ou aproximacao ("ha cerca de 2 semanas").
+5. Aceitar conteudo dos ultimos {max_idade} dias - se nao tiver certeza da data, considere recente se a busca classificou como tal.
+6. PREFIRA poucos itens BEM concretos a muitos itens vagos. Trazer 1-2 posts especificos com citacao real e melhor que 5 genericos.
+7. Se mesmo assim nao encontrar nada nas buscas, retorne {{"itens": []}}.
+
+{FONTES_OFICIAIS}
+
+== TAREFA ==
+
+Realize as buscas a seguir, uma por vez, usando a ferramenta web_search:
+{queries_str}
+
+Foque em CONTEUDO RECENTE dos perfis-alvo. Se a busca mostrar:
+- Reel/video do concorrente sobre concurso X = item valido
+- Post do perfil do concorrente sobre tese juridica = item valido
+- Discussao em forum/reddit com candidato desabafando sobre concurso = item valido
+- Comentario em video do youtube com citacao de candidato = item valido
+
+== FORMATO DE RESPOSTA ==
+
+Retorne SOMENTE JSON puro, sem markdown, sem explicacoes.
+
+{{
+  "itens": [
+    {{
+      "titulo": "Titulo curto descrevendo o post/video/discussao",
+      "descricao": "O que foi dito/postado, com citacao literal entre aspas se possivel",
+      "data_publicacao": "DD/MM/AAAA ou aproximacao ('recente', 'ultima semana')",
+      "orgao": "vazio (geralmente nao se aplica em tier 3)",
+      "estado": "UF se relevante ou vazio",
+      "concurso": "Concurso mencionado no post se houver",
+      "cargo": "vazio",
+      "banca": "vazio",
+      "vagas": "vazio",
+      "salario": "vazio",
+      "prazo_inscricao": "vazio",
+      "data_prova": "vazio",
+      "fase_atual": "vazio",
+      "link": "URL do post se houver, ou URL do perfil/canal",
+      "relevancia": 1-10 (alto = ouro para conteudo proprio){extras_json_template}
+    }}
+  ]
+}}"""
+    else:
+        # Prompt RIGIDO para Tier 1 e 2 (anti-invencao reforcado)
+        prompt = f"""Voce e um pesquisador juridico do escritorio Silva Pinto Advocacia, especializado em concursos publicos.
 
 CATEGORIA: {cat['label']} (Tier {tier})
 OBJETIVO: {descricao}
@@ -629,12 +691,26 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
             if not titulo:
                 log.warning("[%s] item sem titulo, ignorando", cat_id)
                 continue
-            if not link or not link.startswith("http"):
-                log.warning("[%s] item sem link real, ignorando: %s", cat_id, titulo[:60])
-                continue
-            if "example.com" in link.lower() or "example.org" in link.lower():
-                log.warning("[%s] link e example.com, ignorando: %s", cat_id, titulo[:60])
-                continue
+
+            # Tier 1 e 2: link obrigatorio. Tier 3: link recomendado mas nao obrigatorio
+            # (aceita posts de redes sociais sem URL direto se tiver descricao concreta)
+            if tier in (1, 2):
+                if not link or not link.startswith("http"):
+                    log.warning("[%s] item sem link real, ignorando: %s", cat_id, titulo[:60])
+                    continue
+                if "example.com" in link.lower() or "example.org" in link.lower():
+                    log.warning("[%s] link e example.com, ignorando: %s", cat_id, titulo[:60])
+                    continue
+            else:
+                # Tier 3: rejeitar APENAS links obviamente fakes
+                if link and ("example.com" in link.lower() or "example.org" in link.lower()):
+                    log.warning("[%s] tier3 link fake (example.com), ignorando: %s", cat_id, titulo[:60])
+                    continue
+                # Se nao tem link mas tem descricao concreta de pelo menos 50 chars, aceita
+                desc = str(item.get("descricao", "")).strip()
+                if not link and len(desc) < 50:
+                    log.warning("[%s] tier3 item sem link e descricao curta (<50ch), ignorando: %s", cat_id, titulo[:60])
+                    continue
 
             # Build extras dict
             extras_dict = {}
