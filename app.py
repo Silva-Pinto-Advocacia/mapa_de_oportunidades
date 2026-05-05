@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.1-2026-05-05-libsql-novo"
+APP_VERSION = "v6.4.2-2026-05-05-libsql-remote"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -334,27 +334,18 @@ def _ensure_metricas_column():
 
 
 class TursoConnWrapper:
-    """Wrapper sobre a nova biblioteca 'libsql' da Turso (substitui a antiga 'libsql-client').
+    """Wrapper sobre a nova biblioteca 'libsql' da Turso.
 
-    A nova lib ja tem API estilo sqlite3 nativa: .cursor(), .execute(), .fetchall(),
-    .commit(), .close(). So precisamos adaptar pra ter a row_factory parecida com Row.
+    Usa modo REMOTO PURO (sem embedded replica) - mais simples e funciona
+    em ambientes sem filesystem persistente como Render free.
     """
     class _IntegrityError(Exception):
         pass
 
     def __init__(self):
-        # libsql.connect aceita um path local (ou ":memory:") + sync_url + auth_token
-        # Pra conexao puramente remota, passamos sync_url e usamos um db local efemero
-        self.conn = libsql.connect(
-            ":memory:",  # banco efemero local (so existe na memoria do worker)
-            sync_url=TURSO_URL,
-            auth_token=TURSO_TOKEN,
-        )
-        # Sync inicial pra puxar tudo do remoto
-        try:
-            self.conn.sync()
-        except Exception as e:
-            log.warning("libsql.sync inicial falhou (talvez DB vazia): %s", e)
+        # Modo remoto puro: passa a URL diretamente, sem path local
+        # (path local + sync_url cria embedded replica que falha no Render free)
+        self.conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
 
     def execute(self, sql, params=()):
         """Executa SQL. Retorna TursoCursor compativel com sqlite3.Cursor."""
@@ -384,15 +375,10 @@ class TursoConnWrapper:
                 raise
 
     def commit(self):
-        """Commit local + push pro remoto."""
         try:
             self.conn.commit()
         except Exception:
             pass
-        try:
-            self.conn.sync()  # empurra mudancas pro remoto
-        except Exception as e:
-            log.warning("libsql.sync no commit falhou: %s", e)
 
     def close(self):
         try:
