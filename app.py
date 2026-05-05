@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.3-2026-05-05-singleton"
+APP_VERSION = "v6.4.4-2026-05-05-http-direto"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,12 +43,7 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 USANDO_TURSO = bool(TURSO_URL and TURSO_TOKEN)
 if USANDO_TURSO:
-    log.info("DB: Turso (persistente) em %s", TURSO_URL.replace("libsql://", ""))
-    try:
-        import libsql  # nova biblioteca oficial Turso (substitui libsql-client deprecada)
-    except ImportError:
-        log.error("Pacote libsql nao instalado! Adicione 'libsql' ao requirements.txt. Caindo para SQLite local.")
-        USANDO_TURSO = False
+    log.info("DB: Turso (HTTP API direta) em %s", TURSO_URL.replace("libsql://", "").replace("https://", ""))
 else:
     log.info("DB: SQLite local em %s (sera apagado se Render reiniciar)", DB_PATH)
 
@@ -334,105 +329,162 @@ def _ensure_metricas_column():
 
 
 class TursoConnWrapper:
-    """Wrapper sobre a nova biblioteca 'libsql' da Turso.
+    """Wrapper sobre a API HTTP da Turso (Hrana over HTTP - endpoint /v2/pipeline).
 
-    Usa modo REMOTO PURO (sem embedded replica) - mais simples e funciona
-    em ambientes sem filesystem persistente como Render free.
+    NAO USA biblioteca libsql nem libsql-client. Usa apenas urllib + JSON.
+    Funciona em qualquer ambiente porque e HTTPS puro.
 
-    SINGLETON com lock: a conexao real e criada UMA UNICA VEZ por worker do gunicorn
-    e reusada em todas as requisicoes. Isso evita o overhead de abrir/fechar HTTPS
-    a cada query, que estava deixando o app travado.
+    Documentacao: https://docs.turso.tech/sdk/http/quickstart
     """
     class _IntegrityError(Exception):
         pass
 
-    # Singleton compartilhado entre threads do mesmo worker
-    _shared_conn = None
-    _lock = None  # threading.Lock - inicializado lazy
+    @staticmethod
+    def _http_url():
+        """Converte libsql://X para https://X/v2/pipeline."""
+        url = TURSO_URL
+        if url.startswith("libsql://"):
+            url = "https://" + url[len("libsql://"):]
+        elif url.startswith("wss://"):
+            url = "https://" + url[len("wss://"):]
+        elif not url.startswith("http"):
+            url = "https://" + url
+        return url.rstrip("/") + "/v2/pipeline"
 
     def __init__(self):
-        import threading
-        # Inicializa lock se ainda nao existe (uma vez por processo)
-        if TursoConnWrapper._lock is None:
-            TursoConnWrapper._lock = threading.Lock()
-        # Pega ou cria a conexao compartilhada
-        with TursoConnWrapper._lock:
-            if TursoConnWrapper._shared_conn is None:
-                TursoConnWrapper._shared_conn = libsql.connect(
-                    TURSO_URL, auth_token=TURSO_TOKEN
-                )
-        self.conn = TursoConnWrapper._shared_conn
+        # Conexao logica - cada execute() faz uma chamada HTTP
+        # (alternativa: manter uma sessao persistente, mas requests simples sao rapidas)
+        self.url = TursoConnWrapper._http_url()
+        self.headers = {
+            "Authorization": f"Bearer {TURSO_TOKEN}",
+            "Content-Type": "application/json",
+        }
+
+    def _post(self, payload, timeout=30):
+        """POST JSON e retorna response JSON."""
+        import urllib.request
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.url, data=body, headers=self.headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _stmt(self, sql, params=()):
+        """Monta o objeto stmt no formato Hrana com argumentos posicionais."""
+        stmt = {"sql": sql}
+        if params:
+            args = []
+            for p in params:
+                if p is None:
+                    args.append({"type": "null"})
+                elif isinstance(p, bool):
+                    args.append({"type": "integer", "value": "1" if p else "0"})
+                elif isinstance(p, int):
+                    args.append({"type": "integer", "value": str(p)})
+                elif isinstance(p, float):
+                    args.append({"type": "float", "value": p})
+                elif isinstance(p, bytes):
+                    import base64
+                    args.append({"type": "blob", "base64": base64.b64encode(p).decode("ascii")})
+                else:
+                    args.append({"type": "text", "value": str(p)})
+            stmt["args"] = args
+        return stmt
 
     def execute(self, sql, params=()):
-        """Executa SQL com lock pra evitar race condition entre threads."""
-        with TursoConnWrapper._lock:
-            try:
-                cur = self.conn.cursor()
-                if params:
-                    cur.execute(sql, list(params))
+        """Executa SQL via HTTP. Retorna TursoCursor compativel com sqlite3.Cursor."""
+        payload = {
+            "requests": [
+                {"type": "execute", "stmt": self._stmt(sql, params)},
+                {"type": "close"},
+            ]
+        }
+        try:
+            data = self._post(payload)
+        except Exception as e:
+            log.error("Turso HTTP execute falhou: %s", e)
+            raise
+
+        # Resposta tem formato: {"results":[{"type":"ok","response":{"type":"execute","result":{...}}}, {"type":"ok",...}]}
+        results = data.get("results", [])
+        if not results:
+            return TursoCursor(cols=[], rows=[])
+
+        first = results[0]
+        if first.get("type") == "error":
+            err = first.get("error", {})
+            msg = err.get("message", "erro desconhecido")
+            msg_low = msg.lower()
+            if "unique" in msg_low or "constraint" in msg_low:
+                raise sqlite3.IntegrityError(msg)
+            raise Exception(f"Turso error: {msg}")
+
+        result = first.get("response", {}).get("result", {})
+        cols_meta = result.get("cols", [])
+        cols = [c.get("name", "") for c in cols_meta]
+        raw_rows = result.get("rows", [])
+
+        # Cada raw_row e uma lista de objetos {type, value}. Converte para tipos Python nativos.
+        rows = []
+        for raw_row in raw_rows:
+            row = []
+            for cell in raw_row:
+                if isinstance(cell, dict):
+                    t = cell.get("type")
+                    v = cell.get("value")
+                    if t == "null":
+                        row.append(None)
+                    elif t == "integer":
+                        row.append(int(v) if v is not None else None)
+                    elif t == "float":
+                        row.append(float(v) if v is not None else None)
+                    elif t == "blob":
+                        import base64
+                        b64 = cell.get("base64", "")
+                        row.append(base64.b64decode(b64) if b64 else b"")
+                    else:
+                        row.append(v)
                 else:
-                    cur.execute(sql)
-                return TursoCursor(cur)
-            except Exception as e:
-                msg = str(e).lower()
-                if "unique" in msg or "constraint" in msg:
-                    raise sqlite3.IntegrityError(str(e))
-                # Em caso de erro de conexao, invalida a singleton pra recriar
-                if "closed" in msg or "broken" in msg or "connection" in msg:
-                    log.warning("Conexao Turso quebrou, sera recriada: %s", e)
-                    try:
-                        self.conn.close()
-                    except Exception:
-                        pass
-                    TursoConnWrapper._shared_conn = None
-                raise
+                    row.append(cell)
+            rows.append(row)
+
+        return TursoCursor(cols=cols, rows=rows)
 
     def executescript(self, script):
-        """Executa multiplos statements separados por ;"""
+        """Executa multiplos statements separados por ; em UMA chamada HTTP (batch)."""
         statements = [s.strip() for s in script.split(';') if s.strip()]
-        with TursoConnWrapper._lock:
-            for stmt in statements:
-                try:
-                    self.conn.execute(stmt)
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "already exists" in msg:
-                        continue
-                    raise
+        if not statements:
+            return
+        # Monta um pipeline com todos os statements + close
+        requests_list = [{"type": "execute", "stmt": {"sql": s}} for s in statements]
+        requests_list.append({"type": "close"})
+        payload = {"requests": requests_list}
+        try:
+            data = self._post(payload, timeout=60)
+        except Exception as e:
+            log.error("Turso executescript falhou: %s", e)
+            raise
+
+        # Verifica erros (mas tolera "already exists")
+        for r in data.get("results", []):
+            if r.get("type") == "error":
+                msg = r.get("error", {}).get("message", "").lower()
+                if "already exists" in msg:
+                    continue
+                raise Exception(f"executescript: {r.get('error', {}).get('message')}")
 
     def commit(self):
-        try:
-            with TursoConnWrapper._lock:
-                self.conn.commit()
-        except Exception:
-            pass
+        # API HTTP nao tem commit explicito - cada execute ja eh uma transacao implicita
+        pass
 
     def close(self):
-        # NAO fecha a singleton - ela fica viva ate o worker morrer
         pass
 
 
-def _close_shared_conn_on_exit():
-    """Fecha a conexao Turso quando o worker sai. Registrado via atexit."""
-    if TursoConnWrapper._shared_conn is not None:
-        try:
-            TursoConnWrapper._shared_conn.close()
-        except Exception:
-            pass
-
-
-import atexit
-atexit.register(_close_shared_conn_on_exit)
-
-
 class TursoCursor:
-    """Wrapper minimo sobre o cursor da nova lib pra retornar TursoRow."""
-    def __init__(self, cur):
-        self.cur = cur
-        # description tem nomes de coluna em formato (name, ...)
-        self.columns = []
-        if cur.description:
-            self.columns = [d[0] for d in cur.description]
+    """Wrapper minimo pra retornar TursoRow. Construido a partir das listas cols+rows."""
+    def __init__(self, cols, rows):
+        self.columns = list(cols) if cols else []
+        self._rows_iter = iter(rows) if rows else iter([])
 
     def _wrap(self, row):
         if row is None:
@@ -440,12 +492,14 @@ class TursoCursor:
         return TursoRow(self.columns, row)
 
     def fetchone(self):
-        r = self.cur.fetchone()
-        return self._wrap(r)
+        try:
+            r = next(self._rows_iter)
+            return self._wrap(r)
+        except StopIteration:
+            return None
 
     def fetchall(self):
-        rows = self.cur.fetchall()
-        return [self._wrap(r) for r in rows]
+        return [self._wrap(r) for r in self._rows_iter]
 
 
 class TursoRow:
