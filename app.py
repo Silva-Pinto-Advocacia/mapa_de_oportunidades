@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.3-2026-05-05-tier3-flexivel"
+APP_VERSION = "v6.4-2026-05-05-melhorias"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +58,16 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "claude-sonnet-4-5")
 MODEL_TIER1 = os.environ.get("MODEL_TIER1", "claude-sonnet-4-5")
 MODEL_TIER23 = os.environ.get("MODEL_TIER23", "claude-haiku-4-5-20251001")
 DEMO_MODE = os.environ.get("DEMO_MODE", "0") == "1"
+
+# Notificacao Discord (webhook URL). Se vazio, nao envia.
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+
+# YouTube Data API (opcional). Se vazio, pula enrichment.
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+
+# Reddit API (opcional). Se um dos campos vazio, pula enrichment Reddit.
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
 
 app = Flask(__name__)
 
@@ -172,23 +182,27 @@ CATEGORIAS = {
         "label": "Sentimento do candidato",
         "flag": "VIRAL",
         "queries": [
-            "site:reddit.com r/concurseiros eliminado",
-            "site:reddit.com concurso TAF eliminado injustamente",
-            "site:youtube.com fui eliminado concurso publico desabafo",
-            "site:tiktok.com eliminado concurso publico",
-            "fui eliminado concurso publico {ano}",
-            "concurso reprovado psicotecnico injusto {mes_ano}",
-            "investigacao social concurso eliminado absurdo {ano}",
+            "site:reddit.com/r/concurseiros eliminado",
+            "site:reddit.com concurso TAF reprovado injusto",
+            "site:reddit.com gabarito errado banca",
+            "site:youtube.com fui eliminado concurso desabafo",
+            "fui eliminado concurso publico desabafo {ano}",
+            "concurso reprovado psicotecnico processo {mes_ano}",
+            "candidato eliminado TAF processo judicial {ano}",
+            "investigacao social eliminado concurso absurdo",
         ],
         "descricao": (
-            "Conteudo REAL de candidatos desabafando em redes sociais e foruns - "
-            "publicado nos ultimos 45 dias. Procurar em: Reddit (r/concurseiros), "
-            "YouTube (videos de desabafo, lives reagindo a resultado), TikTok, "
-            "Instagram (Reels), Twitter/X, blogs. EXTRAIR sempre que possivel: "
-            "(a) citacao LITERAL do candidato (frase entre aspas) - util como hook "
-            "de Reel, (b) qual concurso foi mencionado, (c) padrao emocional "
-            "predominante (revolta, decepcao, indignacao, medo). Aceitar conteudo "
-            "informal: posts de Reddit, comentarios em videos, threads, etc."
+            "Conteudo de candidatos REVOLTADOS com eliminacao em concursos. "
+            "Util para: hooks de Reels (citacoes literais), entender padroes "
+            "emocionais, identificar processos de concursos onde candidatos "
+            "estao buscando ajuda juridica. Procurar em: Reddit r/concurseiros, "
+            "YouTube (videos de desabafo, lives), threads de Twitter/X, "
+            "comentarios em portais de noticias sobre concursos. EXTRAIR "
+            "sempre que possivel: (a) citacao LITERAL do candidato entre aspas, "
+            "(b) qual concurso/banca foi mencionado, (c) padrao emocional "
+            "(revolta, decepcao, medo, indignacao). Aceitar posts informais. "
+            "Para cada item, prefira link da postagem real (reddit.com/r/X/comments/Y/), "
+            "mas link do canal/perfil tambem e aceito."
         ),
         "campos_extras": ["citacao_candidato", "concurso_mencionado", "padrao_emocional"],
         "max_idade_dias": 45,
@@ -198,30 +212,42 @@ CATEGORIAS = {
         "label": "Movimentos da concorrencia",
         "flag": "CONCORRENCIA",
         "queries": [
-            "site:instagram.com advogadodeconcurso reel concurso {ano}",
-            "site:instagram.com pedroauarconcursos {ano}",
-            "site:instagram.com pedroauaroab {ano}",
-            "site:instagram.com luandanaiaraadv concurso {ano}",
-            "Pedro Auar advogado concurso publico liminar {ano}",
-            "Luanda Naiara advocacia concurso publico {ano}",
-            "advogadodeconcurso liminar concurso {mes_ano}",
+            "Pedro Auar advogado liminar concurso publico {ano}",
+            "Luanda Naiara advogada concurso publico decisao {ano}",
+            "Pedro Auar candidato eliminado processo {mes_ano}",
+            "advogado de concurso liminar deferida candidato {ano}",
+            "site:jusbrasil.com.br Pedro Auar concurso",
+            "site:jusbrasil.com.br Luanda Naiara concurso",
+            "site:migalhas.com.br advogado concurso publico liminar {ano}",
+            "site:conjur.com.br concurso publico candidato decisao {mes_ano}",
             "site:youtube.com Pedro Auar concurso",
-            "site:youtube.com Luanda Naiara advogada concurso",
+            "site:youtube.com Luanda Naiara concurso publico",
+            "site:youtube.com advogado de concurso eliminacao",
         ],
         "descricao": (
-            "Atividades recentes (ultimos 45 dias) dos CONCORRENTES DIRETOS do "
-            "escritorio Silva Pinto. Sao 3 escritorios/perfis a monitorar:\n"
-            "  1. ADVOGADO DE CONCURSO - perfil @advogadodeconcurso no Instagram\n"
-            "  2. PEDRO AUAR - perfis @pedroauarconcursos e @pedroauaroab\n"
-            "  3. LUANDA NAIARA - perfil @luandanaiaraadv\n"
-            "Procurar em: Instagram (Reels, posts, lives), YouTube (canais e "
-            "videos), blogs juridicos, sites proprios, decisoes onde apareceram "
-            "como advogados, materias na imprensa. Detectar: (a) novos concursos "
-            "onde estao atuando, (b) Reels/videos que viralizaram, (c) teses ou "
-            "estrategias novas, (d) liminares ganhas. EXTRAIR no campo "
-            "'escritorio_concorrente' QUAL dos 3 e o autor do conteudo, em "
-            "'concurso_tema' o concurso/tema explorado, em 'gap_identificado' "
-            "o que eles fazem que Silva Pinto ainda nao faz."
+            "Movimentos dos CONCORRENTES DIRETOS do escritorio Silva Pinto.\n"
+            "Concorrentes monitorados:\n"
+            "  1. PEDRO AUAR (perfis @pedroauarconcursos, @pedroauaroab no Instagram, "
+            "canal proprio no YouTube)\n"
+            "  2. LUANDA NAIARA (@luandanaiaraadv, canal YouTube proprio)\n"
+            "  3. ADVOGADO DE CONCURSO (@advogadodeconcurso)\n"
+            "\n"
+            "Foco: encontrar materia, decisao judicial, video do YouTube ou postagem "
+            "ESPECIFICA - nao apenas o link do perfil. Procurar em:\n"
+            "  - Sites juridicos: jusbrasil, migalhas, conjur, jota, lex magister\n"
+            "  - Decisoes em DJE (Diario da Justica Eletronico) onde nome do "
+            "advogado consta como patrono\n"
+            "  - YouTube: titulos e descricoes de videos recentes desses canais\n"
+            "  - Materias de portais de concurso (estrategia, qconcursos, gran)\n"
+            "  - Twitter/X com mencao do nome do advogado\n"
+            "\n"
+            "Detectar: (a) NOVO concurso em que estao atuando como patronos, "
+            "(b) tese ou estrategia inovadora descrita em video/post, "
+            "(c) liminar ganha com repercussao na imprensa, "
+            "(d) gap de mercado (tipo de caso que eles atendem e o Silva Pinto nao). "
+            "EXTRAIR: (escritorio_concorrente) qual dos 3 e o autor; "
+            "(concurso_tema) qual concurso/tema; "
+            "(gap_identificado) o que eles fazem que Silva Pinto ainda nao faz."
         ),
         "campos_extras": ["escritorio_concorrente", "concurso_tema", "gap_identificado"],
         "max_idade_dias": 45,
@@ -255,7 +281,8 @@ CREATE TABLE IF NOT EXISTS oportunidades (
     lido INTEGER DEFAULT 0,
     arquivado INTEGER DEFAULT 0,
     data_coleta TEXT NOT NULL,
-    hash_unico TEXT UNIQUE
+    hash_unico TEXT UNIQUE,
+    metricas_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_categoria ON oportunidades(categoria);
 CREATE INDEX IF NOT EXISTS idx_tier ON oportunidades(tier);
@@ -273,7 +300,37 @@ CREATE TABLE IF NOT EXISTS execucoes_cron (
     sucesso INTEGER DEFAULT 1,
     erro TEXT
 );
+
+CREATE TABLE IF NOT EXISTS notas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    oportunidade_id INTEGER NOT NULL,
+    texto TEXT NOT NULL,
+    data_criacao TEXT NOT NULL,
+    FOREIGN KEY (oportunidade_id) REFERENCES oportunidades(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_notas_op ON notas(oportunidade_id);
 """
+
+
+# Migracao: adiciona coluna metricas_json se a tabela ja existe sem ela
+def _ensure_metricas_column():
+    """Adiciona coluna metricas_json em bancos antigos. Idempotente."""
+    try:
+        with db_conn() as conn:
+            try:
+                conn.execute("SELECT metricas_json FROM oportunidades LIMIT 1")
+                return  # ja existe
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE oportunidades ADD COLUMN metricas_json TEXT")
+                log.info("DB: coluna metricas_json adicionada")
+            except Exception as e:
+                msg = str(e).lower()
+                if "duplicate" not in msg and "exist" not in msg:
+                    log.warning("Falha ao adicionar metricas_json: %s", e)
+    except Exception as e:
+        log.warning("_ensure_metricas_column erro: %s", e)
 
 
 class TursoConnWrapper:
@@ -491,6 +548,252 @@ def parse_json_robusto(raw):
             pass
 
     return None
+
+
+# ===== ENRICHMENT: YouTube Data API =====
+
+def _extrair_youtube_video_id(url):
+    """Extrai video ID de varios formatos de URL do YouTube."""
+    if not url:
+        return None
+    # youtube.com/watch?v=XXXXXXXXXXX
+    m = re.search(r'[?&]v=([A-Za-z0-9_-]{11})', url)
+    if m:
+        return m.group(1)
+    # youtu.be/XXXXXXXXXXX
+    m = re.search(r'youtu\.be/([A-Za-z0-9_-]{11})', url)
+    if m:
+        return m.group(1)
+    # /shorts/XXXXXXXXXXX
+    m = re.search(r'/shorts/([A-Za-z0-9_-]{11})', url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def enrich_youtube(link):
+    """Pega views, likes, comentarios e data de publicacao de um video do YouTube.
+
+    Retorna dict {views, likes, comments, published_at, title, description_short}
+    ou None se nao conseguir.
+    """
+    if not YOUTUBE_API_KEY or not link:
+        return None
+    video_id = _extrair_youtube_video_id(link)
+    if not video_id:
+        return None
+    try:
+        import urllib.request, urllib.parse
+        params = urllib.parse.urlencode({
+            "part": "snippet,statistics",
+            "id": video_id,
+            "key": YOUTUBE_API_KEY,
+        })
+        url_api = f"https://www.googleapis.com/youtube/v3/videos?{params}"
+        req = urllib.request.Request(url_api, headers={"User-Agent": "SilvaPinto/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        items = data.get("items", [])
+        if not items:
+            return None
+        snippet = items[0].get("snippet", {})
+        stats = items[0].get("statistics", {})
+        return {
+            "fonte": "youtube",
+            "views": int(stats.get("viewCount", 0)) if stats.get("viewCount") else None,
+            "likes": int(stats.get("likeCount", 0)) if stats.get("likeCount") else None,
+            "comments": int(stats.get("commentCount", 0)) if stats.get("commentCount") else None,
+            "published_at": snippet.get("publishedAt", "")[:10],
+            "channel": snippet.get("channelTitle", "")[:80],
+        }
+    except Exception as e:
+        log.warning("YouTube enrich falhou para %s: %s", link, e)
+        return None
+
+
+# ===== ENRICHMENT: Reddit =====
+
+_REDDIT_TOKEN_CACHE = {"token": None, "expires_at": 0}
+
+
+def _get_reddit_token():
+    """Pega/cacheia token OAuth do Reddit (1h validade). Usa client credentials flow."""
+    import time as _t
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        return None
+    if _REDDIT_TOKEN_CACHE["token"] and _REDDIT_TOKEN_CACHE["expires_at"] > _t.time() + 60:
+        return _REDDIT_TOKEN_CACHE["token"]
+    try:
+        import urllib.request, urllib.parse, base64
+        creds = base64.b64encode(f"{REDDIT_CLIENT_ID}:{REDDIT_CLIENT_SECRET}".encode()).decode()
+        body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+        req = urllib.request.Request(
+            "https://www.reddit.com/api/v1/access_token",
+            data=body,
+            headers={
+                "Authorization": f"Basic {creds}",
+                "User-Agent": "SilvaPinto/1.0 (by /u/silvapinto)",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        token = data.get("access_token")
+        expires_in = int(data.get("expires_in", 3600))
+        _REDDIT_TOKEN_CACHE["token"] = token
+        _REDDIT_TOKEN_CACHE["expires_at"] = _t.time() + expires_in
+        return token
+    except Exception as e:
+        log.warning("Reddit token falhou: %s", e)
+        return None
+
+
+def _extrair_reddit_post_id(url):
+    """Extrai post id de URL tipo /r/X/comments/POSTID/slug/"""
+    if not url:
+        return None
+    m = re.search(r'/comments/([a-z0-9]{5,12})', url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def enrich_reddit(link):
+    """Pega upvotes, comentarios, subreddit, data de um post do Reddit.
+
+    Retorna dict ou None.
+    """
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET or not link:
+        return None
+    if "reddit.com" not in link.lower():
+        return None
+    post_id = _extrair_reddit_post_id(link)
+    if not post_id:
+        return None
+    token = _get_reddit_token()
+    if not token:
+        return None
+    try:
+        import urllib.request
+        url_api = f"https://oauth.reddit.com/api/info?id=t3_{post_id}"
+        req = urllib.request.Request(
+            url_api,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "SilvaPinto/1.0 (by /u/silvapinto)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        children = data.get("data", {}).get("children", [])
+        if not children:
+            return None
+        post_data = children[0].get("data", {})
+        from datetime import datetime as _dt
+        ts = post_data.get("created_utc", 0)
+        pub = _dt.utcfromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
+        return {
+            "fonte": "reddit",
+            "upvotes": int(post_data.get("ups", 0)),
+            "score": int(post_data.get("score", 0)),
+            "comments": int(post_data.get("num_comments", 0)),
+            "subreddit": post_data.get("subreddit_name_prefixed", "")[:60],
+            "published_at": pub,
+        }
+    except Exception as e:
+        log.warning("Reddit enrich falhou para %s: %s", link, e)
+        return None
+
+
+def enrich_metricas(link):
+    """Tenta enrich do link em todos os providers. Retorna dict ou None."""
+    if not link:
+        return None
+    link_low = link.lower()
+    if "youtube.com" in link_low or "youtu.be" in link_low:
+        m = enrich_youtube(link)
+        if m:
+            return m
+    if "reddit.com" in link_low:
+        m = enrich_reddit(link)
+        if m:
+            return m
+    return None
+
+
+# ===== NOTIFICACAO: Discord webhook =====
+
+def notificar_discord(itens_novos):
+    """Envia mensagem no Discord com lista de novos itens. Silencioso se DISCORD_WEBHOOK_URL nao configurado."""
+    if not DISCORD_WEBHOOK_URL or not itens_novos:
+        return
+    try:
+        import urllib.request
+
+        # Limita a 10 itens por mensagem (Discord tem limite de tamanho)
+        limit = 10
+        itens_to_send = itens_novos[:limit]
+        extra_count = len(itens_novos) - limit
+
+        embeds = []
+        for it in itens_to_send:
+            rel = it.get("relevancia", 5)
+            # Cor do embed segundo a relevancia (BBGGRR -> int)
+            cores = {
+                10: 0xdc2626, 9: 0xea580c, 8: 0xf97316, 7: 0xeab308,
+                6: 0x84cc16, 5: 0x22c55e, 4: 0x10b981, 3: 0x06b6d4,
+                2: 0x0ea5e9, 1: 0x2563eb,
+            }
+            color = cores.get(int(rel), 0x888888)
+
+            titulo = it.get("titulo", "(sem titulo)")[:200]
+            desc = it.get("descricao", "")[:300]
+            link = it.get("link", "")
+            estado = it.get("estado", "")
+            banca = it.get("banca", "")
+            flag = it.get("flag", "")
+
+            campos_meta = []
+            if estado:
+                campos_meta.append("\U0001F4CD " + estado)  # round pin
+            if banca:
+                campos_meta.append("\U0001F3DB\uFE0F " + banca)  # classical building
+            if flag:
+                campos_meta.append("\U0001F3F7\uFE0F " + flag)  # label
+            meta_line = " \u00B7 ".join(campos_meta)
+
+            embed = {
+                "title": titulo,
+                "description": (meta_line + "\n\n" + desc) if meta_line else desc,
+                "color": color,
+                "footer": {"text": f"Relevancia {rel}/10"},
+            }
+            if link:
+                embed["url"] = link
+            embeds.append(embed)
+
+        content_extra = ""
+        if extra_count > 0:
+            content_extra = f"\n_(+{extra_count} itens adicionais no painel)_"
+
+        payload = {
+            "content": "\U0001F514 **" + str(len(itens_novos)) + " oportunidade(s) nova(s)** no painel Silva Pinto" + content_extra,
+            "embeds": embeds,
+            "username": "Painel Silva Pinto",
+        }
+
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL,
+            data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "SilvaPinto/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status >= 300:
+                log.warning("Discord webhook retornou status %d", resp.status)
+        log.info("Discord notificado: %d itens", len(itens_novos))
+    except Exception as e:
+        log.warning("Falha ao notificar Discord: %s", e)
 
 
 def coletar_categoria(api_key, cat_id, hoje):
@@ -756,33 +1059,41 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
 
 
 def salvar_itens(itens):
+    """Salva itens novos no banco. Retorna lista de itens efetivamente inseridos (para notificacao)."""
     if not itens:
-        return 0
-    novos = 0
+        return []
+    inseridos = []
     agora = datetime.now(timezone.utc).isoformat()
     with db_conn() as conn:
         for item in itens:
             h = hash_for_dedup(item["titulo"], item.get("orgao", ""))
+
+            # Enriquecimento de metricas (YouTube/Reddit) - silencioso se nao configurado
+            metricas = enrich_metricas(item.get("link", ""))
+            metricas_json = json.dumps(metricas, ensure_ascii=False) if metricas else ""
+
             try:
                 conn.execute(
                     """INSERT INTO oportunidades
                     (categoria, tier, flag, titulo, descricao, orgao, estado,
                      concurso, cargo, banca, vagas, salario, prazo_inscricao,
                      data_prova, fase_atual, data_publicacao, extras_json,
-                     link, relevancia, etapa_concurso, data_coleta, hash_unico)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     link, relevancia, etapa_concurso, data_coleta, hash_unico,
+                     metricas_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (item["categoria"], item["tier"], item["flag"],
                      item["titulo"], item["descricao"], item["orgao"], item["estado"],
                      item["concurso"], item["cargo"], item["banca"], item["vagas"],
                      item["salario"], item["prazo_inscricao"], item["data_prova"],
                      item["fase_atual"], item.get("data_publicacao", ""),
                      item["extras_json"], item["link"],
-                     item["relevancia"], item["etapa_concurso"], agora, h)
+                     item["relevancia"], item["etapa_concurso"], agora, h,
+                     metricas_json)
                 )
-                novos += 1
+                inseridos.append(item)
             except sqlite3.IntegrityError:
                 pass
-    return novos
+    return inseridos
 
 
 def executar_coleta(api_key, categorias_a_rodar, tipo_run="manual"):
@@ -796,33 +1107,32 @@ def executar_coleta(api_key, categorias_a_rodar, tipo_run="manual"):
     inicio = datetime.now(timezone.utc)
     total_novos = 0
     erros = []
+    todos_itens_novos = []  # acumula pra notificacao Discord
 
-    DELAY_ENTRE_CATEGORIAS_SEG = 35  # garante folga sobre 30k tokens/min
+    DELAY_ENTRE_CATEGORIAS_SEG = 35
 
     for idx, cat_id in enumerate(categorias_a_rodar):
         if cat_id not in CATEGORIAS:
             continue
 
-        # Throttle: espera entre categorias para nao estourar rate limit
         if idx > 0:
             log.info("[throttle] aguardando %ds antes de %s", DELAY_ENTRE_CATEGORIAS_SEG, cat_id)
             time.sleep(DELAY_ENTRE_CATEGORIAS_SEG)
 
-        # Tenta a categoria com 1 retry adicional em caso de 429
         tentativas = 0
         max_tentativas = 2
         while tentativas < max_tentativas:
             tentativas += 1
             try:
                 itens, erro = coletar_categoria(api_key, cat_id, inicio)
-                # Se deu 429, espera mais e tenta de novo
                 if erro and "429" in str(erro) and tentativas < max_tentativas:
                     log.warning("[%s] rate limit 429 - esperando 60s e tentando de novo", cat_id)
                     time.sleep(60)
                     continue
-                novos = salvar_itens(itens)
-                total_novos += novos
-                log.info("[%s] %d novos salvos (de %d encontrados)", cat_id, novos, len(itens))
+                inseridos = salvar_itens(itens)
+                total_novos += len(inseridos)
+                todos_itens_novos.extend(inseridos)
+                log.info("[%s] %d novos salvos (de %d encontrados)", cat_id, len(inseridos), len(itens))
                 if erro:
                     erros.append(f"{cat_id}: {erro}")
                 break
@@ -847,6 +1157,12 @@ def executar_coleta(api_key, categorias_a_rodar, tipo_run="manual"):
              total_novos, duracao, 1 if sucesso else 0,
              "; ".join(erros) if erros else None)
         )
+
+    # Notificacao Discord: so se teve algo novo
+    if todos_itens_novos:
+        # Ordena por relevancia (maiores primeiro)
+        todos_itens_novos.sort(key=lambda x: -int(x.get("relevancia", 5) or 5))
+        notificar_discord(todos_itens_novos)
 
     return {
         "tipo_run": tipo_run,
@@ -923,6 +1239,19 @@ def api_listar():
     with db_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
 
+        # Pega contagem de notas por oportunidade em um query so
+        notas_count = {}
+        if rows:
+            ids = [_dict_from_row(r)["id"] for r in rows]
+            placeholders = ",".join(["?"] * len(ids))
+            counts = conn.execute(
+                f"SELECT oportunidade_id, COUNT(*) AS c FROM notas WHERE oportunidade_id IN ({placeholders}) GROUP BY oportunidade_id",
+                ids
+            ).fetchall()
+            for c in counts:
+                d = _dict_from_row(c)
+                notas_count[d["oportunidade_id"]] = d["c"]
+
     itens = []
     for r in rows:
         d = _dict_from_row(r)
@@ -933,6 +1262,14 @@ def api_listar():
                 d["extras"] = {}
         else:
             d["extras"] = {}
+        if d.get("metricas_json"):
+            try:
+                d["metricas"] = json.loads(d["metricas_json"])
+            except:
+                d["metricas"] = None
+        else:
+            d["metricas"] = None
+        d["notas_count"] = notas_count.get(d["id"], 0)
         itens.append(d)
 
     return jsonify({"total": len(itens), "itens": itens})
@@ -949,6 +1286,51 @@ def api_marcar_lido(item_id):
 def api_arquivar(item_id):
     with db_conn() as conn:
         conn.execute("UPDATE oportunidades SET arquivado = 1 WHERE id = ?", (item_id,))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/oportunidades/<int:item_id>/notas", methods=["GET"])
+def api_listar_notas(item_id):
+    """Lista todas as notas de uma oportunidade, mais recentes primeiro."""
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM notas WHERE oportunidade_id = ? ORDER BY id DESC",
+            (item_id,)
+        ).fetchall()
+    notas = [_dict_from_row(r) for r in rows]
+    return jsonify({"total": len(notas), "notas": notas})
+
+
+@app.route("/api/oportunidades/<int:item_id>/notas", methods=["POST"])
+def api_adicionar_nota(item_id):
+    """Cria uma nova nota. Body JSON: {texto: '...'}. Maximo 500 caracteres."""
+    data = request.get_json(silent=True) or {}
+    texto = (data.get("texto") or "").strip()
+    if not texto:
+        return jsonify({"erro": "texto vazio"}), 400
+    if len(texto) > 500:
+        texto = texto[:500]
+
+    agora = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        # Verifica se a oportunidade existe
+        ex = conn.execute(
+            "SELECT id FROM oportunidades WHERE id = ?", (item_id,)
+        ).fetchone()
+        if not ex:
+            return jsonify({"erro": "oportunidade nao encontrada"}), 404
+        conn.execute(
+            "INSERT INTO notas (oportunidade_id, texto, data_criacao) VALUES (?, ?, ?)",
+            (item_id, texto, agora)
+        )
+    return jsonify({"ok": True, "data_criacao": agora})
+
+
+@app.route("/api/notas/<int:nota_id>", methods=["DELETE"])
+def api_deletar_nota(nota_id):
+    """Apaga uma nota especifica (botao lixeira ao lado de cada nota)."""
+    with db_conn() as conn:
+        conn.execute("DELETE FROM notas WHERE id = ?", (nota_id,))
     return jsonify({"ok": True})
 
 
@@ -1099,6 +1481,10 @@ def debug_page():
         "modelo_tier23": MODEL_TIER23,
         "tem_api_key": bool(ANTHROPIC_API_KEY),
         "tem_cron_secret": bool(CRON_SECRET),
+        "tem_discord_webhook": bool(DISCORD_WEBHOOK_URL),
+        "tem_youtube_api": bool(YOUTUBE_API_KEY),
+        "tem_reddit_api": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET),
+        "usando_turso": USANDO_TURSO,
         "db_path": str(DB_PATH),
         "db_existe": DB_PATH.exists(),
         "total_no_banco": total,
@@ -1124,6 +1510,7 @@ def health():
 
 # Init
 init_db()
+_ensure_metricas_column()
 
 
 # Logo PNG transparente embutido (gerado a partir da logo Silva Pinto)
@@ -1185,10 +1572,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
       font-size: 14px;
     }
     header {
-      background: var(--navy);
+      background: #3a3d42;
       color: white;
       padding: 14px 24px;
-      box-shadow: 0 2px 12px rgba(26, 40, 66, 0.15);
+      box-shadow: 0 2px 12px rgba(58, 61, 66, 0.15);
       position: sticky;
       top: 0;
       z-index: 100;
@@ -1443,16 +1830,149 @@ HTML_INDEX = r"""<!DOCTYPE html>
     .flag-badge.CONCORRENCIA { background: #475569; color: white; }
     .relevancia {
       margin-left: auto;
-      background: var(--gold-pale);
-      color: var(--gold-dark);
+      color: #000;
       font-size: 10px;
       font-weight: 700;
       padding: 4px 9px;
       border-radius: 3px;
       letter-spacing: 0.5px;
     }
-    .relevancia.alta { background: #fef3c7; color: #b45309; }
-    .relevancia.maxima { background: var(--gold); color: white; }
+    /* Espectro arco-iris invertido: 10 = vermelho urgente, 1 = azul calmo */
+    .relevancia.r10 { background: #dc2626; }
+    .relevancia.r9  { background: #ea580c; }
+    .relevancia.r8  { background: #f97316; }
+    .relevancia.r7  { background: #eab308; }
+    .relevancia.r6  { background: #84cc16; }
+    .relevancia.r5  { background: #22c55e; }
+    .relevancia.r4  { background: #10b981; }
+    .relevancia.r3  { background: #06b6d4; }
+    .relevancia.r2  { background: #0ea5e9; }
+    .relevancia.r1  { background: #2563eb; }
+
+    /* Botao Notas */
+    .card-action.notas {
+      transition: all 0.2s;
+    }
+    .card-action.notas.tem-notas {
+      border-color: #2563eb;
+      color: #1d4ed8;
+      background: #eff6ff;
+      font-weight: 700;
+    }
+    .notas-panel {
+      margin-top: 10px;
+      padding: 12px 14px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 4px;
+      display: none;
+    }
+    .notas-panel.aberto { display: block; }
+    .notas-textarea {
+      width: 100%;
+      min-height: 70px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      font-family: 'Montserrat', sans-serif;
+      font-size: 12px;
+      resize: vertical;
+      box-sizing: border-box;
+    }
+    .notas-textarea:focus {
+      outline: none;
+      border-color: var(--gold);
+    }
+    .notas-bottom {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .notas-counter {
+      font-size: 10px;
+      color: var(--text-secondary);
+    }
+    .notas-counter.warn { color: #c2410c; font-weight: 600; }
+    .notas-btn-salvar {
+      margin-left: auto;
+      background: var(--gold);
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 3px;
+      font-family: 'Montserrat', sans-serif;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .notas-btn-salvar:hover { background: var(--gold-light); }
+    .notas-btn-salvar:disabled { opacity: 0.4; cursor: not-allowed; }
+    .notas-lista {
+      margin-top: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .nota-item {
+      background: white;
+      border: 1px solid var(--line-soft);
+      border-left: 3px solid var(--gold);
+      border-radius: 3px;
+      padding: 8px 10px;
+      font-size: 12px;
+      color: var(--text-primary);
+      line-height: 1.45;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .nota-item .nota-conteudo { flex: 1; }
+    .nota-item .nota-meta {
+      font-size: 9px;
+      color: var(--text-muted);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      margin-top: 4px;
+      font-weight: 600;
+    }
+    .nota-deletar {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 14px;
+      padding: 0 4px;
+      line-height: 1;
+    }
+    .nota-deletar:hover { color: var(--tier1); }
+
+    /* Metricas reais (YouTube/Reddit) */
+    .metricas-reais {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 8px 10px;
+      background: #f1f5f9;
+      border-radius: 3px;
+      font-size: 11px;
+      color: #334155;
+      margin-top: 4px;
+    }
+    .metricas-reais .met-label {
+      font-weight: 600;
+      color: var(--navy);
+    }
+    .metricas-reais .met-source {
+      font-size: 9px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      font-weight: 700;
+      margin-right: 4px;
+    }
 
     .card-title {
       font-family: 'Cormorant Garamond', serif;
@@ -1596,7 +2116,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
       position: fixed;
       bottom: 24px;
       right: 24px;
-      background: var(--navy);
+      background: #3a3d42;
       color: white;
       padding: 14px 22px;
       border-radius: 4px;
@@ -1844,12 +2364,13 @@ HTML_INDEX = r"""<!DOCTYPE html>
     }
 
     function renderCard(item) {
-      let relClass = '';
-      if (item.relevancia >= 9) relClass = 'maxima';
-      else if (item.relevancia >= 7) relClass = 'alta';
+      // Espectro arco-iris invertido: r10 vermelho, r1 azul
+      let r = parseInt(item.relevancia, 10);
+      if (isNaN(r) || r < 1) r = 1;
+      if (r > 10) r = 10;
+      const relClass = 'r' + r;
 
       const flagSafe = (item.flag || '').replace(/[^A-Z]/g, '');
-      // Para categoria taf_fases: mostrar a fase especifica em vez do generico "FASE"
       let flagPretty = (item.flag || '').replace('CONCORRENCIA', 'CONCORR.');
       if (item.flag === 'FASE' && item.extras && item.extras.fase_eliminacao) {
         flagPretty = String(item.extras.fase_eliminacao).toUpperCase().substring(0, 18);
@@ -1871,8 +2392,19 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '</div>';
       }
 
+      // Layout do titulo varia por categoria
       let titleArea;
-      if (item.concurso) {
+      if (item.categoria === 'jurisprudencia') {
+        // Para jurisprudencia: titulo da materia em destaque, concurso/contexto embaixo menor
+        titleArea = '<div class="card-title">' + escapeHtml(item.titulo) + '</div>';
+        const subParts = [];
+        if (item.concurso) subParts.push(item.concurso);
+        if (item.cargo) subParts.push(item.cargo);
+        if (subParts.length) {
+          titleArea += '<div class="card-subtitle">' + escapeHtml(subParts.join(' \u00B7 ')) + '</div>';
+        }
+      } else if (item.concurso) {
+        // Padrao: nome do concurso primeiro, titulo da materia embaixo
         const cargoStr = item.cargo ? ' &middot; ' + escapeHtml(item.cargo) : '';
         titleArea = '<div class="card-title">' + escapeHtml(item.concurso) + cargoStr + '</div>';
         if (item.titulo && item.titulo !== item.concurso) {
@@ -1889,6 +2421,31 @@ HTML_INDEX = r"""<!DOCTYPE html>
       if (item.prazo_inscricao) badges.push('<span class="badge fase">Inscr.: ' + escapeHtml(item.prazo_inscricao) + '</span>');
       if (item.data_prova) badges.push('<span class="badge">Prova: ' + escapeHtml(item.data_prova) + '</span>');
       if (item.data_publicacao) badges.push('<span class="badge data">' + escapeHtml(item.data_publicacao) + '</span>');
+
+      // Metricas reais (YouTube/Reddit)
+      let metricasBlock = '';
+      if (item.metricas) {
+        const m = item.metricas;
+        const partes = [];
+        if (m.fonte === 'youtube') {
+          partes.push('<span class="met-source">YouTube</span>');
+          if (m.views !== null && m.views !== undefined) partes.push('<span><span class="met-label">Views:</span> ' + Number(m.views).toLocaleString('pt-BR') + '</span>');
+          if (m.likes !== null && m.likes !== undefined) partes.push('<span><span class="met-label">Likes:</span> ' + Number(m.likes).toLocaleString('pt-BR') + '</span>');
+          if (m.comments !== null && m.comments !== undefined) partes.push('<span><span class="met-label">Coment.:</span> ' + Number(m.comments).toLocaleString('pt-BR') + '</span>');
+          if (m.published_at) partes.push('<span><span class="met-label">Publicado:</span> ' + escapeHtml(m.published_at) + '</span>');
+          if (m.channel) partes.push('<span><span class="met-label">Canal:</span> ' + escapeHtml(m.channel) + '</span>');
+        } else if (m.fonte === 'reddit') {
+          partes.push('<span class="met-source">Reddit</span>');
+          if (m.subreddit) partes.push('<span class="met-label">' + escapeHtml(m.subreddit) + '</span>');
+          if (m.score !== null && m.score !== undefined) partes.push('<span><span class="met-label">Score:</span> ' + Number(m.score).toLocaleString('pt-BR') + '</span>');
+          if (m.upvotes !== null && m.upvotes !== undefined) partes.push('<span><span class="met-label">Upvotes:</span> ' + Number(m.upvotes).toLocaleString('pt-BR') + '</span>');
+          if (m.comments !== null && m.comments !== undefined) partes.push('<span><span class="met-label">Coment.:</span> ' + Number(m.comments).toLocaleString('pt-BR') + '</span>');
+          if (m.published_at) partes.push('<span><span class="met-label">Publicado:</span> ' + escapeHtml(m.published_at) + '</span>');
+        }
+        if (partes.length) {
+          metricasBlock = '<div class="metricas-reais">' + partes.join(' ') + '</div>';
+        }
+      }
 
       let extrasBlock = '';
       if (item.extras && Object.keys(item.extras).length) {
@@ -1925,6 +2482,22 @@ HTML_INDEX = r"""<!DOCTYPE html>
       const linkHtml = item.link ?
         '<a class="card-link" href="' + escapeHtml(item.link) + '" target="_blank" rel="noopener">Ver fonte &rarr;</a>' : '';
 
+      // Botao Notas - varia se ja tem nota
+      const notasCount = parseInt(item.notas_count || 0, 10);
+      const notasClass = notasCount > 0 ? 'card-action notas tem-notas' : 'card-action notas';
+      const notasLabel = notasCount > 0 ? ('Notas (' + notasCount + ')') : 'Notas';
+
+      // Painel de notas (escondido por padrao)
+      const notasPanel =
+        '<div class="notas-panel" id="notas-panel-' + item.id + '">' +
+          '<textarea class="notas-textarea" id="nota-input-' + item.id + '" maxlength="500" placeholder="Escreva uma nota (max 500 caracteres)..." oninput="atualizarContador(' + item.id + ')"></textarea>' +
+          '<div class="notas-bottom">' +
+            '<span class="notas-counter" id="contador-' + item.id + '">0/500</span>' +
+            '<button class="notas-btn-salvar" onclick="salvarNota(' + item.id + ')">Salvar nota</button>' +
+          '</div>' +
+          '<div class="notas-lista" id="notas-lista-' + item.id + '"></div>' +
+        '</div>';
+
       return '<div class="card tier' + item.tier + '" data-id="' + item.id + '">' +
         '<div class="card-flag-row">' +
           '<span class="flag-badge ' + flagSafe + '">' + escapeHtml(flagPretty) + '</span>' +
@@ -1934,13 +2507,125 @@ HTML_INDEX = r"""<!DOCTYPE html>
         concursoBlock +
         (badges.length ? '<div class="card-meta">' + badges.join('') + '</div>' : '') +
         '<div class="card-desc">' + escapeHtml(item.descricao || '') + '</div>' +
+        metricasBlock +
         extrasBlock +
         '<div class="card-actions">' +
           '<button class="card-action" onclick="marcarLido(' + item.id + ')">Lido</button>' +
           '<button class="card-action" onclick="arquivar(' + item.id + ')">Arquivar</button>' +
+          '<button class="' + notasClass + '" onclick="toggleNotas(' + item.id + ')" id="btn-notas-' + item.id + '">' + notasLabel + '</button>' +
           linkHtml +
         '</div>' +
+        notasPanel +
       '</div>';
+    }
+
+    // ===== NOTAS =====
+
+    async function toggleNotas(id) {
+      const panel = document.getElementById('notas-panel-' + id);
+      if (!panel) return;
+      const aberto = panel.classList.contains('aberto');
+      if (aberto) {
+        panel.classList.remove('aberto');
+        return;
+      }
+      panel.classList.add('aberto');
+      // Carrega lista de notas
+      await carregarNotas(id);
+    }
+
+    async function carregarNotas(id) {
+      try {
+        const r = await fetch('/api/oportunidades/' + id + '/notas');
+        const data = await r.json();
+        const lista = document.getElementById('notas-lista-' + id);
+        if (!lista) return;
+        if (!data.notas || data.notas.length === 0) {
+          lista.innerHTML = '<div style="font-size:11px;color:var(--text-muted);font-style:italic;padding:6px 0">Nenhuma nota ainda.</div>';
+          return;
+        }
+        lista.innerHTML = data.notas.map(n => {
+          const dt = formatarDataNota(n.data_criacao);
+          return '<div class="nota-item">' +
+            '<div class="nota-conteudo">' +
+              escapeHtml(n.texto) +
+              '<div class="nota-meta">' + dt + '</div>' +
+            '</div>' +
+            '<button class="nota-deletar" onclick="deletarNota(' + n.id + ', ' + id + ')" title="Apagar nota">&times;</button>' +
+          '</div>';
+        }).join('');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function formatarDataNota(iso) {
+      if (!iso) return '';
+      try {
+        const d = new Date(iso);
+        return d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+      } catch (e) { return iso.substring(0, 16); }
+    }
+
+    function atualizarContador(id) {
+      const input = document.getElementById('nota-input-' + id);
+      const counter = document.getElementById('contador-' + id);
+      if (!input || !counter) return;
+      const len = input.value.length;
+      counter.textContent = len + '/500';
+      counter.classList.toggle('warn', len > 450);
+    }
+
+    async function salvarNota(id) {
+      const input = document.getElementById('nota-input-' + id);
+      if (!input) return;
+      const texto = input.value.trim();
+      if (!texto) { toast('Escreva algo antes de salvar'); return; }
+      try {
+        const r = await fetch('/api/oportunidades/' + id + '/notas', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ texto })
+        });
+        const data = await r.json();
+        if (data.erro) { toast('Erro: ' + data.erro); return; }
+        input.value = '';
+        atualizarContador(id);
+        await carregarNotas(id);
+        // Atualiza o botao com novo contador
+        atualizarBotaoNotas(id);
+      } catch (e) {
+        toast('Erro ao salvar nota');
+      }
+    }
+
+    async function deletarNota(notaId, opId) {
+      if (!confirm('Apagar esta nota?')) return;
+      try {
+        await fetch('/api/notas/' + notaId, { method: 'DELETE' });
+        await carregarNotas(opId);
+        atualizarBotaoNotas(opId);
+      } catch (e) {
+        toast('Erro ao apagar');
+      }
+    }
+
+    async function atualizarBotaoNotas(id) {
+      // Recontagem rapida buscando a lista
+      try {
+        const r = await fetch('/api/oportunidades/' + id + '/notas');
+        const data = await r.json();
+        const btn = document.getElementById('btn-notas-' + id);
+        if (!btn) return;
+        const total = data.total || 0;
+        if (total > 0) {
+          btn.classList.add('tem-notas');
+          btn.textContent = 'Notas (' + total + ')';
+        } else {
+          btn.classList.remove('tem-notas');
+          btn.textContent = 'Notas';
+        }
+      } catch (e) { /* ignora */ }
     }
 
     async function marcarLido(id) {
