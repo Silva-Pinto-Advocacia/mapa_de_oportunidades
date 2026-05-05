@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.5-2026-05-05-anti-fake"
+APP_VERSION = "v6.4.6-2026-05-05-cron-bg"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1689,6 +1689,24 @@ def api_status():
     })
 
 
+def _executar_coleta_background(api_key, categorias, tipo_run):
+    """Roda executar_coleta em uma thread de background. Pra crons fire-and-forget.
+
+    Permite que o endpoint responda imediatamente com 200 OK (~30 bytes), evitando
+    timeout do cron-job.org (30s) e erro de 'saida muito grande'.
+    """
+    import threading
+
+    def _run():
+        try:
+            executar_coleta(api_key, categorias, tipo_run=tipo_run)
+        except Exception as e:
+            log.error("Coleta background (%s) falhou: %s", tipo_run, e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
 @app.route("/cron/tier1", methods=["GET", "POST"])
 def cron_tier1():
     if CRON_SECRET:
@@ -1699,16 +1717,13 @@ def cron_tier1():
         return jsonify({"erro": "API key nao configurada"}), 500
 
     log.info("=" * 60)
-    log.info("CRON TIER 1 disparado em %s", datetime.now(timezone.utc).isoformat())
+    log.info("CRON TIER 1 disparado em %s (background)", datetime.now(timezone.utc).isoformat())
     log.info("=" * 60)
 
     cats = categorias_por_tier(1)
-    try:
-        result = executar_coleta(ANTHROPIC_API_KEY, cats, tipo_run="tier1")
-        return jsonify(result)
-    except Exception as e:
-        log.error("Cron tier1 falhou: %s", e)
-        return jsonify({"erro": str(e)}), 500
+    _executar_coleta_background(ANTHROPIC_API_KEY, cats, tipo_run="tier1")
+    # Resposta minima e imediata - cron-job.org recebe sem timeout/saida grande
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/cron/tier23", methods=["GET", "POST"])
@@ -1721,16 +1736,12 @@ def cron_tier23():
         return jsonify({"erro": "API key nao configurada"}), 500
 
     log.info("=" * 60)
-    log.info("CRON TIER 2+3 disparado em %s", datetime.now(timezone.utc).isoformat())
+    log.info("CRON TIER 2+3 disparado em %s (background)", datetime.now(timezone.utc).isoformat())
     log.info("=" * 60)
 
     cats = categorias_por_tier(2, 3)
-    try:
-        result = executar_coleta(ANTHROPIC_API_KEY, cats, tipo_run="tier23")
-        return jsonify(result)
-    except Exception as e:
-        log.error("Cron tier23 falhou: %s", e)
-        return jsonify({"erro": str(e)}), 500
+    _executar_coleta_background(ANTHROPIC_API_KEY, cats, tipo_run="tier23")
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/cron/manual", methods=["POST"])
