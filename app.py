@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4-2026-05-05-melhorias"
+APP_VERSION = "v6.4.1-2026-05-05-libsql-novo"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,9 +45,9 @@ USANDO_TURSO = bool(TURSO_URL and TURSO_TOKEN)
 if USANDO_TURSO:
     log.info("DB: Turso (persistente) em %s", TURSO_URL.replace("libsql://", ""))
     try:
-        import libsql_client
+        import libsql  # nova biblioteca oficial Turso (substitui libsql-client deprecada)
     except ImportError:
-        log.error("libsql_client nao instalado! pip install libsql-client. Caindo para SQLite local.")
+        log.error("Pacote libsql nao instalado! Adicione 'libsql' ao requirements.txt. Caindo para SQLite local.")
         USANDO_TURSO = False
 else:
     log.info("DB: SQLite local em %s (sera apagado se Render reiniciar)", DB_PATH)
@@ -334,62 +334,81 @@ def _ensure_metricas_column():
 
 
 class TursoConnWrapper:
-    """Wrapper que apresenta API parecida com sqlite3.Connection com row_factory=Row.
+    """Wrapper sobre a nova biblioteca 'libsql' da Turso (substitui a antiga 'libsql-client').
 
-    Usa libsql_client.create_client_sync para falar com Turso via HTTP.
-    Buffer de mudancas e .commit() faz batch (libsql ja eh autocommit, entao
-    o commit e no-op, mas mantemos a API).
+    A nova lib ja tem API estilo sqlite3 nativa: .cursor(), .execute(), .fetchall(),
+    .commit(), .close(). So precisamos adaptar pra ter a row_factory parecida com Row.
     """
     class _IntegrityError(Exception):
         pass
 
     def __init__(self):
-        self.client = libsql_client.create_client_sync(
-            url=TURSO_URL,
+        # libsql.connect aceita um path local (ou ":memory:") + sync_url + auth_token
+        # Pra conexao puramente remota, passamos sync_url e usamos um db local efemero
+        self.conn = libsql.connect(
+            ":memory:",  # banco efemero local (so existe na memoria do worker)
+            sync_url=TURSO_URL,
             auth_token=TURSO_TOKEN,
         )
+        # Sync inicial pra puxar tudo do remoto
+        try:
+            self.conn.sync()
+        except Exception as e:
+            log.warning("libsql.sync inicial falhou (talvez DB vazia): %s", e)
 
     def execute(self, sql, params=()):
-        """Executa SQL. Retorna self.Cursor compativel."""
+        """Executa SQL. Retorna TursoCursor compativel com sqlite3.Cursor."""
         try:
-            rs = self.client.execute(sql, list(params) if params else None)
+            cur = self.conn.cursor()
+            if params:
+                cur.execute(sql, list(params))
+            else:
+                cur.execute(sql)
+            return TursoCursor(cur)
         except Exception as e:
             msg = str(e).lower()
             if "unique" in msg or "constraint" in msg:
                 raise sqlite3.IntegrityError(str(e))
             raise
-        return TursoCursor(rs)
 
     def executescript(self, script):
         """Executa multiplos statements separados por ;"""
         statements = [s.strip() for s in script.split(';') if s.strip()]
         for stmt in statements:
             try:
-                self.client.execute(stmt)
+                self.conn.execute(stmt)
             except Exception as e:
-                # CREATE INDEX IF NOT EXISTS as vezes da erro de "ja existe" no Turso
                 msg = str(e).lower()
                 if "already exists" in msg:
                     continue
                 raise
 
     def commit(self):
-        pass  # Turso e autocommit
+        """Commit local + push pro remoto."""
+        try:
+            self.conn.commit()
+        except Exception:
+            pass
+        try:
+            self.conn.sync()  # empurra mudancas pro remoto
+        except Exception as e:
+            log.warning("libsql.sync no commit falhou: %s", e)
 
     def close(self):
         try:
-            self.client.close()
+            self.conn.close()
         except Exception:
             pass
 
 
 class TursoCursor:
-    """Wrapper sobre o resultado do libsql para parecer com sqlite3.Cursor + Row."""
-    def __init__(self, rs):
-        self.rs = rs
-        # rs.columns = lista de nomes de coluna; rs.rows = lista de tuplas
-        self.columns = list(rs.columns) if rs.columns else []
-        self._rows_iter = iter(rs.rows) if rs.rows else iter([])
+    """Wrapper minimo sobre o cursor da nova lib pra retornar TursoRow."""
+    def __init__(self, cur):
+        self.cur = cur
+        # description tem nomes de coluna em formato (name, ...)
+        self.columns = []
+        if cur.description:
+            self.columns = [d[0] for d in cur.description]
 
     def _wrap(self, row):
         if row is None:
@@ -397,14 +416,12 @@ class TursoCursor:
         return TursoRow(self.columns, row)
 
     def fetchone(self):
-        try:
-            r = next(self._rows_iter)
-            return self._wrap(r)
-        except StopIteration:
-            return None
+        r = self.cur.fetchone()
+        return self._wrap(r)
 
     def fetchall(self):
-        return [self._wrap(r) for r in self._rows_iter]
+        rows = self.cur.fetchall()
+        return [self._wrap(r) for r in rows]
 
 
 class TursoRow:
