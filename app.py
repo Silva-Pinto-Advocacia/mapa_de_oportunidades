@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.2-2026-05-05-libsql-remote"
+APP_VERSION = "v6.4.3-2026-05-05-singleton"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -338,53 +338,91 @@ class TursoConnWrapper:
 
     Usa modo REMOTO PURO (sem embedded replica) - mais simples e funciona
     em ambientes sem filesystem persistente como Render free.
+
+    SINGLETON com lock: a conexao real e criada UMA UNICA VEZ por worker do gunicorn
+    e reusada em todas as requisicoes. Isso evita o overhead de abrir/fechar HTTPS
+    a cada query, que estava deixando o app travado.
     """
     class _IntegrityError(Exception):
         pass
 
+    # Singleton compartilhado entre threads do mesmo worker
+    _shared_conn = None
+    _lock = None  # threading.Lock - inicializado lazy
+
     def __init__(self):
-        # Modo remoto puro: passa a URL diretamente, sem path local
-        # (path local + sync_url cria embedded replica que falha no Render free)
-        self.conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+        import threading
+        # Inicializa lock se ainda nao existe (uma vez por processo)
+        if TursoConnWrapper._lock is None:
+            TursoConnWrapper._lock = threading.Lock()
+        # Pega ou cria a conexao compartilhada
+        with TursoConnWrapper._lock:
+            if TursoConnWrapper._shared_conn is None:
+                TursoConnWrapper._shared_conn = libsql.connect(
+                    TURSO_URL, auth_token=TURSO_TOKEN
+                )
+        self.conn = TursoConnWrapper._shared_conn
 
     def execute(self, sql, params=()):
-        """Executa SQL. Retorna TursoCursor compativel com sqlite3.Cursor."""
-        try:
-            cur = self.conn.cursor()
-            if params:
-                cur.execute(sql, list(params))
-            else:
-                cur.execute(sql)
-            return TursoCursor(cur)
-        except Exception as e:
-            msg = str(e).lower()
-            if "unique" in msg or "constraint" in msg:
-                raise sqlite3.IntegrityError(str(e))
-            raise
+        """Executa SQL com lock pra evitar race condition entre threads."""
+        with TursoConnWrapper._lock:
+            try:
+                cur = self.conn.cursor()
+                if params:
+                    cur.execute(sql, list(params))
+                else:
+                    cur.execute(sql)
+                return TursoCursor(cur)
+            except Exception as e:
+                msg = str(e).lower()
+                if "unique" in msg or "constraint" in msg:
+                    raise sqlite3.IntegrityError(str(e))
+                # Em caso de erro de conexao, invalida a singleton pra recriar
+                if "closed" in msg or "broken" in msg or "connection" in msg:
+                    log.warning("Conexao Turso quebrou, sera recriada: %s", e)
+                    try:
+                        self.conn.close()
+                    except Exception:
+                        pass
+                    TursoConnWrapper._shared_conn = None
+                raise
 
     def executescript(self, script):
         """Executa multiplos statements separados por ;"""
         statements = [s.strip() for s in script.split(';') if s.strip()]
-        for stmt in statements:
-            try:
-                self.conn.execute(stmt)
-            except Exception as e:
-                msg = str(e).lower()
-                if "already exists" in msg:
-                    continue
-                raise
+        with TursoConnWrapper._lock:
+            for stmt in statements:
+                try:
+                    self.conn.execute(stmt)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "already exists" in msg:
+                        continue
+                    raise
 
     def commit(self):
         try:
-            self.conn.commit()
+            with TursoConnWrapper._lock:
+                self.conn.commit()
         except Exception:
             pass
 
     def close(self):
+        # NAO fecha a singleton - ela fica viva ate o worker morrer
+        pass
+
+
+def _close_shared_conn_on_exit():
+    """Fecha a conexao Turso quando o worker sai. Registrado via atexit."""
+    if TursoConnWrapper._shared_conn is not None:
         try:
-            self.conn.close()
+            TursoConnWrapper._shared_conn.close()
         except Exception:
             pass
+
+
+import atexit
+atexit.register(_close_shared_conn_on_exit)
 
 
 class TursoCursor:
