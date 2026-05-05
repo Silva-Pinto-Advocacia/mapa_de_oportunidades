@@ -1,6 +1,11 @@
 """
-Silva Pinto Advocacia - Painel de Oportunidades
-Single-file MVP: tudo num arquivo so para evitar problemas com pastas no GitHub.
+Silva Pinto Advocacia - Painel de Oportunidades v6.2
+====================================================
+Mudancas:
+- Persistencia via Turso (SQLite na nuvem) - dados nao se perdem mais
+- Fallback automatico para SQLite local se TURSO_URL nao configurado
+- Tier 3: queries melhoradas com Reddit, YouTube, Instagram, TikTok
+- Concorrentes monitorados: Pedro Auar, Luanda Naiara, Advogado de Concurso
 """
 
 import os
@@ -18,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v3-2026-05-04-single-file"
+APP_VERSION = "v6.2-2026-05-05-turso-tier3-concorrentes"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,60 +35,388 @@ log.info("=" * 70)
 log.info("Silva Pinto Oportunidades %s INICIANDO", APP_VERSION)
 log.info("=" * 70)
 
+# Banco: Turso (na nuvem, persistente) ou SQLite local (efemero, /tmp do Render)
+TURSO_URL = os.environ.get("TURSO_URL", "").strip()
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "").strip()
 DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/oportunidades.db"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+USANDO_TURSO = bool(TURSO_URL and TURSO_TOKEN)
+if USANDO_TURSO:
+    log.info("DB: Turso (persistente) em %s", TURSO_URL.replace("libsql://", ""))
+    try:
+        import libsql_client
+    except ImportError:
+        log.error("libsql_client nao instalado! pip install libsql-client. Caindo para SQLite local.")
+        USANDO_TURSO = False
+else:
+    log.info("DB: SQLite local em %s (sera apagado se Render reiniciar)", DB_PATH)
+
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL_NAME = os.environ.get("MODEL_NAME", "claude-haiku-4-5-20251001")
+MODEL_NAME = os.environ.get("MODEL_NAME", "claude-sonnet-4-5")
+MODEL_TIER1 = os.environ.get("MODEL_TIER1", "claude-sonnet-4-5")
+MODEL_TIER23 = os.environ.get("MODEL_TIER23", "claude-haiku-4-5-20251001")
+DEMO_MODE = os.environ.get("DEMO_MODE", "0") == "1"
 
 app = Flask(__name__)
 
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS oportunidades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            categoria TEXT NOT NULL,
-            titulo TEXT NOT NULL,
-            descricao TEXT,
-            orgao TEXT,
-            estado TEXT,
-            prazo TEXT,
-            link TEXT,
-            relevancia INTEGER DEFAULT 5,
-            lido INTEGER DEFAULT 0,
-            arquivado INTEGER DEFAULT 0,
-            data_coleta TEXT NOT NULL,
-            hash_unico TEXT UNIQUE
-        );
-        CREATE INDEX IF NOT EXISTS idx_categoria ON oportunidades(categoria);
-        CREATE INDEX IF NOT EXISTS idx_data ON oportunidades(data_coleta);
-        CREATE INDEX IF NOT EXISTS idx_lido ON oportunidades(lido);
+CATEGORIAS = {
+    "elim_ativas": {
+        "tier": 1,
+        "label": "Eliminacoes ativas",
+        "flag": "QUENTE",
+        "queries": [
+            "gabarito definitivo concurso publico {mes_ano}",
+            "resultado final concurso publico eliminados {mes_ano}",
+            "nota de corte concurso publico aprovados {mes_ano}",
+            "FGV Cebraspe Vunesp gabarito polemica concurso {mes_ano}",
+        ],
+        "descricao": (
+            "Detectar candidatos sendo ELIMINADOS de concursos publicos AGORA. "
+            "Foco: gabaritos definitivos publicados nos ultimos 7 dias, listas de "
+            "resultados eliminando candidatos, notas de corte recem-divulgadas. "
+            "NAO incluir simples publicacoes de edital novo (isso e Cat 4)."
+        ),
+        "campos_extras": ["concurso", "banca", "fase_eliminacao", "candidatos_estimados"],
+        "max_idade_dias": 7,
+    },
+    "taf_fases": {
+        "tier": 1,
+        "label": "Fases pos-prova",
+        "flag": "FASE",
+        "queries": [
+            "TAF concurso eliminados resultado {mes_ano}",
+            "psicotecnico concurso inapto recurso {mes_ano}",
+            "investigacao social eliminado concurso {mes_ano}",
+            "convocacao TAF concurso PMERJ PRF PM PC CBMDF {mes_ano}",
+        ],
+        "descricao": (
+            "Eliminacao em fases POS-PROVA OBJETIVA. As fases sao DISTINTAS, "
+            "NAO confunda uma com outra. Use SEMPRE o nome correto da fase no "
+            "campo 'fase_eliminacao':\n"
+            "  - 'TAF' (teste de aptidao fisica - corrida, barra, abdominal)\n"
+            "  - 'Psicotecnico' (avaliacao psicologica)\n"
+            "  - 'Investigacao social' (vida pregressa, antecedentes)\n"
+            "  - 'Exame medico' (saude fisica)\n"
+            "  - 'Heteroidentificacao' (verificacao de auto-declaracao racial)\n"
+            "ATENCAO: TAF e FISICO. Psicotecnico e PSICOLOGICO. Sao coisas DIFERENTES. "
+            "NAO classifique psicotecnico como TAF. NAO classifique investigacao social "
+            "como TAF. Cada fase tem seu nome proprio. Tambem incluir convocacoes "
+            "recentes (ultimos 7 dias) para essas fases."
+        ),
+        "campos_extras": ["concurso", "fase_eliminacao", "tipo_irregularidade"],
+        "max_idade_dias": 7,
+    },
+    "recurso_anulacao": {
+        "tier": 1,
+        "label": "Questoes passiveis de recurso",
+        "flag": "RECURSO",
+        "queries": [
+            "questao anulada banca concurso {mes_ano}",
+            "gabarito definitivo alterado concurso {mes_ano}",
+            "recursos deferidos banca concurso {mes_ano}",
+            "Estrategia Gran QConcursos questao polemica {mes_ano}",
+        ],
+        "descricao": (
+            "Questoes polemicas de provas RECENTES - candidatas a anulacao. "
+            "Foco em: questoes ja anuladas pela banca, recursos deferidos, "
+            "questoes apontadas como polemicas por professores/cursinhos."
+        ),
+        "campos_extras": ["concurso", "banca", "questao_numero", "afetados_estimados"],
+        "max_idade_dias": 7,
+    },
+    "radar_volume": {
+        "tier": 2,
+        "label": "Radar de volume - novos concursos",
+        "flag": "VOLUME",
+        "queries": [
+            "concurso publico inscritos abertas {mes_ano}",
+            "edital concurso policial militar estado {mes_ano}",
+            "concurso publico FGV Cebraspe Vunesp edital aberto {mes_ano}",
+            "novo edital PM PC guarda municipal {mes_ano}",
+            "pciconcursos concursos abertos {mes_ano}",
+        ],
+        "descricao": (
+            "NOVOS CONCURSOS abertos com inscricoes ainda vigentes "
+            "(prova objetiva ainda NAO realizada) - editais publicados nos "
+            "ultimos 12 meses. Para cada concurso INFORMAR EXPLICITAMENTE: "
+            "vagas, salario inicial, banca, prazo de inscricao, "
+            "data prevista da prova."
+        ),
+        "campos_extras": ["concurso", "cargo", "vagas", "salario", "banca", "prazo_inscricao", "data_prova"],
+        "max_idade_dias": 365,
+    },
+    "jurisprudencia": {
+        "tier": 2,
+        "label": "Jurisprudencia estrategica",
+        "flag": "JURISPRUDENCIA",
+        "queries": [
+            "STJ decisao concurso publico candidato {ano}",
+            "STF sumula concurso publico eliminacao {ano}",
+            "TJ liminar concurso publico candidato deferida {ano}",
+            "mandado de seguranca concurso STJ {ano}",
+            "TAF ilegal decisao judicial {ano}",
+        ],
+        "descricao": (
+            "Decisoes de tribunais (STJ, STF, TJs) FAVORAVEIS aos candidatos "
+            "em concursos publicos. APENAS DECISOES DOS ULTIMOS 12 MESES. "
+            "Extrair tribunal, tema, numero do processo."
+        ),
+        "campos_extras": ["tribunal", "tema", "numero_processo", "tese"],
+        "max_idade_dias": 365,
+    },
+    "sentimento": {
+        "tier": 3,
+        "label": "Sentimento do candidato",
+        "flag": "VIRAL",
+        "queries": [
+            "site:reddit.com r/concurseiros eliminado",
+            "site:reddit.com concurso TAF eliminado injustamente",
+            "site:youtube.com fui eliminado concurso publico desabafo",
+            "site:tiktok.com eliminado concurso publico",
+            "fui eliminado concurso publico {ano}",
+            "concurso reprovado psicotecnico injusto {mes_ano}",
+            "investigacao social concurso eliminado absurdo {ano}",
+        ],
+        "descricao": (
+            "Conteudo REAL de candidatos desabafando em redes sociais e foruns - "
+            "publicado nos ultimos 45 dias. Procurar em: Reddit (r/concurseiros), "
+            "YouTube (videos de desabafo, lives reagindo a resultado), TikTok, "
+            "Instagram (Reels), Twitter/X, blogs. EXTRAIR sempre que possivel: "
+            "(a) citacao LITERAL do candidato (frase entre aspas) - util como hook "
+            "de Reel, (b) qual concurso foi mencionado, (c) padrao emocional "
+            "predominante (revolta, decepcao, indignacao, medo). Aceitar conteudo "
+            "informal: posts de Reddit, comentarios em videos, threads, etc."
+        ),
+        "campos_extras": ["citacao_candidato", "concurso_mencionado", "padrao_emocional"],
+        "max_idade_dias": 45,
+    },
+    "concorrencia": {
+        "tier": 3,
+        "label": "Movimentos da concorrencia",
+        "flag": "CONCORRENCIA",
+        "queries": [
+            "site:instagram.com advogadodeconcurso reel concurso {ano}",
+            "site:instagram.com pedroauarconcursos {ano}",
+            "site:instagram.com pedroauaroab {ano}",
+            "site:instagram.com luandanaiaraadv concurso {ano}",
+            "Pedro Auar advogado concurso publico liminar {ano}",
+            "Luanda Naiara advocacia concurso publico {ano}",
+            "advogadodeconcurso liminar concurso {mes_ano}",
+            "site:youtube.com Pedro Auar concurso",
+            "site:youtube.com Luanda Naiara advogada concurso",
+        ],
+        "descricao": (
+            "Atividades recentes (ultimos 45 dias) dos CONCORRENTES DIRETOS do "
+            "escritorio Silva Pinto. Sao 3 escritorios/perfis a monitorar:\n"
+            "  1. ADVOGADO DE CONCURSO - perfil @advogadodeconcurso no Instagram\n"
+            "  2. PEDRO AUAR - perfis @pedroauarconcursos e @pedroauaroab\n"
+            "  3. LUANDA NAIARA - perfil @luandanaiaraadv\n"
+            "Procurar em: Instagram (Reels, posts, lives), YouTube (canais e "
+            "videos), blogs juridicos, sites proprios, decisoes onde apareceram "
+            "como advogados, materias na imprensa. Detectar: (a) novos concursos "
+            "onde estao atuando, (b) Reels/videos que viralizaram, (c) teses ou "
+            "estrategias novas, (d) liminares ganhas. EXTRAIR no campo "
+            "'escritorio_concorrente' QUAL dos 3 e o autor do conteudo, em "
+            "'concurso_tema' o concurso/tema explorado, em 'gap_identificado' "
+            "o que eles fazem que Silva Pinto ainda nao faz."
+        ),
+        "campos_extras": ["escritorio_concorrente", "concurso_tema", "gap_identificado"],
+        "max_idade_dias": 45,
+    },
+}
 
-        CREATE TABLE IF NOT EXISTS execucoes_cron (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data_execucao TEXT NOT NULL,
-            categorias_processadas TEXT,
-            itens_novos INTEGER DEFAULT 0,
-            duracao_segundos REAL,
-            sucesso INTEGER DEFAULT 1,
-            erro TEXT
-        );
-        """)
-    log.info("DB inicializado em %s", DB_PATH)
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS oportunidades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    categoria TEXT NOT NULL,
+    tier INTEGER NOT NULL,
+    flag TEXT,
+    titulo TEXT NOT NULL,
+    descricao TEXT,
+    orgao TEXT,
+    estado TEXT,
+    concurso TEXT,
+    cargo TEXT,
+    banca TEXT,
+    vagas TEXT,
+    salario TEXT,
+    prazo_inscricao TEXT,
+    data_prova TEXT,
+    fase_atual TEXT,
+    data_publicacao TEXT,
+    extras_json TEXT,
+    link TEXT,
+    relevancia INTEGER DEFAULT 5,
+    etapa_concurso TEXT,
+    lido INTEGER DEFAULT 0,
+    arquivado INTEGER DEFAULT 0,
+    data_coleta TEXT NOT NULL,
+    hash_unico TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_categoria ON oportunidades(categoria);
+CREATE INDEX IF NOT EXISTS idx_tier ON oportunidades(tier);
+CREATE INDEX IF NOT EXISTS idx_etapa ON oportunidades(etapa_concurso);
+CREATE INDEX IF NOT EXISTS idx_data ON oportunidades(data_coleta);
+CREATE INDEX IF NOT EXISTS idx_lido ON oportunidades(lido);
+
+CREATE TABLE IF NOT EXISTS execucoes_cron (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    data_execucao TEXT NOT NULL,
+    tipo_run TEXT,
+    categorias_processadas TEXT,
+    itens_novos INTEGER DEFAULT 0,
+    duracao_segundos REAL,
+    sucesso INTEGER DEFAULT 1,
+    erro TEXT
+);
+"""
+
+
+class TursoConnWrapper:
+    """Wrapper que apresenta API parecida com sqlite3.Connection com row_factory=Row.
+
+    Usa libsql_client.create_client_sync para falar com Turso via HTTP.
+    Buffer de mudancas e .commit() faz batch (libsql ja eh autocommit, entao
+    o commit e no-op, mas mantemos a API).
+    """
+    class _IntegrityError(Exception):
+        pass
+
+    def __init__(self):
+        self.client = libsql_client.create_client_sync(
+            url=TURSO_URL,
+            auth_token=TURSO_TOKEN,
+        )
+
+    def execute(self, sql, params=()):
+        """Executa SQL. Retorna self.Cursor compativel."""
+        try:
+            rs = self.client.execute(sql, list(params) if params else None)
+        except Exception as e:
+            msg = str(e).lower()
+            if "unique" in msg or "constraint" in msg:
+                raise sqlite3.IntegrityError(str(e))
+            raise
+        return TursoCursor(rs)
+
+    def executescript(self, script):
+        """Executa multiplos statements separados por ;"""
+        statements = [s.strip() for s in script.split(';') if s.strip()]
+        for stmt in statements:
+            try:
+                self.client.execute(stmt)
+            except Exception as e:
+                # CREATE INDEX IF NOT EXISTS as vezes da erro de "ja existe" no Turso
+                msg = str(e).lower()
+                if "already exists" in msg:
+                    continue
+                raise
+
+    def commit(self):
+        pass  # Turso e autocommit
+
+    def close(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
+
+class TursoCursor:
+    """Wrapper sobre o resultado do libsql para parecer com sqlite3.Cursor + Row."""
+    def __init__(self, rs):
+        self.rs = rs
+        # rs.columns = lista de nomes de coluna; rs.rows = lista de tuplas
+        self.columns = list(rs.columns) if rs.columns else []
+        self._rows_iter = iter(rs.rows) if rs.rows else iter([])
+
+    def _wrap(self, row):
+        if row is None:
+            return None
+        return TursoRow(self.columns, row)
+
+    def fetchone(self):
+        try:
+            r = next(self._rows_iter)
+            return self._wrap(r)
+        except StopIteration:
+            return None
+
+    def fetchall(self):
+        return [self._wrap(r) for r in self._rows_iter]
+
+
+class TursoRow:
+    """Imita sqlite3.Row: acesso por indice E por nome de coluna (linha['col'])."""
+    def __init__(self, columns, values):
+        self.columns = columns
+        self.values = list(values)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self.values[key]
+        try:
+            idx = self.columns.index(key)
+        except ValueError:
+            raise KeyError(key)
+        return self.values[idx]
+
+    def keys(self):
+        return list(self.columns)
+
+
+def _dict_from_row(row):
+    """Converte tanto TursoRow quanto sqlite3.Row para dict."""
+    if row is None:
+        return None
+    if isinstance(row, TursoRow):
+        return {col: row.values[i] for i, col in enumerate(row.columns)}
+    # sqlite3.Row
+    return dict(row)
+
+
+def init_db():
+    global USANDO_TURSO
+    if USANDO_TURSO:
+        try:
+            wrapper = TursoConnWrapper()
+            try:
+                wrapper.executescript(SCHEMA_SQL)
+            finally:
+                wrapper.close()
+            log.info("DB Turso inicializado")
+            return
+        except Exception as e:
+            log.error("Falha ao conectar no Turso: %s. Caindo para SQLite local.", e)
+            USANDO_TURSO = False
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executescript(SCHEMA_SQL)
+    log.info("DB SQLite local inicializado em %s", DB_PATH)
 
 
 @contextmanager
 def db_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    """Context manager que retorna conexao Turso ou SQLite, ambos com mesma API."""
+    if USANDO_TURSO:
+        conn = TursoConnWrapper()
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def hash_for_dedup(titulo, orgao=""):
@@ -92,7 +425,7 @@ def hash_for_dedup(titulo, orgao=""):
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
 
 
-def buscas_para_categoria(categoria, hoje):
+def render_queries(queries_template, hoje):
     mes_ano = hoje.strftime("%B %Y").lower()
     mes_pt = {
         "january": "janeiro", "february": "fevereiro", "march": "marco",
@@ -102,137 +435,245 @@ def buscas_para_categoria(categoria, hoje):
     }
     for en, pt in mes_pt.items():
         mes_ano = mes_ano.replace(en, pt)
-
-    if categoria == "concursos_abertos":
-        return [
-            f"concursos publicos abertos inscricao {mes_ano}",
-            "novos editais concurso publico Brasil esta semana",
-            "concursos publicos com inscricoes abertas hoje",
-            "edital concurso publico publicado Brasil",
-        ]
-    if categoria == "recursos_anulacao":
-        return [
-            f"questoes anuladas concurso publico {mes_ano}",
-            "gabarito definitivo concurso publico recursos",
-            "anulacao questao concurso recente Brasil",
-            "concurso publico polemica questao prova",
-        ]
-    if categoria == "jurisprudencia":
-        return [
-            "STJ decisao concurso publico recente",
-            "TJ anulacao questao concurso 2026",
-            "jurisprudencia concurso publico nota corte",
-            "decisao judicial concurso publico candidato eliminado",
-        ]
-    return []
+    ano = hoje.strftime("%Y")
+    return [q.replace("{mes_ano}", mes_ano).replace("{ano}", ano) for q in queries_template]
 
 
-def coletar_categoria(api_key, categoria, hoje):
-    queries = buscas_para_categoria(categoria, hoje)
+FONTES_OFICIAIS = """
+FONTES PRIORITARIAS (use de preferencia):
+- pciconcursos.com.br, qconcursos.com (concursos)
+- estrategiaconcursos.com.br, grancursosonline.com.br (analise tecnica)
+- jusbrasil.com.br, migalhas.com.br, conjur.com.br (juridico)
+- stj.jus.br, stf.jus.br (sites oficiais de tribunais)
+- Sites oficiais de bancas (FGV, Cebraspe, Vunesp, IDECAN, IBADE)
+- Sites oficiais de orgaos (PMs, PCs, ministerios, prefeituras)
+
+Para Tier 3 (sentimento/concorrencia): aceite reddit.com, instagram.com,
+youtube.com, tiktok.com, telegram, e perfis dos escritorios concorrentes.
+"""
+
+
+def parse_json_robusto(raw):
+    """Parser tolerante - Sonnet as vezes retorna texto+JSON misturado."""
+    if not raw:
+        return None
+    # Remove markdown fences
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"```\s*$", "", raw, flags=re.MULTILINE)
+    raw = raw.strip()
+
+    # Tenta direto
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Procura o maior bloco JSON valido
+    # Pega do primeiro { ate o ultimo } e tenta parsear pedacos
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        for try_end in (end, raw.rfind("}", start, end)):
+            if try_end <= start:
+                continue
+            candidate = raw[start:try_end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
+    # Tenta extrair so o array "itens"
+    m = re.search(r'"itens"\s*:\s*\[(.*?)\]\s*}', raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads('{"itens":[' + m.group(1) + ']}')
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def coletar_categoria(api_key, cat_id, hoje):
+    cat = CATEGORIAS[cat_id]
+    queries = render_queries(cat["queries"], hoje)
+    descricao = cat["descricao"]
+    flag = cat["flag"]
+    tier = cat["tier"]
+    extras = cat.get("campos_extras", [])
+    max_idade = cat.get("max_idade_dias", 7)
+
     todos_itens = []
     erro_msg = None
 
-    descricoes = {
-        "concursos_abertos": (
-            "concursos publicos com INSCRICOES ABERTAS no momento - "
-            "ou seja, com prazo de inscricao vigente. Liste apenas concursos "
-            "que ainda permitem inscricao."
-        ),
-        "recursos_anulacao": (
-            "concursos publicos em FASE DE RECURSOS ou COM QUESTOES POLEMICAS, "
-            "onde candidatos estao contestando questoes ou ha discussao sobre "
-            "anulacao de questoes."
-        ),
-        "jurisprudencia": (
-            "DECISOES JUDICIAIS RECENTES de tribunais (STJ, STF, TJs) sobre "
-            "concursos publicos - anulacao de questoes, reclassificacao, "
-            "nota de corte, posse, convocacao."
-        ),
-    }
-
-    descricao = descricoes.get(categoria, "")
-    client = anthropic.Anthropic(api_key=api_key, timeout=180.0, max_retries=2)
+    extras_json_template = ""
+    if extras:
+        lines = ",\n      ".join(f'"{c}": "valor real ou vazio"' for c in extras)
+        extras_json_template = f",\n      {lines}"
 
     queries_str = "\n".join(f"  {i+1}. {q}" for i, q in enumerate(queries))
-    prompt = f"""Voce e um pesquisador juridico do escritorio Silva Pinto Advocacia.
 
-TAREFA: Pesquise na web sobre {descricao}
+    etapa_block = ""
+    if cat_id in ("elim_ativas", "taf_fases", "recurso_anulacao", "radar_volume"):
+        etapa_block = """,
+      "etapa_concurso": "antes_prova" se concurso ainda NAO realizou prova objetiva, "apos_prova" se prova ja foi realizada"""
 
-Realize as buscas a seguir, uma por vez, usando a ferramenta de busca:
+    data_limite = (hoje - timedelta(days=max_idade)).strftime("%d/%m/%Y")
+
+    prompt = f"""Voce e um pesquisador juridico do escritorio Silva Pinto Advocacia, especializado em concursos publicos.
+
+CATEGORIA: {cat['label']} (Tier {tier})
+OBJETIVO: {descricao}
+
+== REGRAS CRITICAS - LEIA COM ATENCAO ==
+
+1. NUNCA INVENTE conteudo. Se a busca nao retornou resultados reais, retorne {{"itens": []}}.
+2. Cada item DEVE ter um LINK REAL E VERIFICAVEL retornado pela ferramenta web_search.
+   Se voce nao tem o URL exato da fonte, NAO INCLUA o item.
+3. NUNCA crie URLs ficticios. NUNCA escreva "https://example.com" ou similares.
+4. RESTRICAO DE DATA RIGIDA: apenas conteudo publicado em {data_limite} ou DEPOIS.
+   Se o conteudo nao tem data clara OU e mais antigo, NAO INCLUA.
+5. Cada item deve ser INDIVIDUAL e VERIFICAVEL: titulo deve permitir busca rapida na fonte.
+6. Se nada relevante for encontrado nas buscas, retorne {{"itens": []}} - isso e ACEITAVEL.
+   E muito melhor retornar zero itens do que inventar.
+
+{FONTES_OFICIAIS}
+
+== TAREFA ==
+
+Realize as buscas a seguir, uma por vez, usando a ferramenta web_search:
 {queries_str}
 
-Apos as buscas, retorne JSON com itens encontrados. Cada item deve ser UNICO, RECENTE (ultimos 30 dias) e RELEVANTE para um escritorio que atua em concursos publicos.
+Apos as buscas, analise os RESULTADOS REAIS retornados e extraia ate 8 itens relevantes
+e RECENTES (publicados a partir de {data_limite}).
 
-FORMATO (JSON puro, sem markdown):
+== FORMATO DE RESPOSTA ==
+
+Retorne SOMENTE JSON puro, sem markdown, sem explicacoes, sem texto antes ou depois.
+NAO escreva "Aqui esta o JSON:" ou frases similares. Apenas o JSON.
+
 {{
   "itens": [
     {{
-      "titulo": "Titulo objetivo",
-      "descricao": "Resumo em 2-3 frases",
-      "orgao": "Orgao (ex: PCMG, STJ) ou vazio",
-      "estado": "UF (ex: MG) ou Brasil se nacional",
-      "prazo": "Data ou prazo ou vazio",
-      "link": "URL da fonte",
-      "relevancia": 1-10
+      "titulo": "Titulo objetivo (REAL, da materia/decisao)",
+      "descricao": "Resumo de 2-3 frases com dados concretos da fonte real",
+      "data_publicacao": "DD/MM/AAAA da publicacao da materia (OBRIGATORIO)",
+      "orgao": "Orgao/instituicao (PCMG, STJ, TJ-SP, etc) ou vazio",
+      "estado": "UF (MG, SP, etc) ou Brasil se nacional",
+      "concurso": "Nome do concurso (PMERJ 2026, etc) ou vazio",
+      "cargo": "Cargo do concurso ou vazio",
+      "banca": "Banca examinadora (FGV, Cebraspe, etc) ou vazio",
+      "vagas": "Numero de vagas exato ou vazio",
+      "salario": "Salario inicial em R$ exato ou vazio",
+      "prazo_inscricao": "Data limite de inscricao ou vazio",
+      "data_prova": "Data prevista da prova ou vazio",
+      "fase_atual": "Fase em que esta (gabarito definitivo, TAF, recursos, etc) ou vazio",
+      "link": "URL REAL E COMPLETO da fonte (OBRIGATORIO - sem isso, NAO inclua o item)",
+      "relevancia": 1-10{extras_json_template}{etapa_block}
     }}
   ]
 }}
 
-REGRAS:
-- Maximo 8 itens por categoria.
-- NAO duplicados.
-- NAO antigos (> 30 dias).
-- Se nada relevante, retorne {{"itens": []}}.
-- Retorne SO o JSON."""
+REPETINDO AS REGRAS MAIS IMPORTANTES:
+- Sem link real verificavel = NAO incluir
+- Sem data clara dentro do periodo (>= {data_limite}) = NAO incluir
+- Sem dados extraidos da web_search = retornar []
+- Inventar = pior do que retornar []"""
 
     try:
-        log.info("[%s] iniciando %d buscas", categoria, len(queries))
+        # Modelo varia por tier: Sonnet pro tier 1 (qualidade), Haiku pro 2/3 (rate limit folgado)
+        modelo_categoria = MODEL_TIER1 if tier == 1 else MODEL_TIER23
+        log.info("[%s tier%d] iniciando %d buscas (max %d dias) com %s",
+                 cat_id, tier, len(queries), max_idade, modelo_categoria)
+        client = anthropic.Anthropic(api_key=api_key, timeout=240.0, max_retries=2)
         msg = client.messages.create(
-            model=MODEL_NAME,
-            max_tokens=8000,
+            model=modelo_categoria,
+            max_tokens=12000,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
 
+        # Coleta texto da resposta
         text_parts = []
+        web_searches_used = 0
         for block in msg.content:
-            if hasattr(block, "text") and block.text:
+            btype = getattr(block, "type", "")
+            if btype == "server_tool_use" and getattr(block, "name", "") == "web_search":
+                web_searches_used += 1
+            elif hasattr(block, "text") and block.text:
                 text_parts.append(block.text)
         raw = "".join(text_parts).strip()
 
-        log.info("[%s] resposta: %d chars", categoria, len(raw))
+        log.info("[%s] web_searches: %d, resposta texto: %d chars",
+                 cat_id, web_searches_used, len(raw))
 
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```\s*$", "", raw)
-
-        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not json_match:
-            return [], "JSON nao encontrado"
-
-        try:
-            data = json.loads(json_match.group(0))
-        except json.JSONDecodeError as e:
-            return [], f"JSON malformado: {e}"
+        # Parse robusto
+        data = parse_json_robusto(raw)
+        if data is None:
+            # Loga prefixo da resposta crua pra diagnostico
+            log.warning("[%s] JSON nao parseado. Preview: %s", cat_id, raw[:500])
+            return [], f"JSON nao parseado (resposta: {len(raw)} chars)"
 
         itens = data.get("itens", [])
-        log.info("[%s] %d itens extraidos", categoria, len(itens))
+        log.info("[%s] %d itens extraidos do JSON", cat_id, len(itens))
+
+        if not itens:
+            log.info("[%s] IA retornou lista vazia (esperado se nada relevante)", cat_id)
 
         for item in itens:
-            if not isinstance(item, dict) or not item.get("titulo"):
+            if not isinstance(item, dict):
                 continue
+            titulo = str(item.get("titulo", "")).strip()
+            link = str(item.get("link", "")).strip()
+
+            # Validacoes anti-invencao
+            if not titulo:
+                log.warning("[%s] item sem titulo, ignorando", cat_id)
+                continue
+            if not link or not link.startswith("http"):
+                log.warning("[%s] item sem link real, ignorando: %s", cat_id, titulo[:60])
+                continue
+            if "example.com" in link.lower() or "example.org" in link.lower():
+                log.warning("[%s] link e example.com, ignorando: %s", cat_id, titulo[:60])
+                continue
+
+            # Build extras dict
+            extras_dict = {}
+            for campo in extras:
+                v = item.get(campo)
+                if v:
+                    extras_dict[campo] = str(v)[:300]
+
+            etapa = str(item.get("etapa_concurso", "")).strip().lower()
+            if etapa not in ("antes_prova", "apos_prova"):
+                etapa = ""
+
             todos_itens.append({
-                "categoria": categoria,
-                "titulo": str(item.get("titulo", "")).strip()[:300],
-                "descricao": str(item.get("descricao", "")).strip()[:1000],
+                "categoria": cat_id,
+                "tier": tier,
+                "flag": flag,
+                "titulo": titulo[:300],
+                "descricao": str(item.get("descricao", "")).strip()[:1200],
                 "orgao": str(item.get("orgao", "")).strip()[:100],
                 "estado": str(item.get("estado", "")).strip()[:30],
-                "prazo": str(item.get("prazo", "")).strip()[:100],
-                "link": str(item.get("link", "")).strip()[:500],
+                "concurso": str(item.get("concurso", "")).strip()[:120],
+                "cargo": str(item.get("cargo", "")).strip()[:120],
+                "banca": str(item.get("banca", "")).strip()[:60],
+                "vagas": str(item.get("vagas", "")).strip()[:60],
+                "salario": str(item.get("salario", "")).strip()[:60],
+                "prazo_inscricao": str(item.get("prazo_inscricao", "")).strip()[:60],
+                "data_prova": str(item.get("data_prova", "")).strip()[:60],
+                "fase_atual": str(item.get("fase_atual", "")).strip()[:120],
+                "data_publicacao": str(item.get("data_publicacao", "")).strip()[:30],
+                "extras_json": json.dumps(extras_dict, ensure_ascii=False) if extras_dict else "",
+                "link": link[:500],
                 "relevancia": int(item.get("relevancia", 5)) if str(item.get("relevancia", 5)).isdigit() else 5,
+                "etapa_concurso": etapa,
             })
 
+        log.info("[%s] %d itens validados (com link real)", cat_id, len(todos_itens))
+
     except Exception as e:
-        log.error("[%s] erro: %s", categoria, e)
+        log.error("[%s] erro: %s\n%s", cat_id, e, traceback.format_exc())
         erro_msg = f"{type(e).__name__}: {str(e)[:200]}"
 
     return todos_itens, erro_msg
@@ -249,12 +690,18 @@ def salvar_itens(itens):
             try:
                 conn.execute(
                     """INSERT INTO oportunidades
-                    (categoria, titulo, descricao, orgao, estado, prazo, link,
-                     relevancia, data_coleta, hash_unico)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (item["categoria"], item["titulo"], item["descricao"],
-                     item["orgao"], item["estado"], item["prazo"], item["link"],
-                     item["relevancia"], agora, h)
+                    (categoria, tier, flag, titulo, descricao, orgao, estado,
+                     concurso, cargo, banca, vagas, salario, prazo_inscricao,
+                     data_prova, fase_atual, data_publicacao, extras_json,
+                     link, relevancia, etapa_concurso, data_coleta, hash_unico)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (item["categoria"], item["tier"], item["flag"],
+                     item["titulo"], item["descricao"], item["orgao"], item["estado"],
+                     item["concurso"], item["cargo"], item["banca"], item["vagas"],
+                     item["salario"], item["prazo_inscricao"], item["data_prova"],
+                     item["fase_atual"], item.get("data_publicacao", ""),
+                     item["extras_json"], item["link"],
+                     item["relevancia"], item["etapa_concurso"], agora, h)
                 )
                 novos += 1
             except sqlite3.IntegrityError:
@@ -262,22 +709,55 @@ def salvar_itens(itens):
     return novos
 
 
-def executar_coleta_completa(api_key):
+def executar_coleta(api_key, categorias_a_rodar, tipo_run="manual"):
+    """Executa coleta categoria por categoria com delay para respeitar rate limit.
+
+    Rate limit Tier 1 da Anthropic: 30k input tokens/min.
+    Cada categoria usa ~3-5k tokens de prompt + retries do web_search.
+    Delay de 35s entre categorias garante folga.
+    """
+    import time
     inicio = datetime.now(timezone.utc)
-    categorias = ["concursos_abertos", "recursos_anulacao", "jurisprudencia"]
     total_novos = 0
     erros = []
 
-    for cat in categorias:
-        try:
-            itens, erro_cat = coletar_categoria(api_key, cat, inicio)
-            novos = salvar_itens(itens)
-            total_novos += novos
-            log.info("[%s] %d novos salvos (de %d)", cat, novos, len(itens))
-            if erro_cat:
-                erros.append(f"{cat}: {erro_cat}")
-        except Exception as e:
-            erros.append(f"{cat}: {e}")
+    DELAY_ENTRE_CATEGORIAS_SEG = 35  # garante folga sobre 30k tokens/min
+
+    for idx, cat_id in enumerate(categorias_a_rodar):
+        if cat_id not in CATEGORIAS:
+            continue
+
+        # Throttle: espera entre categorias para nao estourar rate limit
+        if idx > 0:
+            log.info("[throttle] aguardando %ds antes de %s", DELAY_ENTRE_CATEGORIAS_SEG, cat_id)
+            time.sleep(DELAY_ENTRE_CATEGORIAS_SEG)
+
+        # Tenta a categoria com 1 retry adicional em caso de 429
+        tentativas = 0
+        max_tentativas = 2
+        while tentativas < max_tentativas:
+            tentativas += 1
+            try:
+                itens, erro = coletar_categoria(api_key, cat_id, inicio)
+                # Se deu 429, espera mais e tenta de novo
+                if erro and "429" in str(erro) and tentativas < max_tentativas:
+                    log.warning("[%s] rate limit 429 - esperando 60s e tentando de novo", cat_id)
+                    time.sleep(60)
+                    continue
+                novos = salvar_itens(itens)
+                total_novos += novos
+                log.info("[%s] %d novos salvos (de %d encontrados)", cat_id, novos, len(itens))
+                if erro:
+                    erros.append(f"{cat_id}: {erro}")
+                break
+            except Exception as e:
+                if "429" in str(e) and tentativas < max_tentativas:
+                    log.warning("[%s] excecao 429 - esperando 60s e tentando de novo", cat_id)
+                    time.sleep(60)
+                    continue
+                erros.append(f"{cat_id}: {e}")
+                log.error("[%s] falha total: %s", cat_id, e)
+                break
 
     duracao = (datetime.now(timezone.utc) - inicio).total_seconds()
     sucesso = len(erros) == 0
@@ -285,62 +765,360 @@ def executar_coleta_completa(api_key):
     with db_conn() as conn:
         conn.execute(
             """INSERT INTO execucoes_cron
-            (data_execucao, categorias_processadas, itens_novos, duracao_segundos, sucesso, erro)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (inicio.isoformat(), ",".join(categorias), total_novos, duracao,
-             1 if sucesso else 0, "; ".join(erros) if erros else None)
+            (data_execucao, tipo_run, categorias_processadas, itens_novos, duracao_segundos, sucesso, erro)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (inicio.isoformat(), tipo_run, ",".join(categorias_a_rodar),
+             total_novos, duracao, 1 if sucesso else 0,
+             "; ".join(erros) if erros else None)
         )
 
     return {
+        "tipo_run": tipo_run,
         "sucesso": sucesso,
+        "categorias": categorias_a_rodar,
         "itens_novos": total_novos,
         "duracao_segundos": round(duracao, 1),
         "erros": erros,
     }
 
 
-# HTML embutido (sem precisar de pasta templates)
+def categorias_por_tier(*tiers):
+    return [cid for cid, c in CATEGORIAS.items() if c["tier"] in tiers]
+
+
+# Routes
+@app.route("/")
+def home():
+    return Response(HTML_INDEX, mimetype="text/html")
+
+
+@app.route("/logo.png")
+def logo_png():
+    """Serve o logo PNG embutido (decode do base64)."""
+    import base64
+    png_bytes = base64.b64decode(LOGO_B64)
+    return Response(png_bytes, mimetype="image/png", headers={
+        "Cache-Control": "public, max-age=86400"
+    })
+
+
+@app.route("/api/oportunidades")
+def api_listar():
+    categoria = request.args.get("categoria", "")
+    tier = request.args.get("tier", "")
+    flag = request.args.get("flag", "")
+    estado = request.args.get("estado", "")
+    etapa = request.args.get("etapa", "")
+    incluir_lidos = request.args.get("incluir_lidos", "0") == "1"
+    limite = int(request.args.get("limite", 200))
+    dias = int(request.args.get("dias", 30))
+
+    where_parts = ["arquivado = 0"]
+    params = []
+    if not incluir_lidos:
+        where_parts.append("lido = 0")
+    if categoria:
+        where_parts.append("categoria = ?")
+        params.append(categoria)
+    if tier:
+        where_parts.append("tier = ?")
+        params.append(int(tier))
+    if flag:
+        where_parts.append("flag = ?")
+        params.append(flag)
+    if estado:
+        where_parts.append("estado = ?")
+        params.append(estado)
+    if etapa:
+        where_parts.append("etapa_concurso = ?")
+        params.append(etapa)
+    if dias > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+        where_parts.append("data_coleta >= ?")
+        params.append(cutoff)
+
+    where_sql = " AND ".join(where_parts)
+    sql = f"""SELECT * FROM oportunidades
+              WHERE {where_sql}
+              ORDER BY tier ASC, relevancia DESC, data_coleta DESC
+              LIMIT ?"""
+    params.append(limite)
+
+    with db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    itens = []
+    for r in rows:
+        d = _dict_from_row(r)
+        if d.get("extras_json"):
+            try:
+                d["extras"] = json.loads(d["extras_json"])
+            except:
+                d["extras"] = {}
+        else:
+            d["extras"] = {}
+        itens.append(d)
+
+    return jsonify({"total": len(itens), "itens": itens})
+
+
+@app.route("/api/oportunidades/<int:item_id>/marcar_lido", methods=["POST"])
+def api_marcar_lido(item_id):
+    with db_conn() as conn:
+        conn.execute("UPDATE oportunidades SET lido = 1 WHERE id = ?", (item_id,))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/oportunidades/<int:item_id>/arquivar", methods=["POST"])
+def api_arquivar(item_id):
+    with db_conn() as conn:
+        conn.execute("UPDATE oportunidades SET arquivado = 1 WHERE id = ?", (item_id,))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/limpar_exemplos", methods=["POST"])
+def api_limpar_exemplos():
+    """Apaga itens [EXEMPLO] do banco. Usado pra limpar antes da primeira coleta real."""
+    with db_conn() as conn:
+        conn.execute("DELETE FROM oportunidades WHERE titulo LIKE '%[EXEMPLO]%'")
+        c = conn.execute("SELECT changes()").fetchone()[0]
+    return jsonify({"ok": True, "removidos": c})
+
+
+@app.route("/api/status")
+def api_status():
+    with db_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) AS c FROM oportunidades").fetchone()["c"]
+        nao_lidos = conn.execute(
+            "SELECT COUNT(*) AS c FROM oportunidades WHERE lido = 0 AND arquivado = 0"
+        ).fetchone()["c"]
+        ultima = conn.execute(
+            "SELECT * FROM execucoes_cron ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        tier_counts = {}
+        for t in (1, 2, 3):
+            r = conn.execute(
+                "SELECT COUNT(*) AS c FROM oportunidades WHERE lido = 0 AND arquivado = 0 AND tier = ?",
+                (t,)
+            ).fetchone()
+            tier_counts[f"tier{t}"] = r["c"]
+
+    return jsonify({
+        "total": total,
+        "nao_lidos": nao_lidos,
+        "tier_counts": tier_counts,
+        "ultima_execucao": _dict_from_row(ultima) if ultima else None,
+        "model_tier1": MODEL_TIER1,
+        "model_tier23": MODEL_TIER23,
+        "version": APP_VERSION,
+    })
+
+
+@app.route("/cron/tier1", methods=["GET", "POST"])
+def cron_tier1():
+    if CRON_SECRET:
+        secret = request.args.get("secret") or request.headers.get("X-Cron-Secret")
+        if secret != CRON_SECRET:
+            return jsonify({"erro": "secret invalido"}), 403
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"erro": "API key nao configurada"}), 500
+
+    log.info("=" * 60)
+    log.info("CRON TIER 1 disparado em %s", datetime.now(timezone.utc).isoformat())
+    log.info("=" * 60)
+
+    cats = categorias_por_tier(1)
+    try:
+        result = executar_coleta(ANTHROPIC_API_KEY, cats, tipo_run="tier1")
+        return jsonify(result)
+    except Exception as e:
+        log.error("Cron tier1 falhou: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/cron/tier23", methods=["GET", "POST"])
+def cron_tier23():
+    if CRON_SECRET:
+        secret = request.args.get("secret") or request.headers.get("X-Cron-Secret")
+        if secret != CRON_SECRET:
+            return jsonify({"erro": "secret invalido"}), 403
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"erro": "API key nao configurada"}), 500
+
+    log.info("=" * 60)
+    log.info("CRON TIER 2+3 disparado em %s", datetime.now(timezone.utc).isoformat())
+    log.info("=" * 60)
+
+    cats = categorias_por_tier(2, 3)
+    try:
+        result = executar_coleta(ANTHROPIC_API_KEY, cats, tipo_run="tier23")
+        return jsonify(result)
+    except Exception as e:
+        log.error("Cron tier23 falhou: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/cron/manual", methods=["POST"])
+def cron_manual():
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
+
+    tipo = request.args.get("tipo", "completo")
+    if tipo == "tier1":
+        cats = categorias_por_tier(1)
+    elif tipo == "tier23":
+        cats = categorias_por_tier(2, 3)
+    else:
+        cats = list(CATEGORIAS.keys())
+
+    log.info("Disparo MANUAL pela UI: %s", cats)
+
+    def run_collect():
+        try:
+            executar_coleta(ANTHROPIC_API_KEY, cats, tipo_run="manual")
+        except Exception as e:
+            log.error("Manual run falhou: %s", e)
+
+    t = threading.Thread(target=run_collect, daemon=True)
+    t.start()
+    return jsonify({
+        "ok": True,
+        "categorias": cats,
+        "mensagem": f"Coleta iniciada ({len(cats)} categorias). Aguarde 2-4 minutos e recarregue."
+    })
+
+
+@app.route("/debug")
+def debug_page():
+    """Pagina de diagnostico - mostra estado real do app."""
+    with db_conn() as conn:
+        # Total por tier
+        tier_data = {}
+        for t in (1, 2, 3):
+            r = conn.execute(
+                "SELECT COUNT(*) AS c FROM oportunidades WHERE tier = ?", (t,)
+            ).fetchone()
+            tier_data[t] = r["c"]
+
+        # Total no banco
+        total = conn.execute("SELECT COUNT(*) AS c FROM oportunidades").fetchone()["c"]
+        exemplos = conn.execute(
+            "SELECT COUNT(*) AS c FROM oportunidades WHERE titulo LIKE '%[EXEMPLO]%'"
+        ).fetchone()["c"]
+
+        # Ultimas 10 execucoes do cron com tudo
+        execs = conn.execute(
+            "SELECT * FROM execucoes_cron ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+
+        # Itens recentes (qualquer tier)
+        ultimos_itens = conn.execute(
+            "SELECT id, categoria, tier, titulo, link, data_coleta FROM oportunidades "
+            "ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+
+    info = {
+        "versao_app": APP_VERSION,
+        "modelo_tier1": MODEL_TIER1,
+        "modelo_tier23": MODEL_TIER23,
+        "tem_api_key": bool(ANTHROPIC_API_KEY),
+        "tem_cron_secret": bool(CRON_SECRET),
+        "db_path": str(DB_PATH),
+        "db_existe": DB_PATH.exists(),
+        "total_no_banco": total,
+        "exemplos_no_banco": exemplos,
+        "tier1_total": tier_data[1],
+        "tier2_total": tier_data[2],
+        "tier3_total": tier_data[3],
+        "ultimas_10_execucoes": [_dict_from_row(r) for r in execs],
+        "ultimos_10_itens_inseridos": [_dict_from_row(r) for r in ultimos_itens],
+        "categorias_config": {
+            cid: {"tier": c["tier"], "max_idade_dias": c.get("max_idade_dias", 7),
+                  "label": c["label"]}
+            for cid, c in CATEGORIAS.items()
+        },
+    }
+    return jsonify(info)
+
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "version": APP_VERSION})
+
+
+# Init
+init_db()
+
+
+# Logo PNG transparente embutido (gerado a partir da logo Silva Pinto)
+LOGO_B64 = "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"
+
+
+# HTML embutido
 HTML_INDEX = r"""<!DOCTYPE html>
 <html lang="pt-br">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Silva Pinto - Oportunidades</title>
+  <title>Silva Pinto - Painel de Oportunidades</title>
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=Montserrat:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
+      /* Paleta Silva Pinto */
       --gold: #BB904C;
       --gold-light: #D4AF7A;
+      --gold-dark: #9a7438;
       --gold-pale: #f5ecd9;
       --navy: #1a2842;
       --navy-light: #2d3e5e;
-      --gray-bg: #f4f4f0;
-      --gray-line: #d8d8d2;
+
+      /* Fundos */
+      --bg-page: #faf8f3;        /* off-white principal */
+      --bg-card: #ffffff;         /* cards brancos */
+      --bg-soft: #f0ede4;         /* secao secundaria */
+      --line: #d8d3c4;
+      --line-soft: #e8e3d4;
+
+      /* Texto */
       --text-primary: #1a2842;
       --text-secondary: #6b6e76;
-      --green: #10b981;
-      --red: #dc2626;
-      --orange: #ea580c;
-      --blue: #2563eb;
+      --text-muted: #9a9690;
+
+      /* Tier accents - mais sobrios pra combinar com a identidade */
+      --tier1: #b91c1c;
+      --tier1-bg: #fef2f2;
+      --tier1-border: #fca5a5;
+      --tier2: #5a6478;
+      --tier2-bg: #eff1f5;
+      --tier2-border: #c8cdd6;
+      --tier3: var(--text-secondary);
+      --tier3-bg: #f0ede4;
+      --tier3-border: var(--line);
+
+      /* Apoio */
+      --green: #5d8c5b;
+      --orange: #c2724a;
+      --link: #3b5a8a;
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: 'Montserrat', sans-serif;
-      background: var(--gray-bg);
+      background: var(--bg-page);
       color: var(--text-primary);
       min-height: 100vh;
+      font-size: 14px;
     }
     header {
       background: var(--navy);
       color: white;
-      padding: 16px 24px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.2);
+      padding: 14px 24px;
+      box-shadow: 0 2px 12px rgba(26, 40, 66, 0.15);
       position: sticky;
       top: 0;
       z-index: 100;
     }
     .header-inner {
-      max-width: 1280px;
+      max-width: 1400px;
       margin: 0 auto;
       display: flex;
       align-items: center;
@@ -350,139 +1128,120 @@ HTML_INDEX = r"""<!DOCTYPE html>
     .header-left {
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 16px;
     }
-    .header-left img {
-      height: 40px;
+    .logo-img {
+      height: 70px;
       width: auto;
-      filter: brightness(0) invert(1);
+      display: block;
+    }
+    .header-text-block {
+      border-left: 1px solid rgba(255,255,255,0.15);
+      padding-left: 16px;
     }
     .header-title {
       font-family: 'Cormorant Garamond', serif;
       font-size: 22px;
       font-weight: 600;
+      letter-spacing: 0.3px;
     }
     .header-subtitle {
-      font-size: 11px;
-      letter-spacing: 1.5px;
+      font-size: 10px;
+      letter-spacing: 2px;
       color: var(--gold-light);
       text-transform: uppercase;
-      margin-top: 2px;
+      margin-top: 4px;
     }
     .btn {
       background: var(--gold);
       color: white;
       border: none;
-      padding: 10px 16px;
-      border-radius: 5px;
+      padding: 10px 18px;
+      border-radius: 4px;
       font-family: 'Montserrat', sans-serif;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 600;
-      letter-spacing: 0.5px;
+      letter-spacing: 1px;
       text-transform: uppercase;
       cursor: pointer;
-      transition: all 0.15s;
-      text-decoration: none;
-      display: inline-block;
+      transition: all 0.2s;
     }
     .btn:hover { background: var(--gold-light); }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-ghost {
       background: transparent;
-      border: 1px solid rgba(255,255,255,0.3);
+      border: 1px solid rgba(187, 144, 76, 0.5);
+      color: var(--gold-light);
+    }
+    .btn-ghost:hover {
+      background: rgba(187, 144, 76, 0.1);
+      border-color: var(--gold);
       color: white;
     }
-    .btn-ghost:hover { background: rgba(255,255,255,0.1); }
+    .btn-group { display: flex; gap: 8px; }
 
     .status-bar {
-      max-width: 1280px;
-      margin: 24px auto 0;
+      max-width: 1400px;
+      margin: 28px auto 0;
       padding: 0 24px;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 12px;
     }
     .status-card {
-      background: white;
-      border-radius: 6px;
-      padding: 16px 18px;
+      background: var(--bg-card);
+      border-radius: 4px;
+      padding: 14px 18px;
       border-left: 3px solid var(--gold);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
     }
+    .status-card.tier1 { border-left-color: var(--tier1); }
+    .status-card.tier2 { border-left-color: var(--tier2); }
+    .status-card.tier3 { border-left-color: var(--tier3); }
     .status-card .label {
-      font-size: 11px;
+      font-size: 9px;
       color: var(--text-secondary);
-      letter-spacing: 1px;
+      letter-spacing: 1.5px;
       text-transform: uppercase;
-      margin-bottom: 6px;
+      margin-bottom: 8px;
+      font-weight: 600;
     }
     .status-card .value {
       font-family: 'Cormorant Garamond', serif;
       font-size: 28px;
       color: var(--navy);
       font-weight: 600;
+      line-height: 1;
     }
     .status-card .value.small {
-      font-size: 14px;
+      font-size: 12px;
       font-family: 'Montserrat', sans-serif;
-    }
-
-    .tabs {
-      max-width: 1280px;
-      margin: 28px auto 0;
-      padding: 0 24px;
-      display: flex;
-      gap: 0;
-      border-bottom: 1px solid var(--gray-line);
-    }
-    .tab {
-      padding: 14px 22px;
-      background: transparent;
-      border: none;
-      cursor: pointer;
-      font-family: 'Montserrat', sans-serif;
-      font-size: 13px;
       font-weight: 500;
-      color: var(--text-secondary);
-      border-bottom: 2px solid transparent;
-      transition: all 0.15s;
-    }
-    .tab:hover { color: var(--navy); }
-    .tab.active {
-      color: var(--navy);
-      border-bottom-color: var(--gold);
-      font-weight: 600;
-    }
-    .tab .count {
-      display: inline-block;
-      background: var(--gray-line);
-      color: var(--text-secondary);
-      font-size: 11px;
-      padding: 2px 8px;
-      border-radius: 10px;
-      margin-left: 6px;
-      font-weight: 600;
-    }
-    .tab.active .count {
-      background: var(--gold);
-      color: white;
     }
 
-    .filters {
-      max-width: 1280px;
-      margin: 16px auto 0;
+    .global-filters {
+      max-width: 1400px;
+      margin: 22px auto 0;
       padding: 0 24px;
+    }
+    .filters {
       display: flex;
-      gap: 10px;
+      gap: 12px;
       align-items: center;
       flex-wrap: wrap;
+      padding: 12px 16px;
+      background: var(--bg-card);
+      border-radius: 4px;
+      border: 1px solid var(--line-soft);
     }
     .filters select, .filters label {
       font-size: 12px;
+      font-family: 'Montserrat', sans-serif;
     }
     .filters select {
-      padding: 7px 10px;
-      border: 1px solid var(--gray-line);
-      border-radius: 4px;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 3px;
       background: white;
       color: var(--navy);
       cursor: pointer;
@@ -495,127 +1254,267 @@ HTML_INDEX = r"""<!DOCTYPE html>
       cursor: pointer;
     }
 
-    .cards-area {
-      max-width: 1280px;
-      margin: 20px auto 60px;
+    .tier-section {
+      max-width: 1400px;
+      margin: 32px auto 0;
       padding: 0 24px;
     }
-    .empty {
-      text-align: center;
-      padding: 80px 20px;
-      color: var(--text-secondary);
-      background: white;
-      border-radius: 8px;
+    .tier-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
     }
-    .empty h3 {
+    .tier-pill {
+      padding: 4px 14px;
+      border-radius: 12px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+    }
+    .tier-pill.tier1 { background: var(--tier1-bg); color: var(--tier1); border: 1px solid var(--tier1-border); }
+    .tier-pill.tier2 { background: var(--tier2-bg); color: var(--tier2); border: 1px solid var(--tier2-border); }
+    .tier-pill.tier3 { background: var(--tier3-bg); color: var(--tier3); border: 1px solid var(--tier3-border); }
+    .tier-title {
       font-family: 'Cormorant Garamond', serif;
       font-size: 24px;
+      font-weight: 600;
       color: var(--navy);
-      margin-bottom: 10px;
     }
-    .empty p {
-      font-size: 14px;
-      max-width: 420px;
-      margin: 0 auto;
-      line-height: 1.6;
+    .tier-desc {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-left: auto;
+      font-style: italic;
     }
+
+    .phase-divider {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 22px 0 12px;
+      font-size: 10px;
+      letter-spacing: 1.8px;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--text-secondary);
+    }
+    .phase-divider::before {
+      content: '';
+      width: 24px;
+      height: 1px;
+      background: var(--line);
+    }
+    .phase-divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--line);
+    }
+    .phase-divider.antes { color: var(--green); }
+    .phase-divider.apos { color: var(--orange); }
 
     .cards-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-      gap: 16px;
+      gap: 14px;
+      margin-bottom: 8px;
     }
+
     .card {
-      background: white;
-      border-radius: 6px;
+      background: var(--bg-card);
+      border-radius: 4px;
       padding: 18px 20px;
-      border: 1px solid var(--gray-line);
+      border: 1px solid var(--line-soft);
       display: flex;
       flex-direction: column;
       gap: 10px;
-      transition: box-shadow 0.15s, transform 0.15s;
+      transition: all 0.2s;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.03);
     }
     .card:hover {
       box-shadow: 0 8px 24px rgba(26, 40, 66, 0.08);
+      border-color: var(--line);
       transform: translateY(-1px);
     }
-    .card-header {
+    .card.tier1 { border-top: 3px solid var(--tier1); }
+    .card.tier2 { border-top: 3px solid var(--tier2); }
+    .card.tier3 { border-top: 3px solid var(--tier3); }
+
+    .card-flag-row {
       display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 10px;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
     }
-    .card-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 18px;
-      font-weight: 600;
-      color: var(--navy);
-      line-height: 1.3;
-      flex: 1;
+    .flag-badge {
+      font-size: 9px;
+      padding: 4px 9px;
+      border-radius: 3px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
     }
+    .flag-badge.QUENTE { background: var(--tier1); color: white; }
+    .flag-badge.FASE { background: #c2410c; color: white; }
+    .flag-badge.RECURSO { background: #b45309; color: white; }
+    .flag-badge.VOLUME { background: #5a6478; color: white; }
+    .flag-badge.JURISPRUDENCIA { background: #6d28d9; color: white; }
+    .flag-badge.VIRAL { background: #be185d; color: white; }
+    .flag-badge.CONCORRENCIA { background: #475569; color: white; }
     .relevancia {
-      flex-shrink: 0;
+      margin-left: auto;
       background: var(--gold-pale);
-      color: var(--gold);
-      font-size: 11px;
+      color: var(--gold-dark);
+      font-size: 10px;
       font-weight: 700;
       padding: 4px 9px;
-      border-radius: 4px;
+      border-radius: 3px;
+      letter-spacing: 0.5px;
     }
     .relevancia.alta { background: #fef3c7; color: #b45309; }
     .relevancia.maxima { background: var(--gold); color: white; }
+
+    .card-title {
+      font-family: 'Cormorant Garamond', serif;
+      font-size: 19px;
+      font-weight: 600;
+      color: var(--navy);
+      line-height: 1.3;
+    }
+    .card-subtitle {
+      font-size: 12px;
+      color: var(--text-secondary);
+      line-height: 1.4;
+      margin-top: -4px;
+    }
+
+    .card-concurso-info {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 12px 14px;
+      background: linear-gradient(135deg, var(--gold-pale) 0%, var(--bg-page) 100%);
+      border-radius: 4px;
+      border-left: 2px solid var(--gold);
+    }
+    .info-block .info-label {
+      font-size: 9px;
+      color: var(--text-secondary);
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+      font-weight: 600;
+    }
+    .info-block .info-value {
+      font-size: 15px;
+      color: var(--navy);
+      font-weight: 600;
+      font-family: 'Cormorant Garamond', serif;
+      letter-spacing: 0.3px;
+    }
+    .info-block .info-value.muted {
+      color: var(--text-muted);
+      font-style: italic;
+      font-weight: 400;
+    }
+
     .card-meta {
       display: flex;
       flex-wrap: wrap;
-      gap: 6px;
+      gap: 5px;
     }
     .badge {
-      font-size: 11px;
+      font-size: 10px;
       padding: 3px 9px;
       border-radius: 3px;
-      background: var(--gray-bg);
+      background: var(--bg-soft);
       color: var(--text-secondary);
       font-weight: 500;
     }
     .badge.estado { background: #e0e7ff; color: #3730a3; }
-    .badge.prazo { background: #fef3c7; color: #92400e; }
-    .badge.orgao { background: #ecfdf5; color: #065f46; }
+    .badge.banca { background: #ecfdf5; color: #065f46; }
+    .badge.fase { background: #fef3c7; color: #92400e; }
+    .badge.data { background: var(--gold-pale); color: var(--gold-dark); }
+
     .card-desc {
       font-size: 13px;
       line-height: 1.55;
       color: var(--text-primary);
     }
+
+    .extras {
+      font-size: 11.5px;
+      background: var(--bg-soft);
+      padding: 10px 12px;
+      border-radius: 4px;
+      color: var(--text-secondary);
+      line-height: 1.7;
+    }
+    .extras strong { color: var(--navy); font-weight: 600; }
+    .extras .citacao {
+      font-style: italic;
+      color: var(--navy);
+      border-left: 2px solid var(--gold);
+      padding-left: 10px;
+      margin-top: 6px;
+      display: block;
+      font-size: 12px;
+    }
+
     .card-actions {
       display: flex;
       gap: 8px;
       margin-top: auto;
-      padding-top: 8px;
-      border-top: 1px solid var(--gray-bg);
+      padding-top: 10px;
+      border-top: 1px solid var(--line-soft);
+      align-items: center;
     }
     .card-action {
       background: transparent;
-      border: 1px solid var(--gray-line);
+      border: 1px solid var(--line);
       color: var(--text-secondary);
       font-family: 'Montserrat', sans-serif;
-      font-size: 11px;
-      padding: 6px 11px;
-      border-radius: 4px;
+      font-size: 10px;
+      padding: 5px 11px;
+      border-radius: 3px;
       cursor: pointer;
       transition: all 0.15s;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      font-weight: 600;
     }
     .card-action:hover {
       border-color: var(--gold);
-      color: var(--gold);
+      color: var(--gold-dark);
+      background: var(--gold-pale);
     }
     .card-link {
-      color: var(--blue);
+      color: var(--link);
       text-decoration: none;
       font-size: 11px;
-      font-weight: 500;
+      font-weight: 600;
       margin-left: auto;
-      align-self: center;
     }
     .card-link:hover { text-decoration: underline; }
+
+    .empty {
+      text-align: center;
+      padding: 36px 20px;
+      color: var(--text-secondary);
+      background: var(--bg-card);
+      border-radius: 4px;
+      border: 1px dashed var(--line);
+    }
+    .empty p {
+      font-size: 13px;
+      max-width: 480px;
+      margin: 0 auto;
+      line-height: 1.5;
+    }
 
     .toast {
       position: fixed;
@@ -624,39 +1523,48 @@ HTML_INDEX = r"""<!DOCTYPE html>
       background: var(--navy);
       color: white;
       padding: 14px 22px;
-      border-radius: 6px;
-      box-shadow: 0 6px 20px rgba(0,0,0,0.2);
+      border-radius: 4px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.25);
       font-size: 13px;
       z-index: 200;
-      max-width: 400px;
+      max-width: 420px;
     }
-
     .loading {
       text-align: center;
-      padding: 60px 20px;
+      padding: 40px 20px;
       color: var(--text-secondary);
     }
     .spinner {
       width: 32px;
       height: 32px;
-      border: 3px solid var(--gray-line);
+      border: 3px solid var(--line);
       border-top-color: var(--gold);
       border-radius: 50%;
       animation: spin 0.8s linear infinite;
-      margin: 0 auto 16px;
+      margin: 0 auto 14px;
     }
-    @keyframes spin {
-      to { transform: rotate(360deg); }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    footer {
+      max-width: 1400px;
+      margin: 60px auto 30px;
+      padding: 20px 24px;
+      border-top: 1px solid var(--line);
+      text-align: center;
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 1px;
     }
 
     @media (max-width: 700px) {
-      .header-title { font-size: 18px; }
+      .logo-img { height: 50px; }
+      .header-title { font-size: 17px; }
       .header-subtitle { display: none; }
-      .header-left img { height: 32px; }
+      .header-text-block { padding-left: 12px; }
       .cards-grid { grid-template-columns: 1fr; }
-      .tabs { overflow-x: auto; }
-      .tab { padding: 12px 14px; font-size: 12px; white-space: nowrap; }
-      .btn { font-size: 11px; padding: 8px 12px; }
+      .btn { font-size: 10px; padding: 8px 12px; letter-spacing: 0.5px; }
+      .card-concurso-info { grid-template-columns: 1fr; }
+      .tier-desc { display: none; }
     }
   </style>
 </head>
@@ -664,98 +1572,104 @@ HTML_INDEX = r"""<!DOCTYPE html>
   <header>
     <div class="header-inner">
       <div class="header-left">
-        <div style="font-family:'Cormorant Garamond', serif; font-size: 24px; font-weight: 700; color: white; letter-spacing: 0.5px;">SP</div>
-        <div>
+        <img class="logo-img" src="/logo.png" alt="Silva Pinto Advocacia">
+        <div class="header-text-block">
           <div class="header-title">Painel de Oportunidades</div>
-          <div class="header-subtitle">Concursos | Recursos | Jurisprudencia</div>
+          <div class="header-subtitle">Captacao | Planejamento | Inteligencia</div>
         </div>
       </div>
-      <div>
-        <button class="btn btn-ghost" onclick="rodarAgora()" id="btn-rodar">Coletar agora</button>
+      <div class="btn-group">
+        <button class="btn btn-ghost" onclick="rodarTier(1)" id="btn-tier1">Coletar Tier 1</button>
+        <button class="btn" onclick="rodarCompleto()" id="btn-completo">Coletar Tudo</button>
       </div>
     </div>
   </header>
 
   <div class="status-bar">
-    <div class="status-card">
-      <div class="label">Nao lidos</div>
-      <div class="value" id="stat-nao-lidos">-</div>
+    <div class="status-card tier1">
+      <div class="label">Tier 1 &mdash; Quente</div>
+      <div class="value" id="stat-tier1">-</div>
+    </div>
+    <div class="status-card tier2">
+      <div class="label">Tier 2 &mdash; Planejamento</div>
+      <div class="value" id="stat-tier2">-</div>
+    </div>
+    <div class="status-card tier3">
+      <div class="label">Tier 3 &mdash; Mercado</div>
+      <div class="value" id="stat-tier3">-</div>
     </div>
     <div class="status-card">
-      <div class="label">Total no banco</div>
-      <div class="value" id="stat-total">-</div>
+      <div class="label">Total nao lidos</div>
+      <div class="value" id="stat-nao-lidos">-</div>
     </div>
     <div class="status-card">
       <div class="label">Ultima coleta</div>
       <div class="value small" id="stat-ultima">-</div>
     </div>
-    <div class="status-card">
-      <div class="label">Proxima coleta</div>
-      <div class="value small">09:00 e 17:00</div>
+  </div>
+
+  <div class="global-filters">
+    <div class="filters">
+      <label><input type="checkbox" id="filtro-lidos"> mostrar lidos</label>
+      <select id="filtro-estado">
+        <option value="">Todos os estados</option>
+        <option value="Brasil">Brasil (nacional)</option>
+        <option value="MG">MG</option>
+        <option value="ES">ES</option>
+        <option value="RJ">RJ</option>
+        <option value="SP">SP</option>
+        <option value="DF">DF</option>
+        <option value="BA">BA</option>
+        <option value="PE">PE</option>
+        <option value="RS">RS</option>
+        <option value="PR">PR</option>
+      </select>
+      <button class="card-action" onclick="limparExemplos()" style="margin-left:auto">Limpar exemplos</button>
     </div>
   </div>
 
-  <div class="tabs">
-    <button class="tab active" data-cat="">
-      Todos <span class="count" id="count-todos">0</span>
-    </button>
-    <button class="tab" data-cat="concursos_abertos">
-      Concursos Abertos <span class="count" id="count-concursos_abertos">0</span>
-    </button>
-    <button class="tab" data-cat="recursos_anulacao">
-      Recursos / Anulacao <span class="count" id="count-recursos_anulacao">0</span>
-    </button>
-    <button class="tab" data-cat="jurisprudencia">
-      Jurisprudencia <span class="count" id="count-jurisprudencia">0</span>
-    </button>
-  </div>
-
-  <div class="filters">
-    <label>
-      <input type="checkbox" id="filtro-lidos"> mostrar lidos tambem
-    </label>
-    <select id="filtro-estado">
-      <option value="">Todos os estados</option>
-      <option value="Brasil">Brasil (nacional)</option>
-      <option value="MG">MG</option>
-      <option value="ES">ES</option>
-      <option value="RJ">RJ</option>
-      <option value="SP">SP</option>
-      <option value="DF">DF</option>
-    </select>
-  </div>
-
-  <div class="cards-area">
-    <div id="cards-container">
-      <div class="loading">
-        <div class="spinner"></div>
-        <div>Carregando oportunidades...</div>
-      </div>
+  <div class="tier-section" id="tier-1">
+    <div class="tier-header">
+      <span class="tier-pill tier1">Tier 1</span>
+      <div class="tier-title">Captacao Imediata</div>
+      <div class="tier-desc">Eliminacoes ativas | TAF | Recursos &mdash; acionar em ate 6h</div>
     </div>
+    <div id="container-tier-1"><div class="loading"><div class="spinner"></div>Carregando...</div></div>
   </div>
+
+  <div class="tier-section" id="tier-2">
+    <div class="tier-header">
+      <span class="tier-pill tier2">Tier 2</span>
+      <div class="tier-title">Planejamento</div>
+      <div class="tier-desc">Novos concursos | Jurisprudencia &mdash; estrategia de medio prazo</div>
+    </div>
+    <div id="container-tier-2"></div>
+  </div>
+
+  <div class="tier-section" id="tier-3" style="margin-bottom: 60px;">
+    <div class="tier-header">
+      <span class="tier-pill tier3">Tier 3</span>
+      <div class="tier-title">Inteligencia de Mercado</div>
+      <div class="tier-desc">Sentimento | Concorrencia &mdash; ideias para conteudo</div>
+    </div>
+    <div id="container-tier-3"></div>
+  </div>
+
+  <footer>
+    Silva Pinto Advocacia &middot; OAB/RJ n&ordm; 189.781 &middot; Sistema Interno
+  </footer>
 
   <script>
-    let categoriaAtual = "";
     let mostrarLidos = false;
     let filtroEstado = "";
 
-    document.querySelectorAll('.tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        categoriaAtual = tab.dataset.cat;
-        carregarOportunidades();
-      });
-    });
-
     document.getElementById('filtro-lidos').addEventListener('change', e => {
       mostrarLidos = e.target.checked;
-      carregarOportunidades();
+      carregarTudo();
     });
-
     document.getElementById('filtro-estado').addEventListener('change', e => {
       filtroEstado = e.target.value;
-      carregarOportunidades();
+      carregarTudo();
     });
 
     function toast(msg, ms) {
@@ -775,13 +1689,11 @@ HTML_INDEX = r"""<!DOCTYPE html>
       } catch (e) { return iso.substring(0, 16); }
     }
 
-    function categoriaLabel(cat) {
-      const map = {
-        'concursos_abertos': 'Concurso aberto',
-        'recursos_anulacao': 'Recurso/Anulacao',
-        'jurisprudencia': 'Jurisprudencia'
-      };
-      return map[cat] || cat;
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str).replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[c]));
     }
 
     async function carregarStatus() {
@@ -789,103 +1701,171 @@ HTML_INDEX = r"""<!DOCTYPE html>
         const r = await fetch('/api/status');
         const data = await r.json();
         document.getElementById('stat-nao-lidos').textContent = data.nao_lidos;
-        document.getElementById('stat-total').textContent = data.total;
+        if (data.tier_counts) {
+          document.getElementById('stat-tier1').textContent = data.tier_counts.tier1 || 0;
+          document.getElementById('stat-tier2').textContent = data.tier_counts.tier2 || 0;
+          document.getElementById('stat-tier3').textContent = data.tier_counts.tier3 || 0;
+        }
         if (data.ultima_execucao) {
           const ue = data.ultima_execucao;
-          document.getElementById('stat-ultima').textContent = fmtData(ue.data_execucao) + ' | ' + ue.itens_novos + ' novos';
+          let txt = fmtData(ue.data_execucao) + ' | ' + ue.itens_novos + ' novos';
+          if (ue.tipo_run) txt += ' (' + ue.tipo_run + ')';
+          if (!ue.sucesso) txt += ' [com erros]';
+          document.getElementById('stat-ultima').textContent = txt;
         } else {
-          document.getElementById('stat-ultima').textContent = 'Aguardando primeira coleta';
+          document.getElementById('stat-ultima').textContent = 'Aguardando coleta';
         }
-      } catch (e) {
-        console.error('Status error:', e);
-      }
+      } catch (e) { console.error(e); }
     }
 
-    async function carregarContagens() {
-      const cats = ['concursos_abertos', 'recursos_anulacao', 'jurisprudencia'];
-      let total = 0;
-      for (const cat of cats) {
-        try {
-          const r = await fetch('/api/oportunidades?categoria=' + cat + '&limite=500');
-          const data = await r.json();
-          document.getElementById('count-' + cat).textContent = data.total;
-          total += data.total;
-        } catch (e) {}
-      }
-      document.getElementById('count-todos').textContent = total;
-    }
-
-    async function carregarOportunidades() {
-      const container = document.getElementById('cards-container');
-      container.innerHTML = '<div class="loading"><div class="spinner"></div><div>Carregando...</div></div>';
-
+    async function carregarTier(tier) {
+      const container = document.getElementById('container-tier-' + tier);
       const params = new URLSearchParams();
-      if (categoriaAtual) params.set('categoria', categoriaAtual);
+      params.set('tier', tier);
       if (mostrarLidos) params.set('incluir_lidos', '1');
       if (filtroEstado) params.set('estado', filtroEstado);
 
       try {
         const r = await fetch('/api/oportunidades?' + params);
         const data = await r.json();
-        renderizarCards(data.itens);
+        renderizarTier(container, data.itens, tier);
       } catch (e) {
-        container.innerHTML = '<div class="empty"><h3>Erro ao carregar</h3><p>Tente recarregar</p></div>';
+        container.innerHTML = '<div class="empty"><p>Erro ao carregar.</p></div>';
       }
     }
 
-    function renderizarCards(itens) {
-      const container = document.getElementById('cards-container');
+    function renderizarTier(container, itens, tier) {
       if (!itens.length) {
-        container.innerHTML = '<div class="empty"><h3>Nenhuma oportunidade</h3><p>O sistema coleta automaticamente as 09:00 e 17:00. Voce tambem pode disparar uma coleta manual com o botao "Coletar agora".</p></div>';
+        let msg = 'Nenhuma oportunidade ' + (mostrarLidos ? '' : 'nao lida ') + 'no momento. ';
+        if (tier === 1) msg += 'Tier 1 e atualizado as 09:00 e 17:00.';
+        else msg += 'Tier 2 e 3 sao atualizados ao meio-dia.';
+        container.innerHTML = '<div class="empty"><p>' + msg + '</p></div>';
         return;
       }
 
-      const grid = document.createElement('div');
-      grid.className = 'cards-grid';
+      if (tier === 1 || tier === 2) {
+        const apos = itens.filter(i => i.etapa_concurso === 'apos_prova');
+        const antes = itens.filter(i => i.etapa_concurso === 'antes_prova');
+        const semEtapa = itens.filter(i => !i.etapa_concurso);
 
-      itens.forEach(item => {
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.dataset.id = item.id;
+        let html = '';
+        if (apos.length) {
+          html += '<div class="phase-divider apos">Apos primeira etapa &middot; ' + apos.length + '</div>';
+          html += '<div class="cards-grid">' + apos.map(renderCard).join('') + '</div>';
+        }
+        if (antes.length) {
+          html += '<div class="phase-divider antes">Antes da prova objetiva &middot; ' + antes.length + '</div>';
+          html += '<div class="cards-grid">' + antes.map(renderCard).join('') + '</div>';
+        }
+        if (semEtapa.length) {
+          if (apos.length || antes.length) html += '<div class="phase-divider">Outros &middot; ' + semEtapa.length + '</div>';
+          html += '<div class="cards-grid">' + semEtapa.map(renderCard).join('') + '</div>';
+        }
+        container.innerHTML = html;
+      } else {
+        container.innerHTML = '<div class="cards-grid">' + itens.map(renderCard).join('') + '</div>';
+      }
+    }
 
-        let relClass = '';
-        if (item.relevancia >= 9) relClass = 'maxima';
-        else if (item.relevancia >= 7) relClass = 'alta';
+    function renderCard(item) {
+      let relClass = '';
+      if (item.relevancia >= 9) relClass = 'maxima';
+      else if (item.relevancia >= 7) relClass = 'alta';
 
-        const badges = [];
-        badges.push('<span class="badge">' + categoriaLabel(item.categoria) + '</span>');
-        if (item.estado) badges.push('<span class="badge estado">' + escapeHtml(item.estado) + '</span>');
-        if (item.orgao) badges.push('<span class="badge orgao">' + escapeHtml(item.orgao) + '</span>');
-        if (item.prazo) badges.push('<span class="badge prazo">' + escapeHtml(item.prazo) + '</span>');
+      const flagSafe = (item.flag || '').replace(/[^A-Z]/g, '');
+      // Para categoria taf_fases: mostrar a fase especifica em vez do generico "FASE"
+      let flagPretty = (item.flag || '').replace('CONCORRENCIA', 'CONCORR.');
+      if (item.flag === 'FASE' && item.extras && item.extras.fase_eliminacao) {
+        flagPretty = String(item.extras.fase_eliminacao).toUpperCase().substring(0, 18);
+      }
 
-        const linkHtml = item.link ? '<a class="card-link" href="' + escapeAttr(item.link) + '" target="_blank" rel="noopener">Ver fonte</a>' : '';
-
-        card.innerHTML =
-          '<div class="card-header">' +
-            '<div class="card-title">' + escapeHtml(item.titulo) + '</div>' +
-            '<div class="relevancia ' + relClass + '">' + item.relevancia + '/10</div>' +
-          '</div>' +
-          '<div class="card-meta">' + badges.join('') + '</div>' +
-          '<div class="card-desc">' + escapeHtml(item.descricao || '') + '</div>' +
-          '<div class="card-actions">' +
-            '<button class="card-action" onclick="marcarLido(' + item.id + ')">Marcar lido</button>' +
-            '<button class="card-action" onclick="arquivar(' + item.id + ')">Arquivar</button>' +
-            linkHtml +
+      const isConcurso = (item.tier === 1 || item.tier === 2) && (item.vagas || item.salario || item.concurso);
+      let concursoBlock = '';
+      if (isConcurso && (item.vagas || item.salario)) {
+        const vagasHtml = item.vagas
+          ? '<div class="info-value">' + escapeHtml(item.vagas) + '</div>'
+          : '<div class="info-value muted">nao informado</div>';
+        const salarioHtml = item.salario
+          ? '<div class="info-value">' + escapeHtml(item.salario) + '</div>'
+          : '<div class="info-value muted">nao informado</div>';
+        concursoBlock =
+          '<div class="card-concurso-info">' +
+            '<div class="info-block"><div class="info-label">Vagas</div>' + vagasHtml + '</div>' +
+            '<div class="info-block"><div class="info-label">Salario</div>' + salarioHtml + '</div>' +
           '</div>';
-        grid.appendChild(card);
-      });
+      }
 
-      container.innerHTML = '';
-      container.appendChild(grid);
-    }
+      let titleArea;
+      if (item.concurso) {
+        const cargoStr = item.cargo ? ' &middot; ' + escapeHtml(item.cargo) : '';
+        titleArea = '<div class="card-title">' + escapeHtml(item.concurso) + cargoStr + '</div>';
+        if (item.titulo && item.titulo !== item.concurso) {
+          titleArea += '<div class="card-subtitle">' + escapeHtml(item.titulo) + '</div>';
+        }
+      } else {
+        titleArea = '<div class="card-title">' + escapeHtml(item.titulo) + '</div>';
+      }
 
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str).replace(/[&<>"']/g, c => ({
-        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-      }[c]));
+      const badges = [];
+      if (item.estado) badges.push('<span class="badge estado">' + escapeHtml(item.estado) + '</span>');
+      if (item.banca) badges.push('<span class="badge banca">' + escapeHtml(item.banca) + '</span>');
+      if (item.fase_atual) badges.push('<span class="badge fase">' + escapeHtml(item.fase_atual) + '</span>');
+      if (item.prazo_inscricao) badges.push('<span class="badge fase">Inscr.: ' + escapeHtml(item.prazo_inscricao) + '</span>');
+      if (item.data_prova) badges.push('<span class="badge">Prova: ' + escapeHtml(item.data_prova) + '</span>');
+      if (item.data_publicacao) badges.push('<span class="badge data">' + escapeHtml(item.data_publicacao) + '</span>');
+
+      let extrasBlock = '';
+      if (item.extras && Object.keys(item.extras).length) {
+        const extrasParts = [];
+        for (const [k, v] of Object.entries(item.extras)) {
+          if (!v) continue;
+          if (k === 'citacao_candidato') {
+            extrasParts.push('<div class="citacao">"' + escapeHtml(v) + '"</div>');
+          } else {
+            const labelMap = {
+              'candidatos_estimados': 'Eliminados (est.)',
+              'fase_eliminacao': 'Fase',
+              'tipo_irregularidade': 'Tipo',
+              'questao_numero': 'Questao',
+              'afetados_estimados': 'Afetados',
+              'tribunal': 'Tribunal',
+              'tema': 'Tema',
+              'numero_processo': 'Processo',
+              'tese': 'Tese',
+              'concurso_mencionado': 'Concurso',
+              'padrao_emocional': 'Padrao',
+              'escritorio_concorrente': 'Concorrente',
+              'concurso_tema': 'Tema',
+              'gap_identificado': 'Gap',
+            };
+            extrasParts.push('<strong>' + (labelMap[k] || k) + ':</strong> ' + escapeHtml(v));
+          }
+        }
+        if (extrasParts.length) {
+          extrasBlock = '<div class="extras">' + extrasParts.join(' &middot; ') + '</div>';
+        }
+      }
+
+      const linkHtml = item.link ?
+        '<a class="card-link" href="' + escapeHtml(item.link) + '" target="_blank" rel="noopener">Ver fonte &rarr;</a>' : '';
+
+      return '<div class="card tier' + item.tier + '" data-id="' + item.id + '">' +
+        '<div class="card-flag-row">' +
+          '<span class="flag-badge ' + flagSafe + '">' + escapeHtml(flagPretty) + '</span>' +
+          '<span class="relevancia ' + relClass + '">' + item.relevancia + '/10</span>' +
+        '</div>' +
+        titleArea +
+        concursoBlock +
+        (badges.length ? '<div class="card-meta">' + badges.join('') + '</div>' : '') +
+        '<div class="card-desc">' + escapeHtml(item.descricao || '') + '</div>' +
+        extrasBlock +
+        '<div class="card-actions">' +
+          '<button class="card-action" onclick="marcarLido(' + item.id + ')">Lido</button>' +
+          '<button class="card-action" onclick="arquivar(' + item.id + ')">Arquivar</button>' +
+          linkHtml +
+        '</div>' +
+      '</div>';
     }
-    function escapeAttr(str) { return escapeHtml(str); }
 
     async function marcarLido(id) {
       try {
@@ -893,224 +1873,96 @@ HTML_INDEX = r"""<!DOCTYPE html>
         const card = document.querySelector('.card[data-id="' + id + '"]');
         if (card) card.remove();
         carregarStatus();
-        carregarContagens();
       } catch (e) { toast('Erro ao marcar'); }
     }
 
     async function arquivar(id) {
-      if (!confirm('Arquivar esta oportunidade?')) return;
+      if (!confirm('Arquivar este item?')) return;
       try {
         await fetch('/api/oportunidades/' + id + '/arquivar', { method: 'POST' });
         const card = document.querySelector('.card[data-id="' + id + '"]');
         if (card) card.remove();
         carregarStatus();
-        carregarContagens();
       } catch (e) { toast('Erro ao arquivar'); }
     }
 
-    async function rodarAgora() {
-      const btn = document.getElementById('btn-rodar');
-      if (!confirm('Disparar coleta manual agora? Demora 1-2 minutos.')) return;
+    async function limparExemplos() {
+      if (!confirm('Apagar todos os itens [EXEMPLO] do banco?')) return;
+      try {
+        const r = await fetch('/api/limpar_exemplos', { method: 'POST' });
+        const data = await r.json();
+        toast(data.removidos + ' exemplos removidos');
+        carregarStatus();
+        carregarTudo();
+      } catch (e) { toast('Erro'); }
+    }
+
+    async function rodarTier(tier) {
+      const tipo = tier === 1 ? 'tier1' : 'tier23';
+      const btn = document.getElementById('btn-tier' + tier);
+      if (!confirm('Disparar coleta de Tier ' + tier + ' agora? Demora ~1-2 minutos.')) return;
       btn.disabled = true;
       btn.textContent = 'Coletando...';
-
       try {
-        const r = await fetch('/cron/manual', { method: 'POST' });
+        const r = await fetch('/cron/manual?tipo=' + tipo, { method: 'POST' });
         const data = await r.json();
-        if (data.erro) {
-          toast('Erro: ' + data.erro, 6000);
-          btn.disabled = false;
-          btn.textContent = 'Coletar agora';
-          return;
-        }
-        toast(data.mensagem || 'Coleta iniciada', 8000);
-
-        let polls = 0;
-        const interval = setInterval(async () => {
-          polls++;
-          await carregarStatus();
-          await carregarContagens();
-          await carregarOportunidades();
-          if (polls >= 18) {
-            clearInterval(interval);
-            btn.disabled = false;
-            btn.textContent = 'Coletar agora';
-          }
-        }, 10000);
+        if (data.erro) { toast('Erro: ' + data.erro); btn.disabled = false; btn.textContent = 'Coletar Tier ' + tier; return; }
+        toast(data.mensagem, 8000);
+        startPolling(btn, 'Coletar Tier ' + tier);
       } catch (e) {
-        toast('Erro ao disparar coleta');
-        btn.disabled = false;
-        btn.textContent = 'Coletar agora';
+        toast('Erro');
+        btn.disabled = false; btn.textContent = 'Coletar Tier ' + tier;
       }
     }
 
+    async function rodarCompleto() {
+      const btn = document.getElementById('btn-completo');
+      if (!confirm('Disparar coleta COMPLETA (7 categorias)? Demora 3-6 minutos.')) return;
+      btn.disabled = true;
+      btn.textContent = 'Coletando...';
+      try {
+        const r = await fetch('/cron/manual?tipo=completo', { method: 'POST' });
+        const data = await r.json();
+        if (data.erro) { toast('Erro: ' + data.erro); btn.disabled = false; btn.textContent = 'Coletar Tudo'; return; }
+        toast(data.mensagem, 10000);
+        startPolling(btn, 'Coletar Tudo');
+      } catch (e) {
+        toast('Erro');
+        btn.disabled = false; btn.textContent = 'Coletar Tudo';
+      }
+    }
+
+    function startPolling(btn, txtFinal) {
+      let polls = 0;
+      const interval = setInterval(async () => {
+        polls++;
+        await carregarStatus();
+        await carregarTudo();
+        if (polls >= 30) {
+          clearInterval(interval);
+          btn.disabled = false;
+          btn.textContent = txtFinal;
+        }
+      }, 12000);
+    }
+
+    function carregarTudo() {
+      carregarTier(1);
+      carregarTier(2);
+      carregarTier(3);
+    }
+
     carregarStatus();
-    carregarContagens();
-    carregarOportunidades();
+    carregarTudo();
 
     setInterval(() => {
       carregarStatus();
-      carregarContagens();
+      carregarTudo();
     }, 5 * 60 * 1000);
   </script>
 </body>
 </html>
 """
-
-
-# Routes
-@app.route("/")
-def home():
-    return Response(HTML_INDEX, mimetype="text/html")
-
-
-@app.route("/api/oportunidades")
-def api_listar():
-    categoria = request.args.get("categoria", "")
-    estado = request.args.get("estado", "")
-    incluir_lidos = request.args.get("incluir_lidos", "0") == "1"
-    limite = int(request.args.get("limite", 200))
-    dias = int(request.args.get("dias", 30))
-
-    where_parts = ["arquivado = 0"]
-    params = []
-    if not incluir_lidos:
-        where_parts.append("lido = 0")
-    if categoria:
-        where_parts.append("categoria = ?")
-        params.append(categoria)
-    if estado:
-        where_parts.append("estado = ?")
-        params.append(estado)
-    if dias > 0:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
-        where_parts.append("data_coleta >= ?")
-        params.append(cutoff)
-
-    where_sql = " AND ".join(where_parts)
-    sql = f"SELECT * FROM oportunidades WHERE {where_sql} ORDER BY relevancia DESC, data_coleta DESC LIMIT ?"
-    params.append(limite)
-
-    with db_conn() as conn:
-        rows = conn.execute(sql, params).fetchall()
-
-    return jsonify({"total": len(rows), "itens": [dict(r) for r in rows]})
-
-
-@app.route("/api/oportunidades/<int:item_id>/marcar_lido", methods=["POST"])
-def api_marcar_lido(item_id):
-    with db_conn() as conn:
-        conn.execute("UPDATE oportunidades SET lido = 1 WHERE id = ?", (item_id,))
-    return jsonify({"ok": True})
-
-
-@app.route("/api/oportunidades/<int:item_id>/arquivar", methods=["POST"])
-def api_arquivar(item_id):
-    with db_conn() as conn:
-        conn.execute("UPDATE oportunidades SET arquivado = 1 WHERE id = ?", (item_id,))
-    return jsonify({"ok": True})
-
-
-@app.route("/api/status")
-def api_status():
-    with db_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) AS c FROM oportunidades").fetchone()["c"]
-        nao_lidos = conn.execute(
-            "SELECT COUNT(*) AS c FROM oportunidades WHERE lido = 0 AND arquivado = 0"
-        ).fetchone()["c"]
-        ultima = conn.execute(
-            "SELECT * FROM execucoes_cron ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-
-    return jsonify({
-        "total": total,
-        "nao_lidos": nao_lidos,
-        "ultima_execucao": dict(ultima) if ultima else None,
-        "model": MODEL_NAME,
-        "version": APP_VERSION,
-    })
-
-
-@app.route("/cron/diaria", methods=["GET", "POST"])
-def cron_diaria():
-    if CRON_SECRET:
-        secret = request.args.get("secret") or request.headers.get("X-Cron-Secret")
-        if secret != CRON_SECRET:
-            return jsonify({"erro": "secret invalido"}), 403
-
-    if not ANTHROPIC_API_KEY:
-        return jsonify({"erro": "API key nao configurada"}), 500
-
-    log.info("CRON DIARIA disparado")
-    try:
-        result = executar_coleta_completa(ANTHROPIC_API_KEY)
-        log.info("Cron concluido: %s", result)
-        return jsonify(result)
-    except Exception as e:
-        log.error("Cron falhou: %s", e)
-        return jsonify({"erro": str(e)}), 500
-
-
-@app.route("/cron/manual", methods=["POST"])
-def cron_manual():
-    if not ANTHROPIC_API_KEY:
-        return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
-
-    log.info("Disparo MANUAL pela UI")
-
-    def run_collect():
-        try:
-            executar_coleta_completa(ANTHROPIC_API_KEY)
-        except Exception as e:
-            log.error("Manual run falhou: %s", e)
-
-    t = threading.Thread(target=run_collect, daemon=True)
-    t.start()
-    return jsonify({"ok": True, "mensagem": "Coleta iniciada em background. Aguarde 1-2 minutos e recarregue."})
-
-
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "version": APP_VERSION})
-
-
-# Init
-init_db()
-
-
-def seed_demo_se_vazio():
-    with db_conn() as conn:
-        count = conn.execute("SELECT COUNT(*) AS c FROM oportunidades").fetchone()["c"]
-        if count > 0:
-            return
-        log.info("Banco vazio - inserindo dados de exemplo")
-        agora = datetime.now(timezone.utc).isoformat()
-        demos = [
-            ("concursos_abertos", "[EXEMPLO] PCDF abre concurso para Agente",
-             "Concurso da Policia Civil DF com 1.800 vagas. Inscricoes abertas.",
-             "PCDF", "DF", "30/06/2026", "https://example.com", 9),
-            ("recursos_anulacao", "[EXEMPLO] Banca anula 3 questoes do concurso PCMG",
-             "Apos analise de recursos, banca anulou 3 questoes da prova objetiva.",
-             "PCMG", "MG", "Recursos ate 15/06", "https://example.com", 8),
-            ("jurisprudencia", "[EXEMPLO] STJ: questao fora do edital deve ser anulada",
-             "STJ firmou entendimento de que questoes fora do conteudo programatico devem ser anuladas.",
-             "STJ", "Brasil", "", "https://example.com", 10),
-        ]
-        for cat, tit, desc, org, est, prazo, link, rel in demos:
-            try:
-                conn.execute(
-                    """INSERT INTO oportunidades
-                    (categoria, titulo, descricao, orgao, estado, prazo, link,
-                     relevancia, data_coleta, hash_unico)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (cat, tit, desc, org, est, prazo, link, rel, agora,
-                     hash_for_dedup(tit, org))
-                )
-            except sqlite3.IntegrityError:
-                pass
-
-
-seed_demo_se_vazio()
 
 
 if __name__ == "__main__":
