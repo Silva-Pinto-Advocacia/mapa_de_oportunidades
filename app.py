@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.7-2026-05-05-novo-ordem"
+APP_VERSION = "v6.4.9-2026-05-06-excluir"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1272,12 +1272,49 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
         # Contadores de rejeicao pra log final
         rejeitados_dominio = 0
         rejeitados_nao_citado = 0
+        rejeitados_artigo = 0
         rejeitados_outro = 0
+
+        # Padroes que indicam artigo doutrinario / analise tematica em vez de noticia factual.
+        # Aplicado APENAS no Tier 1 (eliminacoes ativas, fases, recurso) -- jurisprudencia
+        # do Tier 2 pode aceitar essas palavras.
+        PADROES_ARTIGO = [
+            "analise jurisprudencial",
+            "analise tematica",
+            "uma analise",
+            "estudo de caso",
+            "como recorrer",
+            "como funciona",
+            "tudo sobre",
+            "guia sobre",
+            "guia completo",
+            "entenda como",
+            "o que e",
+            "o que fazer",
+            "saiba mais",
+            "saiba como",
+            "5 dicas",
+            "passo a passo",
+            "doutrina",
+            "tese sobre",
+            "reflexoes sobre",
+        ]
+
+        def _parece_artigo(texto):
+            """Retorna True se o texto parece artigo doutrinario em vez de noticia factual."""
+            import unicodedata
+            t = unicodedata.normalize('NFKD', (texto or "").lower())
+            t = "".join(c for c in t if not unicodedata.combining(c))
+            for padrao in PADROES_ARTIGO:
+                if padrao in t:
+                    return padrao
+            return None
 
         for item in itens:
             if not isinstance(item, dict):
                 continue
             titulo = str(item.get("titulo", "")).strip()
+            descricao = str(item.get("descricao", "")).strip()
             link = str(item.get("link", "")).strip()
 
             # Validacoes anti-invencao
@@ -1285,6 +1322,14 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
                 log.warning("[%s] item sem titulo, ignorando", cat_id)
                 rejeitados_outro += 1
                 continue
+
+            # ANTI-ARTIGO: so para Tier 1 (Tier 2 jurisprudencia pode legitimamente trazer analises)
+            if tier == 1:
+                padrao_encontrado = _parece_artigo(titulo) or _parece_artigo(descricao[:200])
+                if padrao_encontrado:
+                    log.warning("[%s] tier1 parece artigo (padrao '%s'): %s", cat_id, padrao_encontrado, titulo[:60])
+                    rejeitados_artigo += 1
+                    continue
 
             # Tier 1 e 2: link obrigatorio + dominio whitelist + match com citacoes web_search
             # Tier 3: mais flexivel (aceita perfis/canais sem URL exato)
@@ -1365,8 +1410,8 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
                 "etapa_concurso": etapa,
             })
 
-        log.info("[%s] %d validados | rejeitados: dominio=%d, nao_citado=%d, outros=%d",
-                 cat_id, len(todos_itens), rejeitados_dominio, rejeitados_nao_citado, rejeitados_outro)
+        log.info("[%s] %d validados | rejeitados: dominio=%d, nao_citado=%d, artigo=%d, outros=%d",
+                 cat_id, len(todos_itens), rejeitados_dominio, rejeitados_nao_citado, rejeitados_artigo, rejeitados_outro)
 
     except Exception as e:
         log.error("[%s] erro: %s\n%s", cat_id, e, traceback.format_exc())
@@ -1520,7 +1565,7 @@ def api_listar():
     etapa = request.args.get("etapa", "")
     incluir_lidos = request.args.get("incluir_lidos", "0") == "1"
     limite = int(request.args.get("limite", 200))
-    dias = int(request.args.get("dias", 30))
+    dias = int(request.args.get("dias", 7))
 
     where_parts = ["arquivado = 0"]
     params = []
@@ -1628,16 +1673,29 @@ def api_listar():
 
 @app.route("/api/oportunidades/<int:item_id>/marcar_lido", methods=["POST"])
 def api_marcar_lido(item_id):
+    """Marca como lido (item continua no Turso, so fica oculto por padrao)."""
     with db_conn() as conn:
         conn.execute("UPDATE oportunidades SET lido = 1 WHERE id = ?", (item_id,))
     return jsonify({"ok": True})
 
 
-@app.route("/api/oportunidades/<int:item_id>/arquivar", methods=["POST"])
-def api_arquivar(item_id):
-    with db_conn() as conn:
-        conn.execute("UPDATE oportunidades SET arquivado = 1 WHERE id = ?", (item_id,))
-    return jsonify({"ok": True})
+@app.route("/api/oportunidades/<int:item_id>", methods=["DELETE"])
+def api_excluir(item_id):
+    """EXCLUI permanentemente do Turso. Acao irreversivel.
+
+    Apaga o item da tabela oportunidades. As notas associadas tambem somem
+    automaticamente via FK ON DELETE CASCADE definido no schema.
+    """
+    try:
+        with db_conn() as conn:
+            # Apaga as notas antes (caso o ON DELETE CASCADE nao seja aplicado pelo Turso)
+            conn.execute("DELETE FROM notas WHERE oportunidade_id = ?", (item_id,))
+            conn.execute("DELETE FROM oportunidades WHERE id = ?", (item_id,))
+        log.info("Item %d excluido permanentemente", item_id)
+        return jsonify({"ok": True, "excluido": item_id})
+    except Exception as e:
+        log.error("Erro ao excluir item %d: %s", item_id, e)
+        return jsonify({"erro": str(e)}), 500
 
 
 @app.route("/api/oportunidades/<int:item_id>/notas", methods=["GET"])
@@ -1746,9 +1804,9 @@ def cron_tier1():
     if CRON_SECRET:
         secret = request.args.get("secret") or request.headers.get("X-Cron-Secret")
         if secret != CRON_SECRET:
-            return jsonify({"erro": "secret invalido"}), 403
+            return "forbidden", 403, {"Content-Type": "text/plain"}
     if not ANTHROPIC_API_KEY:
-        return jsonify({"erro": "API key nao configurada"}), 500
+        return "no api key", 500, {"Content-Type": "text/plain"}
 
     log.info("=" * 60)
     log.info("CRON TIER 1 disparado em %s (background)", datetime.now(timezone.utc).isoformat())
@@ -1756,8 +1814,8 @@ def cron_tier1():
 
     cats = categorias_por_tier(1)
     _executar_coleta_background(ANTHROPIC_API_KEY, cats, tipo_run="tier1")
-    # Resposta minima e imediata - cron-job.org recebe sem timeout/saida grande
-    return jsonify({"ok": True}), 200
+    # Resposta MINIMA em texto puro - 2 bytes - evita "saida muito grande" do cron-job.org
+    return "OK", 200, {"Content-Type": "text/plain"}
 
 
 @app.route("/cron/tier23", methods=["GET", "POST"])
@@ -1765,9 +1823,9 @@ def cron_tier23():
     if CRON_SECRET:
         secret = request.args.get("secret") or request.headers.get("X-Cron-Secret")
         if secret != CRON_SECRET:
-            return jsonify({"erro": "secret invalido"}), 403
+            return "forbidden", 403, {"Content-Type": "text/plain"}
     if not ANTHROPIC_API_KEY:
-        return jsonify({"erro": "API key nao configurada"}), 500
+        return "no api key", 500, {"Content-Type": "text/plain"}
 
     log.info("=" * 60)
     log.info("CRON TIER 2+3 disparado em %s (background)", datetime.now(timezone.utc).isoformat())
@@ -1775,7 +1833,7 @@ def cron_tier23():
 
     cats = categorias_por_tier(2, 3)
     _executar_coleta_background(ANTHROPIC_API_KEY, cats, tipo_run="tier23")
-    return jsonify({"ok": True}), 200
+    return "OK", 200, {"Content-Type": "text/plain"}
 
 
 @app.route("/cron/manual", methods=["POST"])
@@ -2474,6 +2532,12 @@ HTML_INDEX = r"""<!DOCTYPE html>
       color: var(--gold-dark);
       background: var(--gold-pale);
     }
+    /* Botao Excluir: variante destrutiva. Discreto em repouso, vermelho no hover */
+    .card-action.excluir:hover {
+      border-color: #b91c1c;
+      color: #b91c1c;
+      background: #fef2f2;
+    }
     .card-link {
       color: var(--link);
       text-decoration: none;
@@ -2593,6 +2657,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   <div class="global-filters">
     <div class="filters">
       <label><input type="checkbox" id="filtro-lidos"> mostrar lidos</label>
+      <label><input type="checkbox" id="filtro-janela-completa"> ver tudo (30 dias)</label>
       <select id="filtro-estado">
         <option value="">Todos os estados</option>
         <option value="Brasil">Brasil (nacional)</option>
@@ -2644,9 +2709,14 @@ HTML_INDEX = r"""<!DOCTYPE html>
   <script>
     let mostrarLidos = false;
     let filtroEstado = "";
+    let janelaCompleta = false;  // false = 7 dias (default), true = 30 dias
 
     document.getElementById('filtro-lidos').addEventListener('change', e => {
       mostrarLidos = e.target.checked;
+      carregarTudo();
+    });
+    document.getElementById('filtro-janela-completa').addEventListener('change', e => {
+      janelaCompleta = e.target.checked;
       carregarTudo();
     });
     document.getElementById('filtro-estado').addEventListener('change', e => {
@@ -2706,6 +2776,8 @@ HTML_INDEX = r"""<!DOCTYPE html>
       params.set('tier', tier);
       if (mostrarLidos) params.set('incluir_lidos', '1');
       if (filtroEstado) params.set('estado', filtroEstado);
+      if (janelaCompleta) params.set('dias', '30');
+      // se janelaCompleta = false, backend usa default 7 dias
 
       try {
         const r = await fetch('/api/oportunidades?' + params);
@@ -2718,9 +2790,14 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
     function renderizarTier(container, itens, tier) {
       if (!itens.length) {
-        let msg = 'Nenhuma oportunidade ' + (mostrarLidos ? '' : 'nao lida ') + 'no momento. ';
-        if (tier === 1) msg += 'Tier 1 e atualizado as 09:00 e 17:00.';
-        else msg += 'Tier 2 e 3 sao atualizados ao meio-dia.';
+        let parts = [];
+        if (!mostrarLidos) parts.push('nao lidos');
+        if (!janelaCompleta) parts.push('dos ultimos 7 dias');
+        const filtro_str = parts.join(' ');
+        let msg = 'Nenhum item' + (filtro_str ? ' ' + filtro_str : '') + '. ';
+        if (tier === 1) msg += 'Tier 1 atualiza 4x ao dia.';
+        else msg += 'Tier 2 e 3 atualizam 2x ao dia.';
+        msg += ' Marque \"ver tudo\" ou \"mostrar lidos\" para ampliar.';
         container.innerHTML = '<div class="empty"><p>' + msg + '</p></div>';
         return;
       }
@@ -2901,7 +2978,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         extrasBlock +
         '<div class="card-actions">' +
           '<button class="card-action" onclick="marcarLido(' + item.id + ')">Lido</button>' +
-          '<button class="card-action" onclick="arquivar(' + item.id + ')">Arquivar</button>' +
+          '<button class="card-action excluir" onclick="excluir(' + item.id + ')" title="Apaga permanentemente do banco">Excluir</button>' +
           '<button class="' + notasClass + '" onclick="toggleNotas(' + item.id + ')" id="btn-notas-' + item.id + '">' + notasLabel + '</button>' +
           linkHtml +
         '</div>' +
@@ -3027,14 +3104,19 @@ HTML_INDEX = r"""<!DOCTYPE html>
       } catch (e) { toast('Erro ao marcar'); }
     }
 
-    async function arquivar(id) {
-      if (!confirm('Arquivar este item?')) return;
+    async function excluir(id) {
+      if (!confirm('EXCLUIR este item permanentemente?\n\nIsso apaga do banco de dados e NAO pode ser desfeito. Use apenas para itens claramente irrelevantes ou errados.')) return;
       try {
-        await fetch('/api/oportunidades/' + id + '/arquivar', { method: 'POST' });
+        const r = await fetch('/api/oportunidades/' + id, { method: 'DELETE' });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          toast('Erro: ' + (err.erro || r.status));
+          return;
+        }
         const card = document.querySelector('.card[data-id="' + id + '"]');
         if (card) card.remove();
         carregarStatus();
-      } catch (e) { toast('Erro ao arquivar'); }
+      } catch (e) { toast('Erro ao excluir'); }
     }
 
     async function limparExemplos() {
