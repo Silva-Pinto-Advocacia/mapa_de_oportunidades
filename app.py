@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.9-2026-05-06-excluir"
+APP_VERSION = "v6.4.10-2026-05-06-whitelist-ampla"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,15 +77,26 @@ CATEGORIAS = {
             "resultado final concurso publico eliminados {mes_ano}",
             "nota de corte concurso publico aprovados {mes_ano}",
             "FGV Cebraspe Vunesp gabarito polemica concurso {mes_ano}",
+            # Adicionado v6.4.10: nomeacoes / excedentes / decretos / posses
+            "nomeacao excedentes concurso publico decreto {mes_ano}",
+            "convocacao posse concurso publico {mes_ano}",
+            "minuta decreto nomeacao concurso CNU AFT {mes_ano}",
+            "homologacao concurso publico decreto governo {mes_ano}",
         ],
         "descricao": (
-            "Detectar candidatos sendo ELIMINADOS de concursos publicos AGORA. "
-            "Foco: gabaritos definitivos publicados nos ultimos 15 dias, listas de "
-            "resultados eliminando candidatos, notas de corte recem-divulgadas. "
+            "Detectar EVENTOS QUENTES afetando candidatos de concursos publicos AGORA. "
+            "Cobre dois grandes grupos:\n"
+            "  (A) ELIMINACOES: gabaritos definitivos publicados nos ultimos 15 dias, "
+            "listas de resultados eliminando candidatos, notas de corte recem-divulgadas.\n"
+            "  (B) NOMEACOES E POSSES: convocacoes oficiais de aprovados, decretos do "
+            "governo nomeando excedentes, homologacao de concursos, posses agendadas, "
+            "minutas de decreto em tramitacao. Tudo isso afeta direta e imediatamente o "
+            "candidato (precisa apresentar documentos, ir a posse, eventualmente recorrer).\n"
             "ATENCAO CRITICA: trazer APENAS noticias factuais de EVENTOS ESPECIFICOS "
-            "(ex: 'PMERJ divulga gabarito definitivo'). NAO incluir: artigos doutrinarios, "
-            "analises tematicas, posts de blog opinativos, materiais educacionais. "
-            "NAO incluir simples publicacoes de edital novo (isso e categoria radar_volume)."
+            "(ex: 'Decreto nomeia 900 excedentes da AFT', 'TJ-MG convoca aprovados para "
+            "posse'). NAO incluir: artigos doutrinarios, analises tematicas, posts de "
+            "blog opinativos, materiais educacionais. NAO incluir publicacoes de edital "
+            "novo (isso e categoria radar_volume)."
         ),
         "campos_extras": ["concurso", "banca", "fase_eliminacao", "candidatos_estimados"],
         "max_idade_dias": 15,
@@ -636,39 +647,56 @@ def hash_for_dedup(titulo, orgao="", link=""):
 
 # Whitelist de dominios aceitos. Tudo fora dessa lista e rejeitado.
 DOMINIOS_PERMITIDOS = {
-    # Oficiais (governo)
-    "gov.br", "jus.br", "stj.jus.br", "stf.jus.br", "tjsp.jus.br", "tjrj.jus.br",
+    # Oficiais (governo) - tambem aceita qualquer subdominio de .gov.br via regra abaixo
+    "gov.br", "jus.br", "mil.br",
+    "stj.jus.br", "stf.jus.br", "tjsp.jus.br", "tjrj.jus.br",
     "tjmg.jus.br", "tjpr.jus.br", "tjrs.jus.br", "tjba.jus.br", "tjpe.jus.br",
     "tjce.jus.br", "tjes.jus.br", "tjgo.jus.br", "tjam.jus.br", "tjpa.jus.br",
     "trf1.jus.br", "trf2.jus.br", "trf3.jus.br", "trf4.jus.br", "trf5.jus.br",
     "trf6.jus.br", "tst.jus.br", "tcu.gov.br", "cnj.jus.br", "anvisa.gov.br",
     "policiacivil.rj.gov.br", "policiacivil.sp.gov.br", "pf.gov.br", "prf.gov.br",
     "pm.rj.gov.br", "pm.sp.gov.br", "exercito.gov.br", "marinha.mil.br", "fab.mil.br",
+    "in.gov.br",  # Imprensa Nacional - DOU
+    "planalto.gov.br",  # Diario Oficial Eletronico
+    "agu.gov.br",  # Advocacia-Geral da Uniao
+    "mpgo.mp.br", "mprj.mp.br", "mpsp.mp.br",  # Ministerio Publico
 
     # Portais juridicos
     "jusbrasil.com.br", "migalhas.com.br", "conjur.com.br", "jota.info",
     "lexmagister.com.br", "ambito-juridico.com.br", "direitonet.com.br",
+    "consultor-juridico.com.br",
 
     # Portais de concurso (grandes)
     "pciconcursos.com.br", "qconcursos.com", "estrategiaconcursos.com.br",
     "grancursosonline.com.br", "tecconcursos.com.br", "aprovaconcursos.com.br",
     "folhadirigida.com.br", "edital.com.br", "concursosnobrasil.com.br",
     "acheconcursos.com.br", "pensarcursos.com.br", "academiaconcursos.com.br",
-    "jcconcursos.com.br", "ojaiba.com", "tecconcursos.com.br", "guiadosconcursos.com.br",
+    "jcconcursos.com.br", "ojaiba.com", "guiadosconcursos.com.br",
     "oesquadraodeelite.com.br",
+    "direcaoconcursos.com.br", "direcaoconcursos.com",  # adicionado v6.4.10
+    "concursosobrasil.com.br", "novaconcursos.com.br", "concursosaqui.com.br",
+    "concursospublicos.gov.br", "concursoseeditais.com.br",
+    "olhonavaga.com.br", "vou-passar.com.br",
+    "estudegratis.com.br", "espacodoconcurseiro.com",
 
-    # Imprensa de referencia
+    # Imprensa de referencia (genericas)
     "g1.globo.com", "globo.com", "uol.com.br", "folha.uol.com.br",
     "estadao.com.br", "valor.com.br", "veja.com.br", "exame.com",
     "agenciabrasil.ebc.com.br", "metropoles.com", "correiobraziliense.com.br",
     "gazetadopovo.com.br", "oglobo.globo.com", "extra.globo.com",
     "r7.com", "band.com.br", "cnnbrasil.com.br", "poder360.com.br",
+    "noticias.uol.com.br", "economia.uol.com.br", "noticias.r7.com",
+    "terra.com.br", "ig.com.br", "infomoney.com.br",
+    "diariodepernambuco.com.br", "atribuna.com.br", "agazeta.com.br",
+    "otempo.com.br", "estadodeminas.com.br", "em.com.br",
 
     # Bancas (sites oficiais)
     "cebraspe.org.br", "fgvprojetos.fgv.br", "vunesp.com.br", "ibade.org.br",
     "idcap.org.br", "aocp.com.br", "consulplan.net", "ibfc.org.br",
     "fgv.br", "cesgranrio.org.br", "fundatec.org.br", "fcc.org.br",
     "iades.com.br", "quadrix.org.br", "instituteaocp.org.br",
+    "ibam.org.br", "vunesp.com.br", "selecon.org.br", "msconcursos.com.br",
+    "iesesconcursos.org.br", "iuds.org.br",
 
     # Comunidades / fontes Tier 3
     "reddit.com", "youtube.com", "youtu.be",
@@ -676,6 +704,17 @@ DOMINIOS_PERMITIDOS = {
     # Anthropic (caso o cron self-test apareca)
     "anthropic.com",
 }
+
+
+# Sufixos genericos de TLD oficial brasileiro - aceitos automaticamente
+TLDS_GENERICOS_PERMITIDOS = (
+    ".gov.br",   # qualquer .gov.br (orgao publico)
+    ".jus.br",   # qualquer .jus.br (justica)
+    ".mil.br",   # forcas armadas
+    ".mp.br",    # ministerio publico
+    ".leg.br",   # legislativo
+    ".edu.br",   # ensino superior
+)
 
 
 def _extrair_dominio(url):
@@ -696,16 +735,21 @@ def _extrair_dominio(url):
 
 
 def _dominio_permitido(url):
-    """True se o dominio (ou subdominio) da URL esta na whitelist."""
+    """True se o dominio (ou subdominio) da URL esta na whitelist OU usa TLD oficial."""
     dom = _extrair_dominio(url)
     if not dom:
         return False
     # Match exato
     if dom in DOMINIOS_PERMITIDOS:
         return True
-    # Match por sufixo (subdominios). Ex: noticias.estrategiaconcursos.com.br
+    # Match por sufixo (subdominios explicitos). Ex: noticias.estrategiaconcursos.com.br
     for permitido in DOMINIOS_PERMITIDOS:
         if dom.endswith("." + permitido):
+            return True
+    # TLDs genericos oficiais (.gov.br, .jus.br, .mil.br, .mp.br, .leg.br, .edu.br)
+    # Aceita qualquer subdominio sob esses TLDs porque sao orgaos oficiais.
+    for tld in TLDS_GENERICOS_PERMITIDOS:
+        if dom.endswith(tld) or dom == tld[1:]:
             return True
     return False
 
