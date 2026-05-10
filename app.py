@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.10-2026-05-06-whitelist-ampla"
+APP_VERSION = "v6.4.11-2026-05-10-whitelist-mega"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -224,31 +224,48 @@ CATEGORIAS = {
         "label": "Movimentos da concorrencia",
         "flag": "CONCORRENCIA",
         "queries": [
+            # Concorrentes principais
             "Pedro Auar advogado liminar concurso publico {ano}",
             "Luanda Naiara advogada concurso publico decisao {ano}",
-            "Pedro Auar candidato eliminado processo {mes_ano}",
-            "advogado de concurso liminar deferida candidato {ano}",
+            "Marcus Peterson advogado concurso publico servidor {ano}",
+            "Oliva e Souza advocacia concurso publico {ano}",
+            "Safe e Lima advogados concurso publico {ano}",
+            "Agnaldo Bastos advogado concurso publico {ano}",
+            "Peterson e Escobar advogados concurso publico {ano}",
+            # Buscas por escritorio em portais juridicos
             "site:jusbrasil.com.br Pedro Auar concurso",
             "site:jusbrasil.com.br Luanda Naiara concurso",
+            "site:jusbrasil.com.br Marcus Peterson concurso",
             "site:migalhas.com.br advogado concurso publico liminar {ano}",
             "site:conjur.com.br concurso publico candidato decisao {mes_ano}",
+            # Generico - liminar ganha por advogado
+            "advogado de concurso liminar deferida candidato {ano}",
+            "advocacia especializada concurso publico vitoria {mes_ano}",
+            # YouTube dos concorrentes
             "site:youtube.com Pedro Auar concurso",
             "site:youtube.com Luanda Naiara concurso publico",
             "site:youtube.com advogado de concurso eliminacao",
+            "site:youtube.com Marcus Peterson concurso",
         ],
         "descricao": (
             "Movimentos dos CONCORRENTES DIRETOS do escritorio Silva Pinto.\n"
-            "Concorrentes monitorados:\n"
+            "Escritorios concorrentes monitorados:\n"
             "  1. PEDRO AUAR (perfis @pedroauarconcursos, @pedroauaroab no Instagram, "
             "canal proprio no YouTube)\n"
             "  2. LUANDA NAIARA (@luandanaiaraadv, canal YouTube proprio)\n"
-            "  3. ADVOGADO DE CONCURSO (@advogadodeconcurso)\n"
+            "  3. ADVOGADO DE CONCURSO / OLIVA E SOUZA (advogadodeconcurso.com / olivaesouza.com.br)\n"
+            "  4. MARCUS PETERSON FIRMA DE ADVOGADOS (marcuspeterson.adv.br - MG)\n"
+            "  5. PETERSON E ESCOBAR ADVOGADOS (petersoneescobar.adv.br)\n"
+            "  6. SAFE E LIMA ADVOGADOS (safeelima.adv.br)\n"
+            "  7. AGNALDO BASTOS ADVOCACIA (agnaldobastos.adv.br)\n"
             "\n"
-            "Foco: encontrar materia, decisao judicial, video do YouTube ou postagem "
-            "ESPECIFICA - nao apenas o link do perfil. Procurar em:\n"
+            "Foco: encontrar materia, decisao judicial, video do YouTube, post de blog, "
+            "Reel ou postagem ESPECIFICA - nao apenas o link do perfil/site institucional. "
+            "Procurar em:\n"
             "  - Sites juridicos: jusbrasil, migalhas, conjur, jota, lex magister\n"
             "  - Decisoes em DJE (Diario da Justica Eletronico) onde nome do "
-            "advogado consta como patrono\n"
+            "advogado consta como patrono da causa\n"
+            "  - Blogs proprios dos escritorios (.adv.br) com novos posts\n"
             "  - YouTube: titulos e descricoes de videos recentes desses canais\n"
             "  - Materias de portais de concurso (estrategia, qconcursos, gran)\n"
             "  - Twitter/X com mencao do nome do advogado\n"
@@ -256,8 +273,9 @@ CATEGORIAS = {
             "Detectar: (a) NOVO concurso em que estao atuando como patronos, "
             "(b) tese ou estrategia inovadora descrita em video/post, "
             "(c) liminar ganha com repercussao na imprensa, "
-            "(d) gap de mercado (tipo de caso que eles atendem e o Silva Pinto nao). "
-            "EXTRAIR: (escritorio_concorrente) qual dos 3 e o autor; "
+            "(d) gap de mercado (tipo de caso que eles atendem e o Silva Pinto nao), "
+            "(e) novo conteudo de marketing/educacional viralizando. "
+            "EXTRAIR: (escritorio_concorrente) qual dos 7 e o autor; "
             "(concurso_tema) qual concurso/tema; "
             "(gap_identificado) o que eles fazem que Silva Pinto ainda nao faz."
         ),
@@ -647,7 +665,8 @@ def hash_for_dedup(titulo, orgao="", link=""):
 
 # Whitelist de dominios aceitos. Tudo fora dessa lista e rejeitado.
 DOMINIOS_PERMITIDOS = {
-    # Oficiais (governo) - tambem aceita qualquer subdominio de .gov.br via regra abaixo
+    # ====== OFICIAIS / GOVERNO ======
+    # (TLDs genericos abaixo cobrem qualquer .gov.br/.jus.br/.mil.br/.mp.br/.leg.br/.edu.br)
     "gov.br", "jus.br", "mil.br",
     "stj.jus.br", "stf.jus.br", "tjsp.jus.br", "tjrj.jus.br",
     "tjmg.jus.br", "tjpr.jus.br", "tjrs.jus.br", "tjba.jus.br", "tjpe.jus.br",
@@ -657,29 +676,59 @@ DOMINIOS_PERMITIDOS = {
     "policiacivil.rj.gov.br", "policiacivil.sp.gov.br", "pf.gov.br", "prf.gov.br",
     "pm.rj.gov.br", "pm.sp.gov.br", "exercito.gov.br", "marinha.mil.br", "fab.mil.br",
     "in.gov.br",  # Imprensa Nacional - DOU
-    "planalto.gov.br",  # Diario Oficial Eletronico
-    "agu.gov.br",  # Advocacia-Geral da Uniao
-    "mpgo.mp.br", "mprj.mp.br", "mpsp.mp.br",  # Ministerio Publico
+    "planalto.gov.br",
+    "agu.gov.br",
+    "mpgo.mp.br", "mprj.mp.br", "mpsp.mp.br",
 
-    # Portais juridicos
+    # ====== PORTAIS JURIDICOS / DECISOES ======
     "jusbrasil.com.br", "migalhas.com.br", "conjur.com.br", "jota.info",
     "lexmagister.com.br", "ambito-juridico.com.br", "direitonet.com.br",
     "consultor-juridico.com.br",
 
-    # Portais de concurso (grandes)
-    "pciconcursos.com.br", "qconcursos.com", "estrategiaconcursos.com.br",
-    "grancursosonline.com.br", "tecconcursos.com.br", "aprovaconcursos.com.br",
-    "folhadirigida.com.br", "edital.com.br", "concursosnobrasil.com.br",
-    "acheconcursos.com.br", "pensarcursos.com.br", "academiaconcursos.com.br",
-    "jcconcursos.com.br", "ojaiba.com", "guiadosconcursos.com.br",
-    "oesquadraodeelite.com.br",
-    "direcaoconcursos.com.br", "direcaoconcursos.com",  # adicionado v6.4.10
-    "concursosobrasil.com.br", "novaconcursos.com.br", "concursosaqui.com.br",
-    "concursospublicos.gov.br", "concursoseeditais.com.br",
-    "olhonavaga.com.br", "vou-passar.com.br",
+    # ====== CURSOS PREPARATORIOS (todos os grandes) ======
+    "estrategiaconcursos.com.br", "estrategia.com.br",
+    "grancursosonline.com.br", "gran.com.br",
+    "qconcursos.com", "folha.qconcursos.com",  # Folha QConcursos
+    "alfaconcursos.com.br", "alfacon.com.br",
+    "direcaoconcursos.com.br", "direcaoconcursos.com",
+    "tecconcursos.com.br",
+    "novaconcursos.com.br",
+    "casadoconcurseiro.com.br",
+    "cers.com.br",
+    "cursoenfase.com.br",
+    "cursoclubedaregra.com.br",
+    "pontodosconcursos.com.br",
+    "focusconcursos.com.br",
+    "cursojuridico.com.br",
+    "approvaconcursos.com.br", "aprovaconcursos.com.br",
+    "preparoconcursos.com.br",
     "estudegratis.com.br", "espacodoconcurseiro.com",
 
-    # Imprensa de referencia (genericas)
+    # ====== PORTAIS DE CONCURSO / NOTICIAS DE CONCURSO ======
+    "pciconcursos.com.br",
+    "folhadirigida.com.br",
+    "jcconcursos.com.br",
+    "edital.com.br",
+    "concursosnobrasil.com.br", "concursosnobrasil.com",
+    "concursosobrasil.com.br",
+    "acheconcursos.com.br",
+    "pensarcursos.com.br",
+    "academiaconcursos.com.br",
+    "concursospublicos.gov.br",
+    "concursoseeditais.com.br",
+    "olhonavaga.com.br",
+    "vou-passar.com.br",
+    "guiadosconcursos.com.br",
+    "ojaiba.com",
+    "oesquadraodeelite.com.br",
+    "concursosaqui.com.br",
+    "concursosabertos.com.br",
+    "rateiobarato.com",
+    "queropassaremconcursos.com.br",
+    "proximosconcursos.com",
+    "diariooficialdf.com.br",
+
+    # ====== IMPRENSA DE REFERENCIA ======
     "g1.globo.com", "globo.com", "uol.com.br", "folha.uol.com.br",
     "estadao.com.br", "valor.com.br", "veja.com.br", "exame.com",
     "agenciabrasil.ebc.com.br", "metropoles.com", "correiobraziliense.com.br",
@@ -690,30 +739,46 @@ DOMINIOS_PERMITIDOS = {
     "diariodepernambuco.com.br", "atribuna.com.br", "agazeta.com.br",
     "otempo.com.br", "estadodeminas.com.br", "em.com.br",
 
-    # Bancas (sites oficiais)
+    # ====== BANCAS (sites oficiais) ======
     "cebraspe.org.br", "fgvprojetos.fgv.br", "vunesp.com.br", "ibade.org.br",
     "idcap.org.br", "aocp.com.br", "consulplan.net", "ibfc.org.br",
     "fgv.br", "cesgranrio.org.br", "fundatec.org.br", "fcc.org.br",
     "iades.com.br", "quadrix.org.br", "instituteaocp.org.br",
-    "ibam.org.br", "vunesp.com.br", "selecon.org.br", "msconcursos.com.br",
-    "iesesconcursos.org.br", "iuds.org.br",
+    "ibam.org.br", "selecon.org.br", "msconcursos.com.br",
+    "iesesconcursos.org.br", "iuds.org.br", "ibgp.org.br",
 
-    # Comunidades / fontes Tier 3
+    # ====== ADVOGADOS ESPECIALIZADOS EM CONCURSO (concorrentes monitorados) ======
+    "advogadodeconcurso.com",
+    "olivaesouza.com.br",
+    "marcuspeterson.adv.br",
+    "petersoneescobar.adv.br",
+    "safeelima.adv.br",
+    "agnaldobastos.adv.br",
+    "concursoscomvc.com.br",
+    "altayrcosta.adv.br",
+    "concurseirojuridico.com.br",
+    "jbarretoadvogados.com.br",
+    "rsadvogadosassociados.com.br",
+    # Genericos do dominio .adv.br aceitos via TLD generico abaixo
+
+    # ====== COMUNIDADES / FONTES TIER 3 ======
     "reddit.com", "youtube.com", "youtu.be",
+    "twitter.com", "x.com",  # citacoes em tweets viralizando
 
-    # Anthropic (caso o cron self-test apareca)
+    # ====== ANTHROPIC (caso o cron self-test apareca) ======
     "anthropic.com",
 }
 
 
 # Sufixos genericos de TLD oficial brasileiro - aceitos automaticamente
 TLDS_GENERICOS_PERMITIDOS = (
-    ".gov.br",   # qualquer .gov.br (orgao publico)
-    ".jus.br",   # qualquer .jus.br (justica)
+    ".gov.br",   # qualquer orgao publico
+    ".jus.br",   # qualquer ramo da justica
     ".mil.br",   # forcas armadas
     ".mp.br",    # ministerio publico
     ".leg.br",   # legislativo
     ".edu.br",   # ensino superior
+    ".adv.br",   # escritorio de advocacia (concorrencia)
 )
 
 
