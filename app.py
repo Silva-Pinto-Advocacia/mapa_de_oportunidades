@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.12-2026-05-13-dedupe-retroativo"
+APP_VERSION = "v6.4.13-2026-05-13-blocklist"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -339,6 +339,15 @@ CREATE TABLE IF NOT EXISTS notas (
     FOREIGN KEY (oportunidade_id) REFERENCES oportunidades(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_notas_op ON notas(oportunidade_id);
+
+-- Hashes de itens que o usuario excluiu manualmente. Bloqueia re-insercao
+-- desses itens em coletas futuras (o Claude pode achar a mesma noticia de novo).
+CREATE TABLE IF NOT EXISTS excluidos (
+    hash_unico TEXT PRIMARY KEY,
+    titulo TEXT,
+    link TEXT,
+    data_exclusao TEXT NOT NULL
+);
 """
 
 
@@ -1548,14 +1557,35 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
 
 
 def salvar_itens(itens):
-    """Salva itens novos no banco. Retorna lista de itens efetivamente inseridos (para notificacao)."""
+    """Salva itens novos no banco. Retorna lista de itens efetivamente inseridos (para notificacao).
+
+    Bloqueia re-insercao de itens cujo hash esta na tabela `excluidos` (blocklist do usuario).
+    """
     if not itens:
         return []
     inseridos = []
+    bloqueados_blocklist = 0
     agora = datetime.now(timezone.utc).isoformat()
     with db_conn() as conn:
+        # Carrega blocklist uma vez no inicio (rapido, indexado por PK)
+        blocklist = set()
+        try:
+            rows = conn.execute("SELECT hash_unico FROM excluidos").fetchall()
+            for r in rows:
+                d = _dict_from_row(r)
+                if d.get("hash_unico"):
+                    blocklist.add(d["hash_unico"])
+        except Exception as e:
+            log.warning("blocklist: nao foi possivel carregar (tabela ausente?): %s", e)
+
         for item in itens:
             h = hash_for_dedup(item["titulo"], item.get("orgao", ""), item.get("link", ""))
+
+            # BLOCKLIST: se o usuario ja excluiu este item antes, nao insere de novo
+            if h in blocklist:
+                bloqueados_blocklist += 1
+                log.info("blocklist: bloqueado re-insercao de '%s'", item["titulo"][:60])
+                continue
 
             # Enriquecimento de metricas (YouTube/Reddit) - silencioso se nao configurado
             metricas = enrich_metricas(item.get("link", ""))
@@ -1582,6 +1612,9 @@ def salvar_itens(itens):
                 inseridos.append(item)
             except sqlite3.IntegrityError:
                 pass
+
+    if bloqueados_blocklist:
+        log.info("blocklist: %d item(ns) bloqueados nesta coleta", bloqueados_blocklist)
     return inseridos
 
 
@@ -1820,20 +1853,77 @@ def api_marcar_lido(item_id):
 
 @app.route("/api/oportunidades/<int:item_id>", methods=["DELETE"])
 def api_excluir(item_id):
-    """EXCLUI permanentemente do Turso. Acao irreversivel.
+    """EXCLUI permanentemente do Turso E adiciona o hash a lista de bloqueio.
 
-    Apaga o item da tabela oportunidades. As notas associadas tambem somem
-    automaticamente via FK ON DELETE CASCADE definido no schema.
+    Apaga o item da tabela oportunidades. As notas associadas tambem somem.
+    O hash do item e registrado na tabela `excluidos` para evitar que o mesmo
+    item seja re-inserido em coletas futuras (o Claude pode achar a mesma
+    noticia em uma busca posterior).
     """
     try:
+        from datetime import datetime, timezone
+        agora = datetime.now(timezone.utc).isoformat()
         with db_conn() as conn:
+            # Captura titulo, link e hash_unico antes de deletar
+            row = conn.execute(
+                "SELECT titulo, link, hash_unico FROM oportunidades WHERE id = ?",
+                (item_id,)
+            ).fetchone()
+
+            if row:
+                d = _dict_from_row(row)
+                titulo = d.get("titulo") or ""
+                link = d.get("link") or ""
+                hash_atual = d.get("hash_unico") or ""
+
+                # Calcula o hash com a logica ATUAL (caso o legacy seja diferente)
+                hash_novo = hash_for_dedup(titulo, "", link)
+
+                # Insere ambos os hashes (o atual e o recalculado) na blocklist.
+                # Garante que mesmo que a logica de hash mude no futuro, o item nao volte.
+                for h in {hash_atual, hash_novo}:
+                    if h:
+                        try:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO excluidos (hash_unico, titulo, link, data_exclusao) VALUES (?, ?, ?, ?)",
+                                (h, titulo[:200], link[:500], agora)
+                            )
+                        except Exception as e:
+                            log.warning("blocklist: nao consegui inserir hash %s: %s", h, e)
+
             # Apaga as notas antes (caso o ON DELETE CASCADE nao seja aplicado pelo Turso)
             conn.execute("DELETE FROM notas WHERE oportunidade_id = ?", (item_id,))
             conn.execute("DELETE FROM oportunidades WHERE id = ?", (item_id,))
-        log.info("Item %d excluido permanentemente", item_id)
+
+        log.info("Item %d excluido + hash adicionado a blocklist", item_id)
         return jsonify({"ok": True, "excluido": item_id})
     except Exception as e:
         log.error("Erro ao excluir item %d: %s", item_id, e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/blocklist", methods=["GET"])
+def api_blocklist_listar():
+    """Lista os hashes na blocklist (itens que o usuario excluiu)."""
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT hash_unico, titulo, link, data_exclusao FROM excluidos ORDER BY data_exclusao DESC LIMIT 500"
+            ).fetchall()
+        itens = [_dict_from_row(r) for r in rows]
+        return jsonify({"total": len(itens), "itens": itens})
+    except Exception as e:
+        return jsonify({"erro": str(e), "total": 0, "itens": []}), 500
+
+
+@app.route("/api/blocklist/<path:hash_unico>", methods=["DELETE"])
+def api_blocklist_remover(hash_unico):
+    """Remove um hash da blocklist. Caso o usuario queira voltar a receber esse item."""
+    try:
+        with db_conn() as conn:
+            conn.execute("DELETE FROM excluidos WHERE hash_unico = ?", (hash_unico,))
+        return jsonify({"ok": True, "hash_removido": hash_unico})
+    except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
 
@@ -1991,11 +2081,17 @@ def api_status():
                 (t,)
             ).fetchone()
             tier_counts[f"tier{t}"] = r["c"]
+        # Tamanho da blocklist (itens excluidos pelo usuario, que nunca mais devem voltar)
+        try:
+            blocklist_size = conn.execute("SELECT COUNT(*) AS c FROM excluidos").fetchone()["c"]
+        except Exception:
+            blocklist_size = 0
 
     return jsonify({
         "total": total,
         "nao_lidos": nao_lidos,
         "tier_counts": tier_counts,
+        "blocklist_size": blocklist_size,
         "ultima_execucao": _dict_from_row(ultima) if ultima else None,
         "model_tier1": MODEL_TIER1,
         "model_tier23": MODEL_TIER23,
