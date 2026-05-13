@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.11-2026-05-10-whitelist-mega"
+APP_VERSION = "v6.4.12-2026-05-13-dedupe-retroativo"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -646,12 +646,30 @@ def hash_for_dedup(titulo, orgao="", link=""):
 
     Isso captura repeticoes mesmo com pequenas variacoes de titulo
     (ex: 'Concurso PMERJ 2026' e 'PMERJ 2026 Edital' -> mesmo hash).
+
+    Normalizacao de link captura:
+      - Diferencas http vs https
+      - www. vs sem www
+      - Query string (utm_*, ref, etc)
+      - Fragment (#secao)
+      - Trailing slash
+      - Sufixo /amp/ ou /amp (versoes AMP do Google)
+      - Duplicacao de barras (//)
     """
     import hashlib
     if link:
-        # Normaliza link: lowercase + tira parametros de query (utm_*, etc)
         l = link.strip().lower()
+        # Tira query string e fragment
         l = re.sub(r'[?#].*$', '', l)
+        # Normaliza protocolo
+        l = re.sub(r'^https?://', 'https://', l)
+        # Tira www.
+        l = re.sub(r'^https://www\.', 'https://', l)
+        # Tira sufixo /amp ou /amp/
+        l = re.sub(r'/amp/?$', '', l)
+        # Colapsa barras duplas no path (mantem // do protocolo)
+        l = re.sub(r'(?<!:)//+', '/', l)
+        # Tira trailing slash
         l = l.rstrip('/')
         base = "L|" + l
     else:
@@ -1777,7 +1795,19 @@ def api_listar():
 
         itens.append(d)
 
-    return jsonify({"total": len(itens), "itens": itens})
+    # DEFESA EM PROFUNDIDADE: dedupe no momento da exibicao.
+    # Mesmo que o banco tenha duplicados (legacy), o frontend nao vai ver dois cards
+    # da mesma noticia. Agrupa por hash recalculado (link normalizado ou titulo+orgao).
+    seen_hashes = set()
+    itens_unicos = []
+    for it in itens:
+        h = hash_for_dedup(it.get("titulo") or "", it.get("orgao") or "", it.get("link") or "")
+        if h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        itens_unicos.append(it)
+
+    return jsonify({"total": len(itens_unicos), "itens": itens_unicos})
 
 
 @app.route("/api/oportunidades/<int:item_id>/marcar_lido", methods=["POST"])
@@ -1859,6 +1889,89 @@ def api_limpar_exemplos():
         conn.execute("DELETE FROM oportunidades WHERE titulo LIKE '%[EXEMPLO]%'")
         c = conn.execute("SELECT changes()").fetchone()[0]
     return jsonify({"ok": True, "removidos": c})
+
+
+@app.route("/api/dedupe", methods=["POST"])
+def api_dedupe():
+    """Roda dedupe retroativa no banco inteiro.
+
+    Estrategia:
+    1. Recalcula hash_unico de TODOS os registros com a logica atual de hash_for_dedup
+    2. Agrupa por novo_hash
+    3. Para cada grupo com mais de 1 registro, mantem o ID MENOR (mais antigo) e
+       deleta os demais (junto com suas notas)
+    4. Atualiza hash_unico de todos os mantidos pro novo valor
+
+    Retorna estatisticas: total antes, duplicados achados, deletados, total apos.
+    """
+    log.info("=== DEDUPE retroativo iniciado ===")
+    with db_conn() as conn:
+        # 1. Coleta todos os registros
+        rows = conn.execute(
+            "SELECT id, titulo, orgao, link, hash_unico, data_coleta FROM oportunidades ORDER BY id ASC"
+        ).fetchall()
+        total_antes = len(rows)
+        log.info("dedupe: %d registros no banco", total_antes)
+
+        # 2. Recalcula hash e agrupa
+        grupos = {}  # novo_hash -> [ids ordenados]
+        for r in rows:
+            d = _dict_from_row(r)
+            novo = hash_for_dedup(d.get("titulo") or "", d.get("orgao") or "", d.get("link") or "")
+            grupos.setdefault(novo, []).append(d["id"])
+
+        # 3. Identifica duplicados (grupos com >1)
+        ids_para_deletar = []
+        ids_para_atualizar_hash = {}  # id -> novo_hash
+        for novo_hash, ids in grupos.items():
+            ids.sort()  # menor primeiro = mais antigo
+            mantido = ids[0]
+            ids_para_atualizar_hash[mantido] = novo_hash
+            for outro in ids[1:]:
+                ids_para_deletar.append(outro)
+
+        log.info("dedupe: %d grupos, %d serao deletados", len(grupos), len(ids_para_deletar))
+
+        # 4. Deleta (notas via DELETE explicito porque CASCADE pode nao estar habilitado)
+        if ids_para_deletar:
+            for chunk_start in range(0, len(ids_para_deletar), 100):
+                chunk = ids_para_deletar[chunk_start:chunk_start + 100]
+                placeholders = ",".join(["?"] * len(chunk))
+                conn.execute(f"DELETE FROM notas WHERE oportunidade_id IN ({placeholders})", chunk)
+                conn.execute(f"DELETE FROM oportunidades WHERE id IN ({placeholders})", chunk)
+
+        # 5. Atualiza hash_unico dos mantidos (caso o atual difira do novo)
+        # Faz so dos que de fato precisam mudar - evita writes desnecessarios
+        atualizados = 0
+        for r in rows:
+            d = _dict_from_row(r)
+            if d["id"] in ids_para_atualizar_hash:
+                novo = ids_para_atualizar_hash[d["id"]]
+                atual = d.get("hash_unico") or ""
+                if novo != atual:
+                    try:
+                        conn.execute(
+                            "UPDATE oportunidades SET hash_unico = ? WHERE id = ?",
+                            (novo, d["id"])
+                        )
+                        atualizados += 1
+                    except Exception as e:
+                        # Pode dar erro de UNIQUE constraint se 2 ids chegarem com mesmo hash
+                        # antes do delete completar - log e segue
+                        log.warning("dedupe: nao consegui atualizar hash do id=%d: %s", d["id"], e)
+
+        total_apos = conn.execute("SELECT COUNT(*) AS c FROM oportunidades").fetchone()["c"]
+
+    log.info("=== DEDUPE concluido: %d -> %d (deletados %d, hashes atualizados %d) ===",
+             total_antes, total_apos, len(ids_para_deletar), atualizados)
+
+    return jsonify({
+        "ok": True,
+        "total_antes": total_antes,
+        "total_apos": total_apos,
+        "duplicados_deletados": len(ids_para_deletar),
+        "hashes_atualizados": atualizados,
+    })
 
 
 @app.route("/api/status")
@@ -2736,6 +2849,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
       <div class="btn-group">
         <button class="btn btn-ghost" onclick="rodarTier(1)" id="btn-tier1">Coletar Tier 1</button>
         <button class="btn" onclick="rodarCompleto()" id="btn-completo">Coletar Tudo</button>
+        <button class="btn btn-ghost" onclick="rodarDedupe()" id="btn-dedupe" title="Apaga registros duplicados do banco">Limpar duplicatas</button>
       </div>
     </div>
   </header>
@@ -3272,6 +3386,29 @@ HTML_INDEX = r"""<!DOCTYPE html>
         toast('Erro');
         btn.disabled = false; btn.textContent = 'Coletar Tudo';
       }
+    }
+
+    async function rodarDedupe() {
+      const btn = document.getElementById('btn-dedupe');
+      if (!confirm('Limpar duplicatas do banco?\n\nRecalcula o hash de TODOS os registros e apaga os duplicados, mantendo sempre o mais antigo. As notas associadas aos duplicados tambem somem.\n\nE seguro, mas demora 10-30s.')) return;
+      btn.disabled = true;
+      const labelOrig = btn.textContent;
+      btn.textContent = 'Limpando...';
+      try {
+        const r = await fetch('/api/dedupe', { method: 'POST' });
+        const data = await r.json();
+        if (data.erro) {
+          toast('Erro: ' + data.erro, 8000);
+        } else {
+          toast('Dedupe concluido: ' + data.total_antes + ' -> ' + data.total_apos + ' (' + data.duplicados_deletados + ' duplicados apagados)', 10000);
+          await carregarStatus();
+          await carregarTudo();
+        }
+      } catch (e) {
+        toast('Erro ao rodar dedupe');
+      }
+      btn.disabled = false;
+      btn.textContent = labelOrig;
     }
 
     function startPolling(btn, txtFinal) {
