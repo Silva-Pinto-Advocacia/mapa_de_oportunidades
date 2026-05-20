@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.13-2026-05-13-blocklist"
+APP_VERSION = "v6.4.14-2026-05-20-selecionar-marketing"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2856,6 +2856,27 @@ HTML_INDEX = r"""<!DOCTYPE html>
       color: #b91c1c;
       background: #fef2f2;
     }
+    /* Botao Selecionar: variante de acao externa. Discreto em repouso, azul no hover */
+    .card-action.selecionar:hover {
+      border-color: #1d4ed8;
+      color: #1d4ed8;
+      background: #eff6ff;
+    }
+    /* Estado de sucesso: verde por 2 segundos apos POST OK */
+    .card-action.selecionar.sucesso,
+    .card-action.selecionar.sucesso:hover {
+      border-color: #16a34a;
+      color: #ffffff;
+      background: #16a34a;
+      cursor: default;
+    }
+    /* Estado de erro: vermelho discreto */
+    .card-action.selecionar.erro,
+    .card-action.selecionar.erro:hover {
+      border-color: #b91c1c;
+      color: #b91c1c;
+      background: #fef2f2;
+    }
     .card-link {
       color: var(--link);
       text-decoration: none;
@@ -3027,8 +3048,12 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   <script>
     let mostrarLidos = false;
+    let janelaCompleta = false;
     let filtroEstado = "";
-    let janelaCompleta = false;  // false = 7 dias (default), true = 30 dias
+
+    // Cache global de itens carregados, indexado por id.
+    // Usado pelos botoes do card que precisam acessar os dados completos (Selecionar etc).
+    const itensPorId = {};
 
     document.getElementById('filtro-lidos').addEventListener('change', e => {
       mostrarLidos = e.target.checked;
@@ -3108,6 +3133,12 @@ HTML_INDEX = r"""<!DOCTYPE html>
     }
 
     function renderizarTier(container, itens, tier) {
+      // Popula o cache global pra que os botoes do card (Selecionar, etc) acessem
+      // os dados completos pelo id.
+      for (const it of itens) {
+        if (it && typeof it.id !== 'undefined') itensPorId[it.id] = it;
+      }
+
       if (!itens.length) {
         let parts = [];
         if (!mostrarLidos) parts.push('nao lidos');
@@ -3298,6 +3329,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '<div class="card-actions">' +
           '<button class="card-action" onclick="marcarLido(' + item.id + ')">Lido</button>' +
           '<button class="card-action excluir" onclick="excluir(' + item.id + ')" title="Apaga permanentemente do banco">Excluir</button>' +
+          '<button class="card-action selecionar" onclick="selecionarMarketing(' + item.id + ', this)" id="btn-sel-' + item.id + '" title="Adiciona como oportunidade no sistema comercial">&rarr; Selecionar</button>' +
           '<button class="' + notasClass + '" onclick="toggleNotas(' + item.id + ')" id="btn-notas-' + item.id + '">' + notasLabel + '</button>' +
           linkHtml +
         '</div>' +
@@ -3436,6 +3468,82 @@ HTML_INDEX = r"""<!DOCTYPE html>
         if (card) card.remove();
         carregarStatus();
       } catch (e) { toast('Erro ao excluir'); }
+    }
+
+    // ===== SELECIONAR (integracao com sistema comercial externo) =====
+    //
+    // Envia o item como nova oportunidade no sistema comercial em
+    // https://silvapinto-comercial.onrender.com.
+    //
+    // Mapeamento de campos:
+    //   nome   <- concurso (fallback: titulo)
+    //   banca  <- banca
+    //   orgao  <- orgao
+    //   vagas  <- vagas
+    //   zona   <- "yellow" (constante, conforme spec)
+    //
+    // Comportamento: 2s em verde apos sucesso, depois volta ao normal.
+    // Em erro: 4s em vermelho com toast explicativo.
+    const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/selecionados/adicionar-externo';
+
+    async function selecionarMarketing(id, btn) {
+      if (!btn) btn = document.getElementById('btn-sel-' + id);
+      if (!btn || btn.disabled) return;
+      const item = itensPorId[id];
+      if (!item) { toast('Item nao encontrado em cache. Recarregue a pagina.'); return; }
+
+      const payload = {
+        nome: String(item.concurso || item.titulo || '').trim(),
+        banca: String(item.banca || '').trim(),
+        orgao: String(item.orgao || '').trim(),
+        zona: 'yellow',
+        vagas: String(item.vagas || '').trim(),
+      };
+
+      // Estado: carregando
+      const labelOrig = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = 'Enviando...';
+      btn.classList.remove('sucesso', 'erro');
+
+      try {
+        const r = await fetch(SELECIONAR_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+          let err_msg = 'HTTP ' + r.status;
+          try { const j = await r.json(); err_msg = j.erro || j.message || err_msg; } catch (_) {}
+          btn.classList.add('erro');
+          btn.innerHTML = 'Erro';
+          toast('Erro ao selecionar: ' + err_msg, 6000);
+          setTimeout(() => {
+            btn.classList.remove('erro');
+            btn.innerHTML = labelOrig;
+            btn.disabled = false;
+          }, 4000);
+          return;
+        }
+        // Sucesso
+        btn.classList.add('sucesso');
+        btn.innerHTML = '&#10003; Selecionado';
+        setTimeout(() => {
+          btn.classList.remove('sucesso');
+          btn.innerHTML = labelOrig;
+          btn.disabled = false;
+        }, 2000);
+      } catch (e) {
+        // Erro de rede / CORS / etc
+        btn.classList.add('erro');
+        btn.innerHTML = 'Erro';
+        toast('Erro de rede ao selecionar. Detalhe: ' + (e && e.message ? e.message : 'desconhecido'), 6000);
+        setTimeout(() => {
+          btn.classList.remove('erro');
+          btn.innerHTML = labelOrig;
+          btn.disabled = false;
+        }, 4000);
+      }
     }
 
     async function limparExemplos() {
