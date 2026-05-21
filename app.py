@@ -3534,7 +3534,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     // Comportamento: apos sucesso o botao fica verde e DESABILITADO permanentemente
     // (estado persistido no banco via /api/oportunidades/{id}/marcar_selecionado).
     // Proxima carga da pagina ja renderiza ele assim. Em erro: 4s em vermelho + toast.
-    const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/selecionados/adicionar-externo';
+    const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/concursos/adicionar-externo';
 
     async function selecionarMarketing(id, btn) {
       if (!btn) btn = document.getElementById('btn-sel-' + id);
