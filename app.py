@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.14-2026-05-20-selecionar-marketing"
+APP_VERSION = "v6.4.16-2026-05-20-selecionar-final"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -310,6 +310,7 @@ CREATE TABLE IF NOT EXISTS oportunidades (
     etapa_concurso TEXT,
     lido INTEGER DEFAULT 0,
     arquivado INTEGER DEFAULT 0,
+    selecionado_marketing INTEGER DEFAULT 0,
     data_coleta TEXT NOT NULL,
     hash_unico TEXT UNIQUE,
     metricas_json TEXT
@@ -370,6 +371,30 @@ def _ensure_metricas_column():
                     log.warning("Falha ao adicionar metricas_json: %s", e)
     except Exception as e:
         log.warning("_ensure_metricas_column erro: %s", e)
+
+
+def _ensure_selecionado_column():
+    """Adiciona coluna selecionado_marketing em bancos antigos. Idempotente.
+
+    Boolean que marca se o item ja foi enviado para o sistema comercial via
+    botao Selecionar. Quando 1, o botao no card vem desabilitado e em verde.
+    """
+    try:
+        with db_conn() as conn:
+            try:
+                conn.execute("SELECT selecionado_marketing FROM oportunidades LIMIT 1")
+                return
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE oportunidades ADD COLUMN selecionado_marketing INTEGER DEFAULT 0")
+                log.info("DB: coluna selecionado_marketing adicionada")
+            except Exception as e:
+                msg = str(e).lower()
+                if "duplicate" not in msg and "exist" not in msg:
+                    log.warning("Falha ao adicionar selecionado_marketing: %s", e)
+    except Exception as e:
+        log.warning("_ensure_selecionado_column erro: %s", e)
 
 
 class TursoConnWrapper:
@@ -1851,6 +1876,26 @@ def api_marcar_lido(item_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/oportunidades/<int:item_id>/marcar_selecionado", methods=["POST"])
+def api_marcar_selecionado(item_id):
+    """Marca o item como ja enviado ao sistema comercial (botao Selecionar).
+
+    Apos o frontend conseguir o POST 200 no sistema comercial, chama este
+    endpoint para persistir o estado. A proxima vez que o item carregar
+    no painel, o botao ja vira desabilitado e em verde.
+    """
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                "UPDATE oportunidades SET selecionado_marketing = 1 WHERE id = ?",
+                (item_id,)
+            )
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.error("Erro ao marcar selecionado %d: %s", item_id, e)
+        return jsonify({"erro": str(e)}), 500
+
+
 @app.route("/api/oportunidades/<int:item_id>", methods=["DELETE"])
 def api_excluir(item_id):
     """EXCLUI permanentemente do Turso E adiciona o hash a lista de bloqueio.
@@ -2249,6 +2294,7 @@ def health():
 # Init
 init_db()
 _ensure_metricas_column()
+_ensure_selecionado_column()
 
 
 # Logo PNG transparente embutido (gerado a partir da logo Silva Pinto)
@@ -3329,7 +3375,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '<div class="card-actions">' +
           '<button class="card-action" onclick="marcarLido(' + item.id + ')">Lido</button>' +
           '<button class="card-action excluir" onclick="excluir(' + item.id + ')" title="Apaga permanentemente do banco">Excluir</button>' +
-          '<button class="card-action selecionar" onclick="selecionarMarketing(' + item.id + ', this)" id="btn-sel-' + item.id + '" title="Adiciona como oportunidade no sistema comercial">&rarr; Selecionar</button>' +
+          (item.selecionado_marketing
+            ? '<button class="card-action selecionar sucesso" id="btn-sel-' + item.id + '" disabled title="Ja enviado ao sistema comercial">&#10003; Selecionado</button>'
+            : '<button class="card-action selecionar" onclick="selecionarMarketing(' + item.id + ', this)" id="btn-sel-' + item.id + '" title="Adiciona como oportunidade no sistema comercial">&rarr; Selecionar</button>'
+          ) +
           '<button class="' + notasClass + '" onclick="toggleNotas(' + item.id + ')" id="btn-notas-' + item.id + '">' + notasLabel + '</button>' +
           linkHtml +
         '</div>' +
@@ -3482,8 +3531,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
     //   vagas  <- vagas
     //   zona   <- "yellow" (constante, conforme spec)
     //
-    // Comportamento: 2s em verde apos sucesso, depois volta ao normal.
-    // Em erro: 4s em vermelho com toast explicativo.
+    // Comportamento: apos sucesso o botao fica verde e DESABILITADO permanentemente
+    // (estado persistido no banco via /api/oportunidades/{id}/marcar_selecionado).
+    // Proxima carga da pagina ja renderiza ele assim. Em erro: 4s em vermelho + toast.
     const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/selecionados/adicionar-externo';
 
     async function selecionarMarketing(id, btn) {
@@ -3525,14 +3575,22 @@ HTML_INDEX = r"""<!DOCTYPE html>
           }, 4000);
           return;
         }
-        // Sucesso
+        // Sucesso no sistema comercial. Agora persiste o estado localmente
+        // (proxima carga do painel, o botao ja vem desabilitado e em verde).
+        try {
+          await fetch('/api/oportunidades/' + id + '/marcar_selecionado', { method: 'POST' });
+          if (itensPorId[id]) itensPorId[id].selecionado_marketing = 1;
+        } catch (persistErr) {
+          // Se nao conseguir persistir, ainda mostra como sucesso na sessao
+          // atual (o POST externo ja foi feito).
+          console.warn('Falha ao persistir selecionado:', persistErr);
+        }
+
+        // Botao fica desabilitado e verde permanentemente
         btn.classList.add('sucesso');
         btn.innerHTML = '&#10003; Selecionado';
-        setTimeout(() => {
-          btn.classList.remove('sucesso');
-          btn.innerHTML = labelOrig;
-          btn.disabled = false;
-        }, 2000);
+        btn.title = 'Ja enviado ao sistema comercial';
+        // btn.disabled continua true - NAO ha setTimeout para resetar
       } catch (e) {
         // Erro de rede / CORS / etc
         btn.classList.add('erro');
