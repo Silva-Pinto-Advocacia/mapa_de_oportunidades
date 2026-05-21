@@ -3376,8 +3376,8 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '<button class="card-action" onclick="marcarLido(' + item.id + ')">Lido</button>' +
           '<button class="card-action excluir" onclick="excluir(' + item.id + ')" title="Apaga permanentemente do banco">Excluir</button>' +
           (item.selecionado_marketing
-            ? '<button class="card-action selecionar sucesso" id="btn-sel-' + item.id + '" disabled title="Ja enviado ao sistema comercial">&#10003; Selecionado</button>'
-            : '<button class="card-action selecionar" onclick="selecionarMarketing(' + item.id + ', this)" id="btn-sel-' + item.id + '" title="Adiciona como oportunidade no sistema comercial">&rarr; Selecionar</button>'
+            ? '<button class="card-action selecionar sucesso" id="btn-sel-' + item.id + '" disabled title="Ja marcado no sistema comercial">&#10003; Marcado</button>'
+            : '<button class="card-action selecionar" onclick="selecionarMarketing(' + item.id + ', this)" id="btn-sel-' + item.id + '" title="Marcar este concurso no sistema comercial">Marcar Concurso</button>'
           ) +
           '<button class="' + notasClass + '" onclick="toggleNotas(' + item.id + ')" id="btn-notas-' + item.id + '">' + notasLabel + '</button>' +
           linkHtml +
