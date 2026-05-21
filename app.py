@@ -3376,9 +3376,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '<button class="card-action" onclick="marcarLido(' + item.id + ')">Lido</button>' +
           '<button class="card-action excluir" onclick="excluir(' + item.id + ')" title="Apaga permanentemente do banco">Excluir</button>' +
           (item.selecionado_marketing
-            ? '<button class="card-action selecionar sucesso" id="btn-sel-' + item.id + '" disabled title="Ja marcado no sistema comercial">&#10003; Marcado</button>'
-            : '<button class="card-action selecionar" onclick="selecionarMarketing(' + item.id + ', this)" id="btn-sel-' + item.id + '" title="Marcar este concurso no sistema comercial">Marcar Concurso</button>'
+            ? '<button class="card-action selecionar sucesso" id="btn-sel-' + item.id + '" disabled title="Ja enviado ao sistema comercial">&#10003; Selecionado</button>'
+            : '<button class="card-action selecionar" onclick="selecionarMarketing(' + item.id + ', this)" id="btn-sel-' + item.id + '" title="Adiciona como oportunidade no sistema comercial">&rarr; Marcar Concurso</button>'
           ) +
+          '<button class="card-action" onclick="gerarConteudo(' + item.id + ', this)" title="Envia card completo para Conteudo a ser Produzido">&#128203; Gerar Conteudo</button>' +
           '<button class="' + notasClass + '" onclick="toggleNotas(' + item.id + ')" id="btn-notas-' + item.id + '">' + notasLabel + '</button>' +
           linkHtml +
         '</div>' +
@@ -3534,7 +3535,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     // Comportamento: apos sucesso o botao fica verde e DESABILITADO permanentemente
     // (estado persistido no banco via /api/oportunidades/{id}/marcar_selecionado).
     // Proxima carga da pagina ja renderiza ele assim. Em erro: 4s em vermelho + toast.
-    const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/concursos/adicionar-externo';
+    const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/selecionados/adicionar-externo';
 
     async function selecionarMarketing(id, btn) {
       if (!btn) btn = document.getElementById('btn-sel-' + id);
@@ -3691,6 +3692,55 @@ HTML_INDEX = r"""<!DOCTYPE html>
       carregarTier(1);
       carregarTier(2);
       carregarTier(3);
+    }
+
+
+    async function gerarConteudo(id, btn) {
+      const item = itensPorId[id];
+      if (!item) { toast('Item não encontrado. Recarregue.'); return; }
+
+      // Perguntar zona
+      const zona = prompt('Adicionar ao pipeline:\n1 = Quente\n2 = Morno\n3 = Frio', '1');
+      if (!zona) return;
+      const zonaMap = {'1':'quente','2':'morno','3':'frio','quente':'quente','morno':'morno','frio':'frio'};
+      const z = zonaMap[String(zona).toLowerCase()] || 'quente';
+
+      const payload = {
+        titulo: String(item.titulo || '').trim(),
+        nome: String(item.concurso || item.titulo || '').trim(),
+        descricao: String(item.descricao || '').trim(),
+        concurso: String(item.concurso || '').trim(),
+        banca: String(item.banca || '').trim(),
+        orgao: String(item.orgao || '').trim(),
+        vagas: String(item.vagas || '').trim(),
+        salario: String(item.salario || '').trim(),
+        prazo_inscricao: String(item.prazo_inscricao || '').trim(),
+        data_prova: String(item.data_prova || '').trim(),
+        fase_atual: String(item.fase_atual || '').trim(),
+        estado: String(item.estado || '').trim(),
+        link: String(item.link || '').trim(),
+        zona: z,
+      };
+
+      if (btn) { btn.disabled = true; btn.textContent = 'Enviando...'; }
+      try {
+        const r = await fetch(CONTEUDO_ENDPOINT, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(payload),
+          credentials: 'include',
+        });
+        if (r.ok || r.status === 200 || r.status === 201) {
+          toast('✓ Enviado para Conteúdo (' + z + ')!');
+          if (btn) { btn.style.color = '#16a34a'; btn.style.borderColor = '#16a34a'; btn.textContent = '✓ Enviado'; }
+        } else {
+          toast('Erro ao enviar para Conteúdo: ' + r.status);
+          if (btn) { btn.disabled = false; btn.textContent = '📋 Gerar Conteúdo'; }
+        }
+      } catch(e) {
+        toast('Erro de rede: ' + e.message);
+        if (btn) { btn.disabled = false; btn.textContent = '📋 Gerar Conteúdo'; }
+      }
     }
 
     carregarStatus();
