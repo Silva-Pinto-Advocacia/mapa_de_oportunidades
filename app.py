@@ -3729,7 +3729,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
           method: 'POST',
           headers: {'Content-Type':'application/json'},
           body: JSON.stringify(payload),
-          credentials: 'include',
+          // sem credentials — rota pública
         });
         if (r.ok || r.status === 200 || r.status === 201) {
           toast('✓ Enviado para Conteúdo (' + z + ')!');
