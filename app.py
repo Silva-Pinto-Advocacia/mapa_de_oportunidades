@@ -3536,6 +3536,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     // (estado persistido no banco via /api/oportunidades/{id}/marcar_selecionado).
     // Proxima carga da pagina ja renderiza ele assim. Em erro: 4s em vermelho + toast.
     const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/selecionados/adicionar-externo';
+    const CONTEUDO_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/conteudo/novo-externo';
 
     async function selecionarMarketing(id, btn) {
       if (!btn) btn = document.getElementById('btn-sel-' + id);
