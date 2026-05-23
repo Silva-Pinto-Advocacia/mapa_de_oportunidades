@@ -2199,6 +2199,154 @@ def cron_tier23():
     return "OK", 200, {"Content-Type": "text/plain"}
 
 
+
+
+@app.route("/cron/alertas-concursos-ativos", methods=["GET", "POST"])
+def cron_alertas_concursos_ativos():
+    """Verifica oportunidades novas que casam com palavras-chave dos concursos ativos
+    no sistema interno e envia alerta dedicado no Discord.
+    
+    Configurar no cron-job.org para rodar 2x ao dia (ex: 09:00 e 18:00).
+    """
+    import urllib.request, urllib.error
+    
+    SISTEMA_URL = "https://silvapinto-comercial.onrender.com/api/marketing/concursos-ativos"
+    JANELA_HORAS = int(request.args.get("horas", "24"))
+    
+    # 1. Buscar concursos ativos no sistema interno
+    try:
+        with urllib.request.urlopen(SISTEMA_URL, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        concursos = data.get("concursos", [])
+    except Exception as e:
+        log.error("Erro ao buscar concursos ativos: %s", e)
+        return jsonify({"erro": str(e), "concursos_consultados": 0}), 500
+    
+    if not concursos:
+        return jsonify({"ok": True, "concursos_ativos": 0, "alertas_enviados": 0,
+                        "msg": "Nenhum concurso marcado como mkt_selecionado=1"})
+    
+    # 2. Para cada concurso, buscar itens novos (ultimas N horas) que casem com keywords
+    from datetime import datetime, timedelta
+    corte = (datetime.now() - timedelta(hours=JANELA_HORAS)).isoformat()
+    
+    alertas_por_concurso = {}
+    total_alertas = 0
+    
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        for c in concursos:
+            keywords_raw = (c.get("palavras_chave") or c.get("nome") or "").strip()
+            if not keywords_raw:
+                continue
+            
+            # Quebra palavras_chave em termos individuais
+            # Aceita separadores: virgula, ponto-virgula, pipe
+            import re as _re
+            termos = [t.strip().strip("\"\'") for t in _re.split(r"[,;|]", keywords_raw) if t.strip()]
+            if not termos:
+                termos = [keywords_raw]
+            
+            # Monta WHERE com OR LIKE para cada termo (case-insensitive via LOWER)
+            where_termos = " OR ".join(["LOWER(titulo) LIKE ? OR LOWER(descricao) LIKE ?" for _ in termos])
+            params = []
+            for t in termos:
+                t_low = "%" + t.lower() + "%"
+                params.extend([t_low, t_low])
+            
+            sql = f"""SELECT id, titulo, descricao, link, banca, estado, flag, relevancia, data_coleta
+                      FROM oportunidades
+                      WHERE data_coleta >= ?
+                        AND arquivado = 0
+                        AND ({where_termos})
+                      ORDER BY relevancia DESC, data_coleta DESC
+                      LIMIT 8"""
+            cursor.execute(sql, [corte] + params)
+            rows = cursor.fetchall()
+            
+            if rows:
+                lista = [dict(r) for r in rows]
+                alertas_por_concurso[c["nome"]] = {
+                    "concurso": c["nome"],
+                    "prioridade": c.get("prioridade", "normal"),
+                    "fase_atual": c.get("fase_atual", ""),
+                    "itens": lista,
+                }
+                total_alertas += len(lista)
+    finally:
+        conn.close()
+    
+    # 3. Enviar alertas no Discord (UM webhook por concurso para nao misturar)
+    enviados = 0
+    if DISCORD_WEBHOOK_URL and alertas_por_concurso:
+        for nome, info in alertas_por_concurso.items():
+            try:
+                _enviar_alerta_concurso_discord(info)
+                enviados += 1
+            except Exception as e:
+                log.warning("Falha ao enviar alerta para %s: %s", nome, e)
+    
+    return jsonify({
+        "ok": True,
+        "concursos_ativos": len(concursos),
+        "concursos_com_novidades": len(alertas_por_concurso),
+        "total_itens_novos": total_alertas,
+        "alertas_enviados": enviados,
+        "janela_horas": JANELA_HORAS,
+        "detalhes": {nome: len(info["itens"]) for nome, info in alertas_por_concurso.items()},
+    })
+
+
+def _enviar_alerta_concurso_discord(info):
+    """Manda um embed dedicado por concurso no Discord."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    import urllib.request
+    
+    PRIORIDADE_CORES = {"alta": 0xdc2626, "normal": 0xc9a84c, "baixa": 0x6b7280}
+    cor = PRIORIDADE_CORES.get(info.get("prioridade", "normal"), 0xc9a84c)
+    
+    embeds = []
+    for it in info["itens"][:8]:
+        rel = it.get("relevancia", 5)
+        titulo = (it.get("titulo") or "(sem titulo)")[:200]
+        desc = (it.get("descricao") or "")[:280]
+        meta = []
+        if it.get("banca"): meta.append("\U0001F3DB\uFE0F " + it["banca"])
+        if it.get("estado"): meta.append("\U0001F4CD " + it["estado"])
+        if it.get("flag"): meta.append("\U0001F3F7\uFE0F " + it["flag"])
+        meta_line = " \u00B7 ".join(meta)
+        
+        embed = {
+            "title": titulo,
+            "description": (meta_line + "\n\n" + desc) if meta_line else desc,
+            "color": cor,
+            "footer": {"text": "Rel " + str(rel) + "/10"},
+        }
+        if it.get("link"):
+            embed["url"] = it["link"]
+        embeds.append(embed)
+    
+    icone_prio = {"alta": "\U0001F525", "normal": "\U0001F4CC", "baixa": "\U0001F4D1"}.get(info.get("prioridade","normal"), "\U0001F4CC")
+    
+    payload = {
+        "content": icone_prio + " **" + info["concurso"] + "** — " + str(len(info["itens"])) + " novidade(s) na janela monitorada\n" +
+                   ("_Fase atual: " + info["fase_atual"] + "_" if info.get("fase_atual") else ""),
+        "embeds": embeds,
+        "username": "Alertas Silva Pinto",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        DISCORD_WEBHOOK_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "SilvaPinto/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        if resp.status >= 300:
+            log.warning("Discord alerta concurso retornou %d", resp.status)
+
+
 @app.route("/cron/manual", methods=["POST"])
 def cron_manual():
     if not ANTHROPIC_API_KEY:
