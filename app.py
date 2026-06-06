@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v6.4.16-2026-05-20-selecionar-final"
+APP_VERSION = "v7.0.0-rc1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -349,7 +349,46 @@ CREATE TABLE IF NOT EXISTS excluidos (
     link TEXT,
     data_exclusao TEXT NOT NULL
 );
+
+-- v7: Concursos que o escritorio escolheu monitorar. Cada um vira uma "ficha viva"
+-- que agrupa as noticias encaixadas nele.
+--   prioridade: 'urgente' | 'importante' | 'naourgente' (semaforo vermelho/dourado/verde)
+--   palavras_chave: lista separada por virgula, usada pela IA pra encaixar noticias
+CREATE TABLE IF NOT EXISTS concursos_monitorados (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    banca TEXT,
+    palavras_chave TEXT,
+    prioridade TEXT DEFAULT 'importante',
+    vagas TEXT,
+    data_criacao TEXT NOT NULL,
+    ativo INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_concmon_ativo ON concursos_monitorados(ativo);
+
+-- v7: Concursos novos que apareceram repetidamente mas ainda nao sao monitorados.
+-- Viram sugestao na caixa de entrada ("apareceu 3x, quer monitorar?").
+CREATE TABLE IF NOT EXISTS sugestoes_concurso (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome_normalizado TEXT UNIQUE,
+    nome_exibicao TEXT NOT NULL,
+    banca TEXT,
+    vezes INTEGER DEFAULT 1,
+    ultima_evidencia TEXT,
+    primeira_aparicao TEXT NOT NULL,
+    ultima_aparicao TEXT NOT NULL,
+    status TEXT DEFAULT 'pendente'
+);
+CREATE INDEX IF NOT EXISTS idx_sugest_status ON sugestoes_concurso(status);
 """
+
+
+# v7: colunas de triagem adicionadas a tabela oportunidades via migracao.
+# Definidas aqui pra referencia:
+#   concurso_id INTEGER         -> FK pro concurso monitorado (NULL = nao encaixado)
+#   status_triagem TEXT         -> 'pendente' | 'confirmado' | 'transversal' | 'sem_concurso'
+#   sugestao_concurso TEXT      -> nome do concurso que a IA sugeriu (pra fila de confirmacao)
+#   tipo_transversal TEXT       -> 'jurisprudencia' | 'concorrencia' | 'tendencia' (se transversal)
 
 
 # Migracao: adiciona coluna metricas_json se a tabela ja existe sem ela
@@ -395,6 +434,39 @@ def _ensure_selecionado_column():
                     log.warning("Falha ao adicionar selecionado_marketing: %s", e)
     except Exception as e:
         log.warning("_ensure_selecionado_column erro: %s", e)
+
+
+def _ensure_triagem_columns():
+    """v7: adiciona colunas de triagem em oportunidades. Idempotente.
+
+    concurso_id        -> FK pro concurso monitorado (NULL = nao encaixado)
+    status_triagem     -> 'pendente'|'confirmado'|'transversal'|'sem_concurso'
+    sugestao_concurso  -> nome do concurso que a IA sugeriu (fila de confirmacao)
+    tipo_transversal   -> 'jurisprudencia'|'concorrencia'|'tendencia'
+    """
+    colunas = [
+        ("concurso_id", "INTEGER"),
+        ("status_triagem", "TEXT DEFAULT 'pendente'"),
+        ("sugestao_concurso", "TEXT"),
+        ("tipo_transversal", "TEXT"),
+    ]
+    try:
+        with db_conn() as conn:
+            for nome, tipo in colunas:
+                try:
+                    conn.execute(f"SELECT {nome} FROM oportunidades LIMIT 1")
+                    continue  # ja existe
+                except Exception:
+                    pass
+                try:
+                    conn.execute(f"ALTER TABLE oportunidades ADD COLUMN {nome} {tipo}")
+                    log.info("DB: coluna %s adicionada", nome)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "duplicate" not in msg and "exist" not in msg:
+                        log.warning("Falha ao adicionar %s: %s", nome, e)
+    except Exception as e:
+        log.warning("_ensure_triagem_columns erro: %s", e)
 
 
 class TursoConnWrapper:
@@ -1581,6 +1653,177 @@ REPETINDO AS REGRAS MAIS IMPORTANTES:
     return todos_itens, erro_msg
 
 
+def _normalizar_nome_concurso(s):
+    """Normaliza nome de concurso/orgao pra comparacao (lowercase, sem acento, sem ano)."""
+    if not s:
+        return ""
+    import unicodedata
+    s = unicodedata.normalize('NFKD', s.lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r'\b20[2-3]\d\b', ' ', s)       # remove anos
+    s = re.sub(r'[^\w\s]', ' ', s)              # remove pontuacao
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
+
+
+# Categorias do Tier 2/3 que sao TRANSVERSAIS (nao pertencem a um concurso especifico)
+CATEGORIAS_TRANSVERSAIS = {
+    "jurisprudencia": "jurisprudencia",
+    "concorrencia": "concorrencia",
+    "sentimento": "tendencia",
+    "radar_volume": None,   # radar_volume PODE ser de um concurso (edital novo) - tratar como concurso
+}
+
+
+def _triar_item_por_palavras(item, concursos_monitorados):
+    """Tenta encaixar um item num concurso monitorado SO por palavras-chave (sem IA).
+
+    Retorna (concurso_id, confianca) onde confianca in ('alta','media',None).
+    - alta: match forte (palavra-chave especifica bateu)
+    - media: match fraco (so o orgao/nome generico bateu)
+    - None: nao encaixou em nenhum
+    """
+    # Texto do item pra buscar (titulo + concurso + orgao)
+    alvo = _normalizar_nome_concurso(
+        f"{item.get('titulo','')} {item.get('concurso','')} {item.get('orgao','')}"
+    )
+    if not alvo:
+        return (None, None)
+
+    melhor_id = None
+    melhor_conf = None
+    for c in concursos_monitorados:
+        # Palavras-chave do concurso
+        kws = [k.strip() for k in (c.get("palavras_chave") or "").split(",") if k.strip()]
+        nome_norm = _normalizar_nome_concurso(c.get("nome", ""))
+        # Match por palavra-chave especifica = alta confianca
+        for kw in kws:
+            kw_norm = _normalizar_nome_concurso(kw)
+            if kw_norm and len(kw_norm) >= 3 and kw_norm in alvo:
+                return (c["id"], "alta")
+        # Match pelo nome do concurso (primeiras 2-3 palavras) = media confianca
+        nome_tokens = nome_norm.split()
+        if nome_tokens:
+            # tenta casar os tokens significativos do nome (ignora palavras curtas)
+            sig = [t for t in nome_tokens if len(t) >= 4]
+            if sig and all(t in alvo for t in sig[:2]):
+                melhor_id = c["id"]
+                melhor_conf = "media"
+    return (melhor_id, melhor_conf)
+
+
+def triar_itens(item_ids=None):
+    """Roda triagem sobre itens do banco (por padrao, os de status 'pendente').
+
+    Para cada item pendente:
+      - Se a categoria e transversal (jurisprudencia/concorrencia/sentimento):
+          marca status='transversal' + tipo_transversal
+      - Senao, tenta encaixar num concurso monitorado por palavras-chave:
+          * match alta confianca -> status='confirmado', concurso_id setado (auto-encaixe)
+          * match media confianca -> status='pendente' + sugestao_concurso (vai pra fila)
+          * sem match -> status='sem_concurso' + registra em sugestoes_concurso
+
+    NOTA: por decisao do usuario, encaixes vao pra fila de confirmacao (status pendente
+    com sugestao). Apenas matches de altissima confianca por palavra-chave exata sao
+    auto-confirmados. Retorna estatisticas.
+    """
+    agora = datetime.now(timezone.utc).isoformat()
+    stats = {"transversal": 0, "auto_confirmado": 0, "sugerido": 0, "sem_concurso": 0}
+
+    with db_conn() as conn:
+        # Carrega concursos monitorados ativos
+        rows = conn.execute(
+            "SELECT * FROM concursos_monitorados WHERE ativo = 1"
+        ).fetchall()
+        concursos = [_dict_from_row(r) for r in rows]
+
+        # Seleciona itens a triar
+        if item_ids:
+            placeholders = ",".join(["?"] * len(item_ids))
+            q = f"SELECT * FROM oportunidades WHERE id IN ({placeholders})"
+            itrows = conn.execute(q, item_ids).fetchall()
+        else:
+            itrows = conn.execute(
+                "SELECT * FROM oportunidades WHERE status_triagem = 'pendente' OR status_triagem IS NULL"
+            ).fetchall()
+
+        for r in itrows:
+            item = _dict_from_row(r)
+            cat = item.get("categoria", "")
+            iid = item["id"]
+
+            # 1. Transversal?
+            if cat in CATEGORIAS_TRANSVERSAIS and CATEGORIAS_TRANSVERSAIS[cat] is not None:
+                tt = CATEGORIAS_TRANSVERSAIS[cat]
+                conn.execute(
+                    "UPDATE oportunidades SET status_triagem='transversal', tipo_transversal=? WHERE id=?",
+                    (tt, iid)
+                )
+                stats["transversal"] += 1
+                continue
+
+            # 2. Tenta encaixar por palavras-chave
+            cid, conf = _triar_item_por_palavras(item, concursos)
+            if cid and conf == "alta":
+                conn.execute(
+                    "UPDATE oportunidades SET status_triagem='confirmado', concurso_id=?, sugestao_concurso=NULL WHERE id=?",
+                    (cid, iid)
+                )
+                stats["auto_confirmado"] += 1
+            elif cid and conf == "media":
+                # Vai pra fila de confirmacao com sugestao
+                nome_sug = next((c["nome"] for c in concursos if c["id"] == cid), "")
+                conn.execute(
+                    "UPDATE oportunidades SET status_triagem='pendente', sugestao_concurso=? WHERE id=?",
+                    (nome_sug, iid)
+                )
+                stats["sugerido"] += 1
+            else:
+                # Sem concurso: marca e registra como possivel sugestao de monitoramento
+                conn.execute(
+                    "UPDATE oportunidades SET status_triagem='sem_concurso' WHERE id=?",
+                    (iid,)
+                )
+                stats["sem_concurso"] += 1
+                _registrar_sugestao_concurso(conn, item, agora)
+
+    log.info("v7 triagem: %s", stats)
+    return stats
+
+
+def _registrar_sugestao_concurso(conn, item, agora):
+    """Registra/incrementa um concurso candidato a monitoramento (apareceu sem encaixe)."""
+    nome_exib = (item.get("concurso") or item.get("orgao") or "").strip()
+    if not nome_exib or len(nome_exib) < 3:
+        return
+    nome_norm = _normalizar_nome_concurso(nome_exib)
+    if not nome_norm:
+        return
+    banca = (item.get("banca") or "").strip()
+    evidencia = (item.get("titulo") or "")[:200]
+    try:
+        existing = conn.execute(
+            "SELECT id, vezes FROM sugestoes_concurso WHERE nome_normalizado = ?",
+            (nome_norm,)
+        ).fetchone()
+        if existing:
+            d = _dict_from_row(existing)
+            conn.execute(
+                "UPDATE sugestoes_concurso SET vezes = vezes + 1, ultima_aparicao = ?, "
+                "ultima_evidencia = ?, banca = COALESCE(NULLIF(banca,''), ?) WHERE id = ?",
+                (agora, evidencia, banca, d["id"])
+            )
+        else:
+            conn.execute(
+                "INSERT INTO sugestoes_concurso "
+                "(nome_normalizado, nome_exibicao, banca, vezes, ultima_evidencia, primeira_aparicao, ultima_aparicao, status) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, 'pendente')",
+                (nome_norm, nome_exib, banca, evidencia, agora, agora)
+            )
+    except Exception as e:
+        log.warning("_registrar_sugestao_concurso erro: %s", e)
+
+
 def salvar_itens(itens):
     """Salva itens novos no banco. Retorna lista de itens efetivamente inseridos (para notificacao).
 
@@ -1589,6 +1832,7 @@ def salvar_itens(itens):
     if not itens:
         return []
     inseridos = []
+    ids_inseridos = []
     bloqueados_blocklist = 0
     agora = datetime.now(timezone.utc).isoformat()
     with db_conn() as conn:
@@ -1617,14 +1861,14 @@ def salvar_itens(itens):
             metricas_json = json.dumps(metricas, ensure_ascii=False) if metricas else ""
 
             try:
-                conn.execute(
+                cur = conn.execute(
                     """INSERT INTO oportunidades
                     (categoria, tier, flag, titulo, descricao, orgao, estado,
                      concurso, cargo, banca, vagas, salario, prazo_inscricao,
                      data_prova, fase_atual, data_publicacao, extras_json,
                      link, relevancia, etapa_concurso, data_coleta, hash_unico,
-                     metricas_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     metricas_json, status_triagem)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendente')""",
                     (item["categoria"], item["tier"], item["flag"],
                      item["titulo"], item["descricao"], item["orgao"], item["estado"],
                      item["concurso"], item["cargo"], item["banca"], item["vagas"],
@@ -1634,12 +1878,32 @@ def salvar_itens(itens):
                      item["relevancia"], item["etapa_concurso"], agora, h,
                      metricas_json)
                 )
+                # Captura o id inserido pra triagem posterior
+                try:
+                    novo_id = cur.lastrowid
+                    if novo_id:
+                        ids_inseridos.append(novo_id)
+                except Exception:
+                    pass
                 inseridos.append(item)
             except sqlite3.IntegrityError:
                 pass
 
     if bloqueados_blocklist:
         log.info("blocklist: %d item(ns) bloqueados nesta coleta", bloqueados_blocklist)
+
+    # v7: roda triagem sobre os itens recem-inseridos (encaixe em concursos / transversal / sugestao)
+    # Se capturamos os ids (SQLite local), tria so eles. Senao (Turso pode nao dar lastrowid),
+    # tria todos os pendentes - cobre o caso de qualquer jeito.
+    if inseridos:
+        try:
+            if ids_inseridos and len(ids_inseridos) == len(inseridos):
+                triar_itens(item_ids=ids_inseridos)
+            else:
+                triar_itens(item_ids=None)  # tria todos os pendentes
+        except Exception as e:
+            log.warning("v7 triagem pos-insercao falhou: %s", e)
+
     return inseridos
 
 
@@ -1771,6 +2035,19 @@ def api_listar():
     if etapa:
         where_parts.append("etapa_concurso = ?")
         params.append(etapa)
+    # v7: filtros de triagem
+    concurso_id = request.args.get("concurso_id", "")
+    status_triagem = request.args.get("status_triagem", "")
+    tipo_transversal = request.args.get("tipo_transversal", "")
+    if concurso_id:
+        where_parts.append("concurso_id = ?")
+        params.append(int(concurso_id))
+    if status_triagem:
+        where_parts.append("status_triagem = ?")
+        params.append(status_triagem)
+    if tipo_transversal:
+        where_parts.append("tipo_transversal = ?")
+        params.append(tipo_transversal)
     if dias > 0:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
         where_parts.append("data_coleta >= ?")
@@ -1969,6 +2246,333 @@ def api_blocklist_remover(hash_unico):
             conn.execute("DELETE FROM excluidos WHERE hash_unico = ?", (hash_unico,))
         return jsonify({"ok": True, "hash_removido": hash_unico})
     except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+# ===== v7: CONCURSOS MONITORADOS (CRUD) =====
+
+PRIORIDADES_VALIDAS = ("urgente", "importante", "naourgente")
+
+
+@app.route("/api/concursos", methods=["GET"])
+def api_concursos_listar():
+    """Lista concursos monitorados com contagem de noticias encaixadas em cada um."""
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM concursos_monitorados WHERE ativo = 1 ORDER BY id DESC"
+            ).fetchall()
+            concursos = [_dict_from_row(r) for r in rows]
+            # Conta noticias confirmadas por concurso
+            for c in concursos:
+                cnt = conn.execute(
+                    "SELECT COUNT(*) AS n FROM oportunidades WHERE concurso_id = ? AND status_triagem = 'confirmado'",
+                    (c["id"],)
+                ).fetchone()
+                c["noticias_count"] = _dict_from_row(cnt)["n"] if cnt else 0
+        return jsonify({"total": len(concursos), "concursos": concursos})
+    except Exception as e:
+        log.error("api_concursos_listar erro: %s", e)
+        return jsonify({"erro": str(e), "total": 0, "concursos": []}), 500
+
+
+@app.route("/api/concursos", methods=["POST"])
+def api_concursos_criar():
+    """Cria um novo concurso monitorado.
+
+    Body JSON: { nome, banca?, palavras_chave?, prioridade?, vagas? }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        nome = str(data.get("nome", "")).strip()
+        if not nome:
+            return jsonify({"erro": "nome obrigatorio"}), 400
+        banca = str(data.get("banca", "")).strip()
+        palavras = str(data.get("palavras_chave", "")).strip()
+        prioridade = str(data.get("prioridade", "importante")).strip().lower()
+        if prioridade not in PRIORIDADES_VALIDAS:
+            prioridade = "importante"
+        vagas = str(data.get("vagas", "")).strip()
+        agora = datetime.now(timezone.utc).isoformat()
+
+        with db_conn() as conn:
+            conn.execute(
+                """INSERT INTO concursos_monitorados
+                   (nome, banca, palavras_chave, prioridade, vagas, data_criacao, ativo)
+                   VALUES (?, ?, ?, ?, ?, ?, 1)""",
+                (nome, banca, palavras, prioridade, vagas, agora)
+            )
+            row = conn.execute(
+                "SELECT * FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1",
+                (nome,)
+            ).fetchone()
+        novo = _dict_from_row(row) if row else {"nome": nome}
+        log.info("v7: concurso monitorado criado: %s", nome)
+        return jsonify({"ok": True, "concurso": novo})
+    except Exception as e:
+        log.error("api_concursos_criar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/<int:concurso_id>", methods=["PATCH"])
+def api_concursos_editar(concurso_id):
+    """Edita campos de um concurso monitorado (nome, banca, palavras_chave, prioridade, vagas)."""
+    try:
+        data = request.get_json(force=True) or {}
+        campos = []
+        valores = []
+        for campo in ("nome", "banca", "palavras_chave", "vagas"):
+            if campo in data:
+                campos.append(f"{campo} = ?")
+                valores.append(str(data[campo]).strip())
+        if "prioridade" in data:
+            p = str(data["prioridade"]).strip().lower()
+            if p in PRIORIDADES_VALIDAS:
+                campos.append("prioridade = ?")
+                valores.append(p)
+        if not campos:
+            return jsonify({"erro": "nada para atualizar"}), 400
+        valores.append(concurso_id)
+        with db_conn() as conn:
+            conn.execute(
+                f"UPDATE concursos_monitorados SET {', '.join(campos)} WHERE id = ?",
+                valores
+            )
+        return jsonify({"ok": True, "id": concurso_id})
+    except Exception as e:
+        log.error("api_concursos_editar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/<int:concurso_id>", methods=["DELETE"])
+def api_concursos_excluir(concurso_id):
+    """Para de monitorar um concurso (soft delete: ativo=0).
+
+    As noticias que estavam encaixadas voltam a status 'sem_concurso' (nao somem).
+    """
+    try:
+        with db_conn() as conn:
+            conn.execute("UPDATE concursos_monitorados SET ativo = 0 WHERE id = ?", (concurso_id,))
+            conn.execute(
+                "UPDATE oportunidades SET concurso_id = NULL, status_triagem = 'sem_concurso' "
+                "WHERE concurso_id = ?",
+                (concurso_id,)
+            )
+        log.info("v7: concurso %d desmonitorado", concurso_id)
+        return jsonify({"ok": True, "id": concurso_id})
+    except Exception as e:
+        log.error("api_concursos_excluir erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/<int:concurso_id>/prioridade", methods=["POST"])
+def api_concursos_prioridade(concurso_id):
+    """Altera so a prioridade (semaforo). Body: { prioridade: 'urgente'|'importante'|'naourgente' }"""
+    try:
+        data = request.get_json(force=True) or {}
+        p = str(data.get("prioridade", "")).strip().lower()
+        if p not in PRIORIDADES_VALIDAS:
+            return jsonify({"erro": "prioridade invalida"}), 400
+        with db_conn() as conn:
+            conn.execute("UPDATE concursos_monitorados SET prioridade = ? WHERE id = ?", (p, concurso_id))
+        return jsonify({"ok": True, "id": concurso_id, "prioridade": p})
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+# ===== v7: CAIXA DE ENTRADA (triagem) =====
+
+@app.route("/api/inbox", methods=["GET"])
+def api_inbox():
+    """Retorna a caixa de entrada: encaixes a confirmar + sugestoes de novos concursos."""
+    try:
+        with db_conn() as conn:
+            # Encaixes pendentes (a IA sugeriu um concurso, usuario confirma)
+            erows = conn.execute(
+                "SELECT id, titulo, descricao, sugestao_concurso, orgao, banca "
+                "FROM oportunidades WHERE status_triagem = 'pendente' AND sugestao_concurso IS NOT NULL "
+                "ORDER BY data_coleta DESC LIMIT 100"
+            ).fetchall()
+            encaixes = [_dict_from_row(r) for r in erows]
+
+            # Sugestoes de novos concursos (apareceram >= 2x, ainda nao monitorados)
+            srows = conn.execute(
+                "SELECT id, nome_exibicao, banca, vezes, ultima_evidencia "
+                "FROM sugestoes_concurso WHERE status = 'pendente' AND vezes >= 2 "
+                "ORDER BY vezes DESC LIMIT 50"
+            ).fetchall()
+            novos = [_dict_from_row(r) for r in srows]
+
+        return jsonify({
+            "encaixes": encaixes,
+            "novos": novos,
+            "total": len(encaixes) + len(novos),
+        })
+    except Exception as e:
+        log.error("api_inbox erro: %s", e)
+        return jsonify({"erro": str(e), "encaixes": [], "novos": [], "total": 0}), 500
+
+
+@app.route("/api/inbox/<int:item_id>/confirmar", methods=["POST"])
+def api_inbox_confirmar(item_id):
+    """Confirma o encaixe sugerido: a noticia entra na ficha do concurso.
+
+    Body opcional: { concurso_id } pra encaixar num concurso especifico (botao 'Outro concurso').
+    Se nao vier concurso_id, usa a sugestao (busca o concurso pelo nome sugerido).
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        concurso_id = data.get("concurso_id")
+        with db_conn() as conn:
+            if not concurso_id:
+                # Resolve pela sugestao
+                row = conn.execute(
+                    "SELECT sugestao_concurso FROM oportunidades WHERE id = ?", (item_id,)
+                ).fetchone()
+                sug = _dict_from_row(row).get("sugestao_concurso") if row else None
+                if sug:
+                    crow = conn.execute(
+                        "SELECT id FROM concursos_monitorados WHERE nome = ? AND ativo = 1 LIMIT 1",
+                        (sug,)
+                    ).fetchone()
+                    if crow:
+                        concurso_id = _dict_from_row(crow)["id"]
+            if not concurso_id:
+                return jsonify({"erro": "concurso nao resolvido"}), 400
+            conn.execute(
+                "UPDATE oportunidades SET status_triagem='confirmado', concurso_id=?, sugestao_concurso=NULL WHERE id=?",
+                (concurso_id, item_id)
+            )
+        return jsonify({"ok": True, "item_id": item_id, "concurso_id": concurso_id})
+    except Exception as e:
+        log.error("api_inbox_confirmar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/inbox/<int:item_id>/criar-e-encaixar", methods=["POST"])
+def api_inbox_criar_encaixar(item_id):
+    """Cria um concurso novo na hora e encaixa esta noticia nele.
+
+    Body: { nome, banca?, palavras_chave?, prioridade? }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        nome = str(data.get("nome", "")).strip()
+        if not nome:
+            return jsonify({"erro": "nome obrigatorio"}), 400
+        banca = str(data.get("banca", "")).strip()
+        palavras = str(data.get("palavras_chave", "")).strip()
+        prioridade = str(data.get("prioridade", "importante")).strip().lower()
+        if prioridade not in PRIORIDADES_VALIDAS:
+            prioridade = "importante"
+        agora = datetime.now(timezone.utc).isoformat()
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO concursos_monitorados (nome, banca, palavras_chave, prioridade, data_criacao, ativo) "
+                "VALUES (?, ?, ?, ?, ?, 1)",
+                (nome, banca, palavras, prioridade, agora)
+            )
+            crow = conn.execute(
+                "SELECT id FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1", (nome,)
+            ).fetchone()
+            cid = _dict_from_row(crow)["id"]
+            conn.execute(
+                "UPDATE oportunidades SET status_triagem='confirmado', concurso_id=?, sugestao_concurso=NULL WHERE id=?",
+                (cid, item_id)
+            )
+        log.info("v7: concurso '%s' criado e item %d encaixado", nome, item_id)
+        return jsonify({"ok": True, "concurso_id": cid, "item_id": item_id})
+    except Exception as e:
+        log.error("api_inbox_criar_encaixar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/inbox/<int:item_id>/descartar", methods=["POST"])
+def api_inbox_descartar(item_id):
+    """Remove da fila sem encaixar. Marca como sem_concurso (some da caixa de entrada)."""
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                "UPDATE oportunidades SET status_triagem='sem_concurso', sugestao_concurso=NULL WHERE id=?",
+                (item_id,)
+            )
+        return jsonify({"ok": True, "item_id": item_id})
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/sugestoes/<int:sug_id>/monitorar", methods=["POST"])
+def api_sugestao_monitorar(sug_id):
+    """Transforma uma sugestao de concurso em concurso monitorado.
+
+    Encaixa retroativamente as noticias 'sem_concurso' que casam com essa sugestao.
+    """
+    try:
+        agora = datetime.now(timezone.utc).isoformat()
+        with db_conn() as conn:
+            srow = conn.execute("SELECT * FROM sugestoes_concurso WHERE id = ?", (sug_id,)).fetchone()
+            if not srow:
+                return jsonify({"erro": "sugestao nao encontrada"}), 404
+            s = _dict_from_row(srow)
+            nome = s["nome_exibicao"]
+            banca = s.get("banca", "")
+            # Cria o concurso monitorado
+            conn.execute(
+                "INSERT INTO concursos_monitorados (nome, banca, palavras_chave, prioridade, data_criacao, ativo) "
+                "VALUES (?, ?, ?, 'importante', ?, 1)",
+                (nome, banca, nome, agora)  # usa o proprio nome como palavra-chave inicial
+            )
+            crow = conn.execute(
+                "SELECT id FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1", (nome,)
+            ).fetchone()
+            cid = _dict_from_row(crow)["id"]
+            # Marca a sugestao como aceita
+            conn.execute("UPDATE sugestoes_concurso SET status='monitorado' WHERE id=?", (sug_id,))
+        # Re-tria os itens sem_concurso (alguns vao encaixar agora)
+        try:
+            with db_conn() as conn:
+                conn.execute(
+                    "UPDATE oportunidades SET status_triagem='pendente' WHERE status_triagem='sem_concurso'"
+                )
+            triar_itens(item_ids=None)
+        except Exception as e:
+            log.warning("re-triagem pos-monitorar falhou: %s", e)
+        log.info("v7: sugestao %d virou concurso monitorado '%s'", sug_id, nome)
+        return jsonify({"ok": True, "concurso_id": cid, "nome": nome})
+    except Exception as e:
+        log.error("api_sugestao_monitorar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/sugestoes/<int:sug_id>/ignorar", methods=["POST"])
+def api_sugestao_ignorar(sug_id):
+    """Ignora uma sugestao de concurso (nao aparece mais na caixa de entrada)."""
+    try:
+        with db_conn() as conn:
+            conn.execute("UPDATE sugestoes_concurso SET status='ignorado' WHERE id=?", (sug_id,))
+        return jsonify({"ok": True, "id": sug_id})
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/triagem/retroativa", methods=["POST"])
+def api_triagem_retroativa():
+    """Roda a triagem uma vez sobre TODO o acervo antigo (itens sem status definido).
+
+    Usado na migracao pra v7: as noticias antigas foram coletadas sem o conceito de
+    concurso monitorado. Isso tenta encaixa-las nos concursos cadastrados.
+    """
+    try:
+        with db_conn() as conn:
+            # Reseta pra pendente os itens que ainda nao passaram por triagem real
+            conn.execute(
+                "UPDATE oportunidades SET status_triagem='pendente' "
+                "WHERE status_triagem IS NULL OR status_triagem = ''"
+            )
+        stats = triar_itens(item_ids=None)
+        return jsonify({"ok": True, "stats": stats})
+    except Exception as e:
+        log.error("api_triagem_retroativa erro: %s", e)
         return jsonify({"erro": str(e)}), 500
 
 
@@ -2199,154 +2803,6 @@ def cron_tier23():
     return "OK", 200, {"Content-Type": "text/plain"}
 
 
-
-
-@app.route("/cron/alertas-concursos-ativos", methods=["GET", "POST"])
-def cron_alertas_concursos_ativos():
-    """Verifica oportunidades novas que casam com palavras-chave dos concursos ativos
-    no sistema interno e envia alerta dedicado no Discord.
-    
-    Configurar no cron-job.org para rodar 2x ao dia (ex: 09:00 e 18:00).
-    """
-    import urllib.request, urllib.error
-    
-    SISTEMA_URL = "https://silvapinto-comercial.onrender.com/api/marketing/concursos-ativos"
-    JANELA_HORAS = int(request.args.get("horas", "24"))
-    
-    # 1. Buscar concursos ativos no sistema interno
-    try:
-        with urllib.request.urlopen(SISTEMA_URL, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        concursos = data.get("concursos", [])
-    except Exception as e:
-        log.error("Erro ao buscar concursos ativos: %s", e)
-        return jsonify({"erro": str(e), "concursos_consultados": 0}), 500
-    
-    if not concursos:
-        return jsonify({"ok": True, "concursos_ativos": 0, "alertas_enviados": 0,
-                        "msg": "Nenhum concurso marcado como mkt_selecionado=1"})
-    
-    # 2. Para cada concurso, buscar itens novos (ultimas N horas) que casem com keywords
-    from datetime import datetime, timedelta
-    corte = (datetime.now() - timedelta(hours=JANELA_HORAS)).isoformat()
-    
-    alertas_por_concurso = {}
-    total_alertas = 0
-    
-    conn = get_db()
-    try:
-        cursor = conn.cursor()
-        for c in concursos:
-            keywords_raw = (c.get("palavras_chave") or c.get("nome") or "").strip()
-            if not keywords_raw:
-                continue
-            
-            # Quebra palavras_chave em termos individuais
-            # Aceita separadores: virgula, ponto-virgula, pipe
-            import re as _re
-            termos = [t.strip().strip("\"\'") for t in _re.split(r"[,;|]", keywords_raw) if t.strip()]
-            if not termos:
-                termos = [keywords_raw]
-            
-            # Monta WHERE com OR LIKE para cada termo (case-insensitive via LOWER)
-            where_termos = " OR ".join(["LOWER(titulo) LIKE ? OR LOWER(descricao) LIKE ?" for _ in termos])
-            params = []
-            for t in termos:
-                t_low = "%" + t.lower() + "%"
-                params.extend([t_low, t_low])
-            
-            sql = f"""SELECT id, titulo, descricao, link, banca, estado, flag, relevancia, data_coleta
-                      FROM oportunidades
-                      WHERE data_coleta >= ?
-                        AND arquivado = 0
-                        AND ({where_termos})
-                      ORDER BY relevancia DESC, data_coleta DESC
-                      LIMIT 8"""
-            cursor.execute(sql, [corte] + params)
-            rows = cursor.fetchall()
-            
-            if rows:
-                lista = [dict(r) for r in rows]
-                alertas_por_concurso[c["nome"]] = {
-                    "concurso": c["nome"],
-                    "prioridade": c.get("prioridade", "normal"),
-                    "fase_atual": c.get("fase_atual", ""),
-                    "itens": lista,
-                }
-                total_alertas += len(lista)
-    finally:
-        conn.close()
-    
-    # 3. Enviar alertas no Discord (UM webhook por concurso para nao misturar)
-    enviados = 0
-    if DISCORD_WEBHOOK_URL and alertas_por_concurso:
-        for nome, info in alertas_por_concurso.items():
-            try:
-                _enviar_alerta_concurso_discord(info)
-                enviados += 1
-            except Exception as e:
-                log.warning("Falha ao enviar alerta para %s: %s", nome, e)
-    
-    return jsonify({
-        "ok": True,
-        "concursos_ativos": len(concursos),
-        "concursos_com_novidades": len(alertas_por_concurso),
-        "total_itens_novos": total_alertas,
-        "alertas_enviados": enviados,
-        "janela_horas": JANELA_HORAS,
-        "detalhes": {nome: len(info["itens"]) for nome, info in alertas_por_concurso.items()},
-    })
-
-
-def _enviar_alerta_concurso_discord(info):
-    """Manda um embed dedicado por concurso no Discord."""
-    if not DISCORD_WEBHOOK_URL:
-        return
-    import urllib.request
-    
-    PRIORIDADE_CORES = {"alta": 0xdc2626, "normal": 0xc9a84c, "baixa": 0x6b7280}
-    cor = PRIORIDADE_CORES.get(info.get("prioridade", "normal"), 0xc9a84c)
-    
-    embeds = []
-    for it in info["itens"][:8]:
-        rel = it.get("relevancia", 5)
-        titulo = (it.get("titulo") or "(sem titulo)")[:200]
-        desc = (it.get("descricao") or "")[:280]
-        meta = []
-        if it.get("banca"): meta.append("\U0001F3DB\uFE0F " + it["banca"])
-        if it.get("estado"): meta.append("\U0001F4CD " + it["estado"])
-        if it.get("flag"): meta.append("\U0001F3F7\uFE0F " + it["flag"])
-        meta_line = " \u00B7 ".join(meta)
-        
-        embed = {
-            "title": titulo,
-            "description": (meta_line + "\n\n" + desc) if meta_line else desc,
-            "color": cor,
-            "footer": {"text": "Rel " + str(rel) + "/10"},
-        }
-        if it.get("link"):
-            embed["url"] = it["link"]
-        embeds.append(embed)
-    
-    icone_prio = {"alta": "\U0001F525", "normal": "\U0001F4CC", "baixa": "\U0001F4D1"}.get(info.get("prioridade","normal"), "\U0001F4CC")
-    
-    payload = {
-        "content": icone_prio + " **" + info["concurso"] + "** — " + str(len(info["itens"])) + " novidade(s) na janela monitorada\n" +
-                   ("_Fase atual: " + info["fase_atual"] + "_" if info.get("fase_atual") else ""),
-        "embeds": embeds,
-        "username": "Alertas Silva Pinto",
-    }
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        DISCORD_WEBHOOK_URL,
-        data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "SilvaPinto/1.0"},
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        if resp.status >= 300:
-            log.warning("Discord alerta concurso retornou %d", resp.status)
-
-
 @app.route("/cron/manual", methods=["POST"])
 def cron_manual():
     if not ANTHROPIC_API_KEY:
@@ -2443,6 +2899,7 @@ def health():
 init_db()
 _ensure_metricas_column()
 _ensure_selecionado_column()
+_ensure_triagem_columns()
 
 
 # Logo PNG transparente embutido (gerado a partir da logo Silva Pinto)
@@ -2451,1455 +2908,635 @@ LOGO_B64 = "iVBORw0KGgoAAAANSUhEUgAAANwAAADcCAYAAAAbWs+BAAABCGlDQ1BJQ0MgUHJvZmls
 
 # HTML embutido
 HTML_INDEX = r"""<!DOCTYPE html>
-<html lang="pt-br">
+<html lang="pt-BR">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Silva Pinto - Painel de Oportunidades</title>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=Montserrat:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      /* Paleta Silva Pinto */
-      --gold: #BB904C;
-      --gold-light: #D4AF7A;
-      --gold-dark: #9a7438;
-      --gold-pale: #f5ecd9;
-      --navy: #1a2842;
-      --navy-light: #2d3e5e;
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Painel de Oportunidades v7 &#8212; Silva Pinto</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    /* Paleta oficial Silva Pinto (manual de marca) */
+    --bege: #D9D7C5;           /* fundo principal */
+    --bege-claro: #e4e2d4;     /* cards / superficie clara */
+    --bege-escuro: #c9c6b2;    /* linhas, divisores */
+    --gold: #BB904C;           /* dourado - acentos */
+    --gold-light: #d0a866;
+    --gold-dark: #9a7438;
+    --gold-pale: #ece3d0;
+    --cinza: #7A7A7A;          /* cinza medio - texto secundario */
+    --preto: #1A1A1A;          /* preto - autoridade, texto, fundos escuros */
+    --preto-soft: #2a2a2a;
+    --cream: #D9D7C5;
+    --navy: #1A1A1A;           /* mapeado pro preto da marca */
+    --line: #c9c6b2;
+    --text: #1A1A1A;
+    --muted: #7A7A7A;
+    --urgente: #c0392b;        /* SEMAFORO vermelho vivo - so as bolinhas */
+    --importante: #BB904C;     /* SEMAFORO amarelo = dourado da marca */
+    --naourgente: #2e9e5b;     /* SEMAFORO verde vivo - so as bolinhas */
+    /* acoes e chrome usam SO a paleta da marca abaixo */
+    --acao: #1A1A1A;           /* botoes de acao = preto */
+    --acao-ok: #BB904C;        /* confirmado = dourado */
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--cream);
+    color: var(--text);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .serif { font-family: 'Cormorant Garamond', serif; }
 
-      /* Fundos */
-      --bg-page: #faf8f3;        /* off-white principal */
-      --bg-card: #ffffff;         /* cards brancos */
-      --bg-soft: #f0ede4;         /* secao secundaria */
-      --line: #d8d3c4;
-      --line-soft: #e8e3d4;
+  .mockup-banner {
+    background: repeating-linear-gradient(45deg, #1A1A1A, #1A1A1A 12px, #2a2a2a 12px, #2a2a2a 24px);
+    color: #fff; text-align: center; padding: 7px 16px; font-size: 11.5px;
+    letter-spacing: 0.4px; font-weight: 600;
+  }
+  .mockup-banner b { color: var(--gold-pale); }
 
-      /* Texto */
-      --text-primary: #1a2842;
-      --text-secondary: #6b6e76;
-      --text-muted: #9a9690;
+  /* ===== Header ===== */
+  header {
+    background: var(--navy); color: #fff; padding: 16px 26px;
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  }
+  .logo-circ {
+    width: 44px; height: 44px; border-radius: 50%; border: 2px solid var(--gold);
+    display: grid; place-items: center; font-family: 'Cormorant Garamond', serif;
+    font-weight: 700; color: var(--gold); font-size: 17px; flex-shrink: 0;
+  }
+  .brand h1 { font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 22px; }
+  .brand .sub { font-size: 9px; letter-spacing: 3px; text-transform: uppercase; color: var(--gold); opacity: 0.85; margin-top: 1px; }
 
-      /* Tier accents - mais sobrios pra combinar com a identidade */
-      --tier1: #b91c1c;
-      --tier1-bg: #fef2f2;
-      --tier1-border: #fca5a5;
-      --tier2: #5a6478;
-      --tier2-bg: #eff1f5;
-      --tier2-border: #c8cdd6;
-      --tier3: var(--text-secondary);
-      --tier3-bg: #f0ede4;
-      --tier3-border: var(--line);
+  .search-wrap { flex: 1; min-width: 260px; display: flex; justify-content: center; }
+  .search-box { width: 100%; max-width: 480px; position: relative; }
+  .search-box input {
+    width: 100%; padding: 12px 16px 12px 42px; border-radius: 28px; border: none;
+    font-family: 'DM Sans'; font-size: 13.5px; background: rgba(255,255,255,0.96); color: var(--navy); font-weight: 500;
+  }
+  .search-box .icon { position: absolute; left: 15px; top: 50%; transform: translateY(-50%); color: var(--gold); }
+  .search-box .hint { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font-size: 9px; color: #7A7A7A; background: var(--gold-pale); padding: 3px 8px; border-radius: 10px; font-weight: 700; }
 
-      /* Apoio */
-      --green: #5d8c5b;
-      --orange: #c2724a;
-      --link: #3b5a8a;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: 'Montserrat', sans-serif;
-      background: var(--bg-page);
-      color: var(--text-primary);
-      min-height: 100vh;
-      font-size: 14px;
-    }
-    header {
-      background: #3a3d42;
-      color: white;
-      padding: 14px 24px;
-      box-shadow: 0 2px 12px rgba(58, 61, 66, 0.15);
-      position: sticky;
-      top: 0;
-      z-index: 100;
-    }
-    .header-inner {
-      max-width: 1400px;
-      margin: 0 auto;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-    }
-    .header-left {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-    .logo-img {
-      height: 70px;
-      width: auto;
-      display: block;
-    }
-    .header-text-block {
-      border-left: 1px solid rgba(255,255,255,0.15);
-      padding-left: 16px;
-    }
-    .header-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 22px;
-      font-weight: 600;
-      letter-spacing: 0.3px;
-    }
-    .header-subtitle {
-      font-size: 10px;
-      letter-spacing: 2px;
-      color: var(--gold-light);
-      text-transform: uppercase;
-      margin-top: 4px;
-    }
-    .btn {
-      background: var(--gold);
-      color: white;
-      border: none;
-      padding: 10px 18px;
-      border-radius: 4px;
-      font-family: 'Montserrat', sans-serif;
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-    .btn:hover { background: var(--gold-light); }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-ghost {
-      background: transparent;
-      border: 1px solid rgba(187, 144, 76, 0.5);
-      color: var(--gold-light);
-    }
-    .btn-ghost:hover {
-      background: rgba(187, 144, 76, 0.1);
-      border-color: var(--gold);
-      color: white;
-    }
-    .btn-group { display: flex; gap: 8px; }
+  /* ===== Nav principal (3 lugares) ===== */
+  .mainnav { background: var(--navy); border-top: 1px solid rgba(255,255,255,0.1); padding: 0 26px; display: flex; gap: 2px; }
+  .mainnav button {
+    background: none; border: none; color: rgba(255,255,255,0.6); font-family: 'DM Sans';
+    font-size: 12.5px; font-weight: 700; padding: 13px 18px; cursor: pointer; letter-spacing: 0.4px;
+    border-bottom: 3px solid transparent; transition: all 0.15s; display: flex; align-items: center; gap: 8px;
+  }
+  .mainnav button:hover { color: #fff; }
+  .mainnav button.active { color: var(--gold); border-bottom-color: var(--gold); }
+  .nav-badge { font-size: 10px; background: var(--urgente); color: #fff; padding: 1px 7px; border-radius: 9px; font-weight: 800; }
+  .nav-badge.cinza { background: rgba(255,255,255,0.18); }
 
-    .status-bar {
-      max-width: 1400px;
-      margin: 28px auto 0;
-      padding: 0 24px;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-      gap: 12px;
-    }
-    .status-card {
-      background: var(--bg-card);
-      border-radius: 4px;
-      padding: 14px 18px;
-      border-left: 3px solid var(--gold);
-      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-    }
-    .status-card.tier1 { border-left-color: var(--tier1); }
-    .status-card.tier2 { border-left-color: var(--tier2); }
-    .status-card.tier3 { border-left-color: var(--tier3); }
-    .status-card .label {
-      font-size: 9px;
-      color: var(--text-secondary);
-      letter-spacing: 1.5px;
-      text-transform: uppercase;
-      margin-bottom: 8px;
-      font-weight: 600;
-    }
-    .status-card .value {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 28px;
-      color: var(--navy);
-      font-weight: 600;
-      line-height: 1;
-    }
-    .status-card .value.small {
-      font-size: 12px;
-      font-family: 'Montserrat', sans-serif;
-      font-weight: 500;
-    }
+  /* ===== Telas ===== */
+  .tela { display: none; padding: 24px 26px 70px; max-width: 1240px; margin: 0 auto; }
+  .tela.active { display: block; }
 
-    .global-filters {
-      max-width: 1400px;
-      margin: 22px auto 0;
-      padding: 0 24px;
-    }
-    .filters {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      flex-wrap: wrap;
-      padding: 12px 16px;
-      background: var(--bg-card);
-      border-radius: 4px;
-      border: 1px solid var(--line-soft);
-    }
-    .filters select, .filters label {
-      font-size: 12px;
-      font-family: 'Montserrat', sans-serif;
-    }
-    .filters select {
-      padding: 6px 10px;
-      border: 1px solid var(--line);
-      border-radius: 3px;
-      background: white;
-      color: var(--navy);
-      cursor: pointer;
-    }
-    .filters label {
-      color: var(--text-secondary);
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      cursor: pointer;
-    }
+  .legenda { display: flex; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; font-size: 11px; color: var(--muted); align-items: center; }
+  .legenda .sq { width: 11px; height: 11px; border-radius: 3px; display: inline-block; margin-right: 5px; vertical-align: middle; }
 
-    .tier-section {
-      max-width: 1400px;
-      margin: 32px auto 0;
-      padding: 0 24px;
-    }
-    .tier-header {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      margin-bottom: 16px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--line);
-    }
-    .tier-pill {
-      padding: 4px 14px;
-      border-radius: 12px;
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 1.5px;
-      text-transform: uppercase;
-    }
-    .tier-pill.tier1 { background: var(--tier1-bg); color: var(--tier1); border: 1px solid var(--tier1-border); }
-    .tier-pill.tier2 { background: var(--tier2-bg); color: var(--tier2); border: 1px solid var(--tier2-border); }
-    .tier-pill.tier3 { background: var(--tier3-bg); color: var(--tier3); border: 1px solid var(--tier3-border); }
-    .tier-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 24px;
-      font-weight: 600;
-      color: var(--navy);
-    }
-    .tier-desc {
-      font-size: 12px;
-      color: var(--text-secondary);
-      margin-left: auto;
-      font-style: italic;
-    }
+  /* ===== Split layout (Op&#231;&#227;o A) ===== */
+  .split { display: grid; grid-template-columns: 1fr 310px; gap: 22px; align-items: start; }
+  @media (max-width: 840px) { .split { grid-template-columns: 1fr; } }
 
-    .phase-divider {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin: 22px 0 12px;
-      font-size: 10px;
-      letter-spacing: 1.8px;
-      text-transform: uppercase;
-      font-weight: 700;
-      color: var(--text-secondary);
-    }
-    .phase-divider::before {
-      content: '';
-      width: 24px;
-      height: 1px;
-      background: var(--line);
-    }
-    .phase-divider::after {
-      content: '';
-      flex: 1;
-      height: 1px;
-      background: var(--line);
-    }
-    .phase-divider.antes { color: var(--green); }
-    .phase-divider.apos { color: var(--orange); }
+  /* ===== Ficha viva de concurso ===== */
+  .ficha {
+    background: #fdfcf9; border: 1px solid var(--line); border-radius: 12px; margin-bottom: 16px;
+    overflow: hidden; box-shadow: 0 1px 3px rgba(40,30,10,0.04);
+  }
+  .ficha-head {
+    padding: 15px 18px; display: flex; align-items: center; gap: 13px; cursor: pointer;
+    border-left: 5px solid var(--urgente); user-select: none;
+  }
+  .ficha-head.urgente { border-left-color: var(--urgente); }
+  .ficha-head.importante { border-left-color: var(--importante); }
+  .ficha-head.naourgente { border-left-color: var(--naourgente); }
+  .ficha-head:hover { background: #e4e2d4; }
 
-    .cards-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-      gap: 14px;
-      margin-bottom: 8px;
-    }
+  /* Selo de prioridade: so cor (semaforo), sem texto */
+  .stage-dot {
+    width: 16px; height: 16px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.7);
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.08); cursor: pointer; flex-shrink: 0; padding: 0;
+    transition: transform 0.12s;
+  }
+  .stage-dot:hover { transform: scale(1.2); }
+  .ficha-tit { flex: 1; }
+  .ficha-tit h3 { font-family: 'Cormorant Garamond'; font-size: 19px; font-weight: 600; color: var(--navy); }
+  .ficha-tit .meta { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  .chev { color: var(--muted); transition: transform 0.2s; font-size: 13px; }
+  .ficha.aberta .chev { transform: rotate(90deg); }
 
-    .card {
-      background: var(--bg-card);
-      border-radius: 4px;
-      padding: 18px 20px;
-      border: 1px solid var(--line-soft);
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      transition: all 0.2s;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-    }
-    .card:hover {
-      box-shadow: 0 8px 24px rgba(26, 40, 66, 0.08);
-      border-color: var(--line);
-      transform: translateY(-1px);
-    }
-    .card.tier1 { border-top: 3px solid var(--tier1); }
-    .card.tier2 { border-top: 3px solid var(--tier2); }
-    .card.tier3 { border-top: 3px solid var(--tier3); }
+  .novelty { font-size: 10.5px; color: var(--urgente); font-weight: 700; display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .novelty .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--urgente); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
-    /* Selo NOVO: flutua no topo central do card, indicando itens da ultima coleta */
-    .card { position: relative; }
-    .selo-novo {
-      position: absolute;
-      top: -10px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: #16a34a;
-      color: white;
-      font-size: 9px;
-      font-weight: 800;
-      letter-spacing: 1.5px;
-      padding: 3px 12px;
-      border-radius: 10px;
-      box-shadow: 0 2px 6px rgba(22, 163, 74, 0.35);
-      text-transform: uppercase;
-      z-index: 2;
-      animation: pulse-novo 2s ease-in-out infinite;
-    }
-    @keyframes pulse-novo {
-      0%, 100% { box-shadow: 0 2px 6px rgba(22, 163, 74, 0.35); }
-      50% { box-shadow: 0 2px 14px rgba(22, 163, 74, 0.6); }
-    }
+  .ficha-body { padding: 0 18px 14px 23px; display: none; }
+  .ficha.aberta .ficha-body { display: block; }
 
-    .card-flag-row {
-      display: flex;
-      gap: 6px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-    .flag-badge {
-      font-size: 9px;
-      padding: 4px 9px;
-      border-radius: 3px;
-      font-weight: 700;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-    }
-    .flag-badge.QUENTE { background: var(--tier1); color: white; }
-    .flag-badge.FASE { background: #c2410c; color: white; }
-    .flag-badge.RECURSO { background: #b45309; color: white; }
-    .flag-badge.VOLUME { background: #5a6478; color: white; }
-    .flag-badge.JURISPRUDENCIA { background: #6d28d9; color: white; }
-    .flag-badge.VIRAL { background: #be185d; color: white; }
-    .flag-badge.CONCORRENCIA { background: #475569; color: white; }
-    .relevancia {
-      margin-left: auto;
-      color: #000;
-      font-size: 10px;
-      font-weight: 700;
-      padding: 4px 9px;
-      border-radius: 3px;
-      letter-spacing: 0.5px;
-    }
-    /* Espectro arco-iris invertido: 10 = vermelho urgente, 1 = azul calmo */
-    .relevancia.r10 { background: #dc2626; }
-    .relevancia.r9  { background: #ea580c; }
-    .relevancia.r8  { background: #f97316; }
-    .relevancia.r7  { background: #eab308; }
-    .relevancia.r6  { background: #84cc16; }
-    .relevancia.r5  { background: #22c55e; }
-    .relevancia.r4  { background: #10b981; }
-    .relevancia.r3  { background: #06b6d4; }
-    .relevancia.r2  { background: #0ea5e9; }
-    .relevancia.r1  { background: #2563eb; }
+  .linha { display: flex; align-items: flex-start; gap: 11px; padding: 12px 0; border-top: 1px solid #c9c6b2; }
+  .ntag { font-size: 8.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; padding: 4px 8px; border-radius: 5px; white-space: nowrap; margin-top: 2px; }
+  .t-gabarito { background: var(--gold-pale); color: var(--preto); }
+  .t-recurso { background: var(--gold-pale); color: var(--gold-dark); }
+  .t-fase { background: var(--gold-pale); color: var(--cinza); }
+  .t-nomeacao { background: var(--gold-pale); color: var(--preto); }
+  .t-inscricao { background: var(--gold-pale); color: var(--cinza); }
+  .ntexto { flex: 1; }
+  .ntexto .nt { font-size: 13.5px; font-weight: 600; color: var(--grafite); }
+  .ntexto .nd { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .nacts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
 
-    /* Botao Notas */
-    .card-action.notas {
-      transition: all 0.2s;
-    }
-    .card-action.notas.tem-notas {
-      border-color: #2563eb;
-      color: #1d4ed8;
-      background: #eff6ff;
-      font-weight: 700;
-    }
-    .notas-panel {
-      margin-top: 10px;
-      padding: 12px 14px;
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      border-radius: 4px;
-      display: none;
-    }
-    .notas-panel.aberto { display: block; }
-    .notas-textarea {
-      width: 100%;
-      min-height: 70px;
-      padding: 8px 10px;
-      border: 1px solid var(--line);
-      border-radius: 3px;
-      font-family: 'Montserrat', sans-serif;
-      font-size: 12px;
-      resize: vertical;
-      box-sizing: border-box;
-    }
-    .notas-textarea:focus {
-      outline: none;
-      border-color: var(--gold);
-    }
-    .notas-bottom {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-top: 8px;
-    }
-    .notas-counter {
-      font-size: 10px;
-      color: var(--text-secondary);
-    }
-    .notas-counter.warn { color: #c2410c; font-weight: 600; }
-    .notas-btn-salvar {
-      margin-left: auto;
-      background: var(--gold);
-      color: white;
-      border: none;
-      padding: 6px 14px;
-      border-radius: 3px;
-      font-family: 'Montserrat', sans-serif;
-      font-size: 10px;
-      font-weight: 600;
-      letter-spacing: 0.5px;
-      text-transform: uppercase;
-      cursor: pointer;
-    }
-    .notas-btn-salvar:hover { background: var(--gold-light); }
-    .notas-btn-salvar:disabled { opacity: 0.4; cursor: not-allowed; }
-    .notas-lista {
-      margin-top: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .nota-item {
-      background: white;
-      border: 1px solid var(--line-soft);
-      border-left: 3px solid var(--gold);
-      border-radius: 3px;
-      padding: 8px 10px;
-      font-size: 12px;
-      color: var(--text-primary);
-      line-height: 1.45;
-      display: flex;
-      align-items: flex-start;
-      gap: 8px;
-    }
-    .nota-item .nota-conteudo { flex: 1; }
-    .nota-item .nota-meta {
-      font-size: 9px;
-      color: var(--text-muted);
-      letter-spacing: 0.5px;
-      text-transform: uppercase;
-      margin-top: 4px;
-      font-weight: 600;
-    }
-    .nota-deletar {
-      background: transparent;
-      border: none;
-      color: var(--text-muted);
-      cursor: pointer;
-      font-size: 14px;
-      padding: 0 4px;
-      line-height: 1;
-    }
-    .nota-deletar:hover { color: var(--tier1); }
+  .mini { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; padding: 5px 11px; border-radius: 5px; border: 1px solid var(--line); background: #fdfcf9; color: var(--muted); cursor: pointer; transition: all 0.15s; font-family: 'DM Sans'; }
+  .mini:hover { border-color: var(--gold); color: var(--gold-dark); }
+  .mini.gerar { background: var(--navy); color: #fff; border-color: var(--navy); }
+  .mini.gerar:hover { background: var(--gold); border-color: var(--gold); color: #fff; }
+  .mini.feito { background: var(--gold); color: #fff; border-color: var(--gold); cursor: default; }
 
-    /* Metricas reais (YouTube/Reddit) */
-    .metricas-reais {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      padding: 8px 10px;
-      background: #f1f5f9;
-      border-radius: 3px;
-      font-size: 11px;
-      color: #334155;
-      margin-top: 4px;
-    }
-    .metricas-reais .met-label {
-      font-weight: 600;
-      color: var(--navy);
-    }
-    .metricas-reais .met-source {
-      font-size: 9px;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-      color: var(--text-muted);
-      font-weight: 700;
-      margin-right: 4px;
-    }
+  /* ===== Lateral temas ===== */
+  .side { background: #fdfcf9; border: 1px solid var(--line); border-radius: 12px; padding: 17px; position: sticky; top: 18px; }
+  .side h4 { font-family: 'Cormorant Garamond'; font-size: 16px; color: var(--navy); }
+  .side .side-sub { font-size: 10.5px; color: var(--muted); margin: 3px 0 13px; }
+  .sitem { padding: 11px 0; border-top: 1px solid #c9c6b2; }
+  .sitem:first-of-type { border-top: none; }
+  .sk { font-size: 8.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; }
+  .sk.juris { color: var(--cinza); }
+  .sk.concorrencia { color: var(--gold-dark); }
+  .sk.tendencia { color: var(--preto); }
+  .si-title { font-size: 12.5px; font-weight: 600; color: var(--grafite); margin: 3px 0 7px; }
 
-    .card-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 19px;
-      font-weight: 600;
-      color: var(--navy);
-      line-height: 1.3;
-    }
-    .card-subtitle {
-      font-size: 12px;
-      color: var(--text-secondary);
-      line-height: 1.4;
-      margin-top: -4px;
-    }
+  /* ===== Caixa de entrada (triagem) ===== */
+  .inbox-grupo { margin-bottom: 28px; }
+  .inbox-grupo > h3 { font-family: 'Cormorant Garamond'; font-size: 18px; color: var(--navy); margin-bottom: 4px; display: flex; align-items: center; gap: 9px; }
+  .inbox-grupo > .gsub { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+  .triagem-card {
+    background: #fdfcf9; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+    margin-bottom: 11px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  }
+  .triagem-card .tc-main { flex: 1; min-width: 220px; }
+  .triagem-card .tc-tit { font-size: 13.5px; font-weight: 600; color: var(--grafite); }
+  .triagem-card .tc-sug { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+  .triagem-card .tc-sug b { color: var(--navy); }
+  .tc-acts { display: flex; gap: 7px; flex-wrap: wrap; }
+  .btn-conf { background: var(--acao); color: #fff; border: none; font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans'; letter-spacing: 0.3px; }
+  .btn-conf:hover { filter: brightness(1.08); }
+  .btn-rej { background: #fdfcf9; color: var(--muted); border: 1px solid var(--line); font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans'; letter-spacing: 0.3px; }
+  .btn-rej:hover { border-color: var(--urgente); color: var(--urgente); }
+  .btn-outro { background: #fdfcf9; color: var(--navy); border: 1px solid var(--gold); font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans'; letter-spacing: 0.3px; }
+  .btn-outro:hover { background: var(--gold-pale); }
+  .sug-monit { background: var(--gold-pale); border-color: var(--gold-light); }
 
-    .card-concurso-info {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      padding: 12px 14px;
-      background: linear-gradient(135deg, var(--gold-pale) 0%, var(--bg-page) 100%);
-      border-radius: 4px;
-      border-left: 2px solid var(--gold);
-    }
-    .info-block .info-label {
-      font-size: 9px;
-      color: var(--text-secondary);
-      letter-spacing: 1.5px;
-      text-transform: uppercase;
-      margin-bottom: 3px;
-      font-weight: 600;
-    }
-    .info-block .info-value {
-      font-size: 15px;
-      color: var(--navy);
-      font-weight: 600;
-      font-family: 'Cormorant Garamond', serif;
-      letter-spacing: 0.3px;
-    }
-    .info-block .info-value.muted {
-      color: var(--text-muted);
-      font-style: italic;
-      font-weight: 400;
-    }
+  /* Menu "outro concurso" */
+  .outro-menu { display: none; position: fixed; inset: 0; background: rgba(26,40,66,0.5); z-index: 60; align-items: center; justify-content: center; padding: 20px; }
+  .outro-menu.show { display: flex; }
+  .outro-box { background: #fdfcf9; border-radius: 14px; padding: 24px; max-width: 420px; width: 100%; }
+  .outro-box h3 { font-family: 'Cormorant Garamond'; font-size: 21px; color: var(--navy); margin-bottom: 3px; }
+  .outro-box .obsub { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+  .outro-list { max-height: 240px; overflow-y: auto; margin-bottom: 14px; }
+  .outro-item { padding: 11px 13px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 7px; cursor: pointer; font-size: 13px; font-weight: 600; color: var(--navy); transition: all 0.12s; }
+  .outro-item:hover { border-color: var(--gold); background: var(--gold-pale); }
+  .outro-novo { border-top: 1px dashed var(--line); padding-top: 14px; }
+  .outro-novo input { width: 100%; padding: 9px 12px; border: 1px solid var(--line); border-radius: 7px; font-family: 'DM Sans'; font-size: 13px; margin-bottom: 8px; }
+  .outro-novo button { width: 100%; padding: 10px; background: var(--navy); color: #fff; border: none; border-radius: 7px; font-family: 'DM Sans'; font-weight: 700; font-size: 12px; cursor: pointer; }
+  .outro-novo button:hover { background: var(--gold); }
+  .outro-fechar { text-align: center; margin-top: 12px; }
+  .outro-fechar button { background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; text-decoration: underline; font-family: 'DM Sans'; }
 
-    .card-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
-    }
-    .badge {
-      font-size: 10px;
-      padding: 3px 9px;
-      border-radius: 3px;
-      background: var(--bg-soft);
-      color: var(--text-secondary);
-      font-weight: 500;
-    }
-    .badge.estado { background: #e0e7ff; color: #3730a3; }
-    .badge.banca { background: #ecfdf5; color: #065f46; }
-    .badge.fase { background: #fef3c7; color: #92400e; }
-    .badge.data { background: var(--gold-pale); color: var(--gold-dark); }
+  /* ===== Concursos monitorados (cadastro) ===== */
+  .add-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+  .add-btn { background: var(--navy); color: #fff; border: none; font-family: 'DM Sans'; font-size: 12.5px; font-weight: 700; padding: 11px 20px; border-radius: 8px; cursor: pointer; letter-spacing: 0.3px; }
+  .add-btn:hover { background: var(--gold); }
+  .monit-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .monit-card { background: #fdfcf9; border: 1px solid var(--line); border-radius: 10px; padding: 16px; border-top: 4px solid var(--importante); }
+  .monit-card.urgente-top { border-top-color: var(--urgente); }
+  .monit-card.radar-top { border-top-color: var(--cinza); }
+  .monit-card h4 { font-family: 'Cormorant Garamond'; font-size: 17px; color: var(--navy); }
+  .monit-card .mc-meta { font-size: 11px; color: var(--muted); margin: 5px 0 10px; }
+  .kw { display: inline-block; font-size: 10px; background: var(--gold-pale); color: var(--gold-dark); padding: 2px 8px; border-radius: 10px; margin: 2px 3px 2px 0; font-weight: 600; }
+  .mc-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; padding-top: 11px; border-top: 1px solid #c9c6b2; }
+  .mc-count { font-size: 11px; color: var(--muted); }
 
-    .card-desc {
-      font-size: 13px;
-      line-height: 1.55;
-      color: var(--text-primary);
-    }
+  /* ===== Modal ===== */
+  .modal-bg { display: none; position: fixed; inset: 0; background: rgba(26,40,66,0.5); z-index: 50; align-items: center; justify-content: center; padding: 20px; }
+  .modal-bg.show { display: flex; }
+  .modal { background: #fdfcf9; border-radius: 14px; padding: 26px; max-width: 460px; width: 100%; }
+  .modal h3 { font-family: 'Cormorant Garamond'; font-size: 22px; color: var(--navy); margin-bottom: 4px; }
+  .modal .msub { font-size: 12px; color: var(--muted); margin-bottom: 18px; }
+  .modal label { display: block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); margin: 13px 0 5px; }
+  .modal input { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; font-family: 'DM Sans'; font-size: 13px; }
+  .modal input:focus { outline: none; border-color: var(--gold); }
+  .modal-acts { display: flex; gap: 10px; margin-top: 22px; }
+  .modal-acts button { flex: 1; padding: 11px; border-radius: 8px; font-family: 'DM Sans'; font-size: 12.5px; font-weight: 700; cursor: pointer; border: none; }
+  .modal-salvar { background: var(--navy); color: #fff; }
+  .modal-salvar:hover { background: var(--gold); }
+  .modal-cancelar { background: #fdfcf9; color: var(--muted); border: 1px solid var(--line) !important; }
 
-    .extras {
-      font-size: 11.5px;
-      background: var(--bg-soft);
-      padding: 10px 12px;
-      border-radius: 4px;
-      color: var(--text-secondary);
-      line-height: 1.7;
-    }
-    .extras strong { color: var(--navy); font-weight: 600; }
-    .extras .citacao {
-      font-style: italic;
-      color: var(--navy);
-      border-left: 2px solid var(--gold);
-      padding-left: 10px;
-      margin-top: 6px;
-      display: block;
-      font-size: 12px;
-    }
-
-    .card-actions {
-      display: flex;
-      gap: 8px;
-      margin-top: auto;
-      padding-top: 10px;
-      border-top: 1px solid var(--line-soft);
-      align-items: center;
-    }
-    .card-action {
-      background: transparent;
-      border: 1px solid var(--line);
-      color: var(--text-secondary);
-      font-family: 'Montserrat', sans-serif;
-      font-size: 10px;
-      padding: 5px 11px;
-      border-radius: 3px;
-      cursor: pointer;
-      transition: all 0.15s;
-      letter-spacing: 0.5px;
-      text-transform: uppercase;
-      font-weight: 600;
-    }
-    .card-action:hover {
-      border-color: var(--gold);
-      color: var(--gold-dark);
-      background: var(--gold-pale);
-    }
-    /* Botao Excluir: variante destrutiva. Discreto em repouso, vermelho no hover */
-    .card-action.excluir:hover {
-      border-color: #b91c1c;
-      color: #b91c1c;
-      background: #fef2f2;
-    }
-    /* Botao Selecionar: variante de acao externa. Discreto em repouso, azul no hover */
-    .card-action.selecionar:hover {
-      border-color: #1d4ed8;
-      color: #1d4ed8;
-      background: #eff6ff;
-    }
-    /* Estado de sucesso: verde por 2 segundos apos POST OK */
-    .card-action.selecionar.sucesso,
-    .card-action.selecionar.sucesso:hover {
-      border-color: #16a34a;
-      color: #ffffff;
-      background: #16a34a;
-      cursor: default;
-    }
-    /* Estado de erro: vermelho discreto */
-    .card-action.selecionar.erro,
-    .card-action.selecionar.erro:hover {
-      border-color: #b91c1c;
-      color: #b91c1c;
-      background: #fef2f2;
-    }
-    .card-link {
-      color: var(--link);
-      text-decoration: none;
-      font-size: 11px;
-      font-weight: 600;
-      margin-left: auto;
-    }
-    .card-link:hover { text-decoration: underline; }
-
-    .empty {
-      text-align: center;
-      padding: 36px 20px;
-      color: var(--text-secondary);
-      background: var(--bg-card);
-      border-radius: 4px;
-      border: 1px dashed var(--line);
-    }
-    .empty p {
-      font-size: 13px;
-      max-width: 480px;
-      margin: 0 auto;
-      line-height: 1.5;
-    }
-
-    .toast {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      background: #3a3d42;
-      color: white;
-      padding: 14px 22px;
-      border-radius: 4px;
-      box-shadow: 0 6px 24px rgba(0,0,0,0.25);
-      font-size: 13px;
-      z-index: 200;
-      max-width: 420px;
-    }
-    .loading {
-      text-align: center;
-      padding: 40px 20px;
-      color: var(--text-secondary);
-    }
-    .spinner {
-      width: 32px;
-      height: 32px;
-      border: 3px solid var(--line);
-      border-top-color: var(--gold);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      margin: 0 auto 14px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    footer {
-      max-width: 1400px;
-      margin: 60px auto 30px;
-      padding: 20px 24px;
-      border-top: 1px solid var(--line);
-      text-align: center;
-      font-size: 11px;
-      color: var(--text-muted);
-      letter-spacing: 1px;
-    }
-
-    @media (max-width: 700px) {
-      .logo-img { height: 50px; }
-      .header-title { font-size: 17px; }
-      .header-subtitle { display: none; }
-      .header-text-block { padding-left: 12px; }
-      .cards-grid { grid-template-columns: 1fr; }
-      .btn { font-size: 10px; padding: 8px 12px; letter-spacing: 0.5px; }
-      .card-concurso-info { grid-template-columns: 1fr; }
-      .tier-desc { display: none; }
-    }
-  </style>
+  /* ===== Toast ===== */
+  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--navy); color: #fff; padding: 13px 22px; border-radius: 30px; font-size: 13px; font-weight: 600; box-shadow: 0 6px 20px rgba(0,0,0,0.25); z-index: 100; opacity: 0; transition: opacity 0.25s; }
+  .toast.show { opacity: 1; }
+</style>
 </head>
 <body>
-  <header>
-    <div class="header-inner">
-      <div class="header-left">
-        <img class="logo-img" src="/logo.png" alt="Silva Pinto Advocacia">
-        <div class="header-text-block">
-          <div class="header-title">Painel de Oportunidades</div>
-          <div class="header-subtitle">Captacao | Planejamento | Inteligencia</div>
-        </div>
-      </div>
-      <div class="btn-group">
-        <button class="btn btn-ghost" onclick="rodarTier(1)" id="btn-tier1">Coletar Tier 1</button>
-        <button class="btn" onclick="rodarCompleto()" id="btn-completo">Coletar Tudo</button>
-        <button class="btn btn-ghost" onclick="rodarDedupe()" id="btn-dedupe" title="Apaga registros duplicados do banco">Limpar duplicatas</button>
-      </div>
-    </div>
-  </header>
 
-  <div class="status-bar">
-    <div class="status-card tier1">
-      <div class="label">Tier 1 &mdash; Quente</div>
-      <div class="value" id="stat-tier1">-</div>
-    </div>
-    <div class="status-card tier2">
-      <div class="label">Tier 2 &mdash; Planejamento</div>
-      <div class="value" id="stat-tier2">-</div>
-    </div>
-    <div class="status-card tier3">
-      <div class="label">Tier 3 &mdash; Mercado</div>
-      <div class="value" id="stat-tier3">-</div>
-    </div>
-    <div class="status-card">
-      <div class="label">Total nao lidos</div>
-      <div class="value" id="stat-nao-lidos">-</div>
-    </div>
-    <div class="status-card">
-      <div class="label">Ultima coleta</div>
-      <div class="value small" id="stat-ultima">-</div>
+<div class="mockup-banner">
+  PROTOTIPO v7 &mdash; dados ficticios, nada conectado ainda. <b>Navegue pelas 3 telas no menu para validar o fluxo completo.</b>
+</div>
+
+<header>
+  <img src="data:image/png;base64,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" alt="Silva Pinto" style="height:52px;width:auto;flex-shrink:0;object-fit:contain;">
+  <div class="brand">
+    <h1 class="serif">Painel de Oportunidades</h1>
+    <div class="sub">Silva Pinto Advocacia</div>
+  </div>
+  <div class="search-wrap">
+    <div class="search-box">
+      <span class="icon">&#128269;</span>
+      <input type="text" placeholder="Pesquisar concurso ao vivo &#8212; ex: PMERJ, Receita, TJRJ..." onkeydown="if(event.key==='Enter')buscaAoVivo(this.value)">
+      <span class="hint">enter busca</span>
     </div>
   </div>
+</header>
 
-  <div class="global-filters">
-    <div class="filters">
-      <label><input type="checkbox" id="filtro-lidos"> mostrar lidos</label>
-      <label><input type="checkbox" id="filtro-janela-completa"> ver tudo (30 dias)</label>
-      <select id="filtro-estado">
-        <option value="">Todos os estados</option>
-        <option value="Brasil">Brasil (nacional)</option>
-        <option value="MG">MG</option>
-        <option value="ES">ES</option>
-        <option value="RJ">RJ</option>
-        <option value="SP">SP</option>
-        <option value="DF">DF</option>
-        <option value="BA">BA</option>
-        <option value="PE">PE</option>
-        <option value="RS">RS</option>
-        <option value="PR">PR</option>
-      </select>
-      <button class="card-action" onclick="limparExemplos()" style="margin-left:auto">Limpar exemplos</button>
+<nav class="mainnav">
+  <button class="active" onclick="showTela('concursos', this)">Concursos monitorados</button>
+  <button onclick="showTela('inbox', this)">Caixa de entrada <span class="nav-badge">5</span></button>
+  <button onclick="showTela('gerenciar', this)">Gerenciar concursos <span class="nav-badge cinza">3</span></button>
+</nav>
+
+<!-- conte&#250;do das telas vem na parte 2 -->
+<div id="telas-container"></div>
+
+<div class="modal-bg" id="modal-add">
+  <div class="modal">
+    <h3 class="serif">Monitorar novo concurso</h3>
+    <div class="msub">A coleta vai encaixar noticias neste concurso automaticamente (voce confirma na caixa de entrada).</div>
+    <label>Nome do concurso</label>
+    <input type="text" placeholder="ex: PMERJ 2026 - Soldado" id="add-nome">
+    <label>Banca</label>
+    <input type="text" placeholder="ex: FGV" id="add-banca">
+    <label>Palavras-chave (separadas por virgula)</label>
+    <input type="text" placeholder="ex: PMERJ, PM-RJ, Policia Militar RJ" id="add-kw">
+    <div class="modal-acts">
+      <button class="modal-cancelar" onclick="fecharModal()">Cancelar</button>
+      <button class="modal-salvar" onclick="salvarConcurso()">Monitorar</button>
     </div>
   </div>
+</div>
 
-  <div class="tier-section" id="tier-1">
-    <div class="tier-header">
-      <span class="tier-pill tier1">Tier 1</span>
-      <div class="tier-title">Captacao Imediata</div>
-      <div class="tier-desc">Eliminacoes ativas | TAF | Recursos &mdash; acionar em ate 6h</div>
+<div class="outro-menu" id="outro-menu">
+  <div class="outro-box">
+    <h3 class="serif">Encaixar em outro concurso</h3>
+    <div class="obsub">Escolha um concurso ja monitorado, ou crie um novo para esta noticia.</div>
+    <div class="outro-list" id="outro-list"></div>
+    <div class="outro-novo">
+      <input type="text" id="outro-novo-nome" placeholder="Criar novo: ex. PC-SP 2026 - Investigador">
+      <button onclick="criarEEncaixar()">Criar concurso e encaixar aqui</button>
     </div>
-    <div id="container-tier-1"><div class="loading"><div class="spinner"></div>Carregando...</div></div>
+    <div class="outro-fechar"><button onclick="fecharOutro()">Cancelar</button></div>
   </div>
+</div>
 
-  <div class="tier-section" id="tier-2">
-    <div class="tier-header">
-      <span class="tier-pill tier2">Tier 2</span>
-      <div class="tier-title">Planejamento</div>
-      <div class="tier-desc">Novos concursos | Jurisprudencia &mdash; estrategia de medio prazo</div>
-    </div>
-    <div id="container-tier-2"></div>
-  </div>
+<div class="toast" id="toast"></div>
 
-  <div class="tier-section" id="tier-3" style="margin-bottom: 60px;">
-    <div class="tier-header">
-      <span class="tier-pill tier3">Tier 3</span>
-      <div class="tier-title">Inteligencia de Mercado</div>
-      <div class="tier-desc">Sentimento | Concorrencia &mdash; ideias para conteudo</div>
-    </div>
-    <div id="container-tier-3"></div>
-  </div>
+<script>
+  // ===== v7: API-CONNECTED JS =====
+  // Constantes de integracao com sistema de marketing
+  const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/selecionados/adicionar-externo';
+  // TODO: preencher quando tiver a rota do endpoint de concursos do marketing
+  const CONCURSOS_MKT_ENDPOINT = '';  // ex: 'https://silvapinto-comercial.onrender.com/marketing/concursos/adicionar-externo'
 
-  <footer>
-    Silva Pinto Advocacia &middot; OAB/RJ n&ordm; 189.781 &middot; Sistema Interno
-  </footer>
+  const PRIO_COR = { urgente: '#c0392b', importante: '#BB904C', naourgente: '#2e9e5b' };
+  const PRIO_LABEL = { urgente: 'Urgente', importante: 'Importante', naourgente: 'Nao urgente' };
+  const PRIO_ORDEM = ['urgente','importante','naourgente'];
+  const TAG_CSS = { gabarito:'t-gabarito', recurso:'t-recurso', fase:'t-fase', nomeacao:'t-nomeacao', inscricao:'t-inscricao' };
 
-  <script>
-    let mostrarLidos = false;
-    let janelaCompleta = false;
-    let filtroEstado = "";
+  function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function tn(s) { return String(s||'').replace(/[^\w\s]/g,' ').replace(/\s+/g,' ').trim().toLowerCase(); }
 
-    // Cache global de itens carregados, indexado por id.
-    // Usado pelos botoes do card que precisam acessar os dados completos (Selecionar etc).
-    const itensPorId = {};
+  // ===== TOAST =====
+  let _tt;
+  function toast(msg, ms) {
+    const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show');
+    clearTimeout(_tt); _tt=setTimeout(()=>t.classList.remove('show'), ms||2800);
+  }
 
-    document.getElementById('filtro-lidos').addEventListener('change', e => {
-      mostrarLidos = e.target.checked;
-      carregarTudo();
-    });
-    document.getElementById('filtro-janela-completa').addEventListener('change', e => {
-      janelaCompleta = e.target.checked;
-      carregarTudo();
-    });
-    document.getElementById('filtro-estado').addEventListener('change', e => {
-      filtroEstado = e.target.value;
-      carregarTudo();
-    });
+  // ===== API helpers =====
+  async function api(path, opts) {
+    try {
+      const r = await fetch(path, opts);
+      return await r.json();
+    } catch(e) { toast('Erro de rede: '+e.message); return {erro:e.message}; }
+  }
+  const GET = (p) => api(p);
+  const POST = (p,b) => api(p, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+  const PATCH = (p,b) => api(p, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+  const DEL = (p) => api(p, {method:'DELETE'});
 
-    function toast(msg, ms) {
-      ms = ms || 4000;
-      const el = document.createElement('div');
-      el.className = 'toast';
-      el.textContent = msg;
-      document.body.appendChild(el);
-      setTimeout(() => el.remove(), ms);
+  // ===== NAVEGACAO =====
+  let telAtual = 'concursos';
+  function showTela(qual, btn) {
+    telAtual = qual;
+    document.querySelectorAll('.mainnav button').forEach(b=>b.classList.remove('active'));
+    if(btn) btn.classList.add('active');
+    if(qual==='concursos') renderTelaConcursos();
+    else if(qual==='inbox') renderTelaInbox();
+    else if(qual==='gerenciar') renderTelaGerenciar();
+  }
+
+  // ===== TELA 1: CONCURSOS MONITORADOS (fichas vivas + sidebar temas) =====
+  async function renderTelaConcursos() {
+    const cont = document.getElementById('telas-container');
+    cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando...</div>';
+    const [cData, tData] = await Promise.all([
+      GET('/api/concursos'),
+      GET('/api/oportunidades?status_triagem=transversal&incluir_lidos=1&dias=90&limite=20')
+    ]);
+    const concursos = (cData.concursos||[]);
+    const temas = (tData.itens||[]);
+    // Para cada concurso, busca suas noticias confirmadas
+    for(const c of concursos) {
+      const nd = await GET('/api/oportunidades?concurso_id='+c.id+'&status_triagem=confirmado&incluir_lidos=1&dias=90&limite=30');
+      c.noticias = nd.itens || [];
+    }
+    // Ordena por prioridade (urgente primeiro)
+    concursos.sort((a,b) => PRIO_ORDEM.indexOf(a.prioridade) - PRIO_ORDEM.indexOf(b.prioridade));
+
+    let fichasHtml = '';
+    if(!concursos.length) {
+      fichasHtml = '<div style="padding:40px;text-align:center;color:var(--cinza)">Nenhum concurso monitorado ainda. Va em \"Gerenciar concursos\" para adicionar.</div>';
+    }
+    for(const c of concursos) {
+      const novas = c.noticias.filter(n=>n.eh_novo).length;
+      const aberta = novas > 0 ? 'aberta' : '';
+      const cor = PRIO_COR[c.prioridade]||PRIO_COR.importante;
+      const headClass = c.prioridade || 'importante';
+      let nots = '';
+      for(const n of c.noticias) {
+        const cat = (n.categoria||'').replace('elim_ativas','gabarito').replace('taf_fases','fase').replace('recurso_anulacao','recurso').replace('radar_volume','inscricao');
+        const tagCss = TAG_CSS[cat] || 'ntag';
+        const tagLabel = cat.charAt(0).toUpperCase()+cat.slice(1);
+        const gerado = n.selecionado_marketing ? true : false;
+        nots += '<div class="linha"><span class="ntag '+tagCss+'">'+esc(tagLabel)+'</span><div class="ntexto">' +
+          '<div class="nt">'+esc(n.titulo)+'</div><div class="nd">'+esc(n.descricao||'').substring(0,200)+'</div>' +
+          '<div class="nacts">' +
+          (gerado ? '<button class="mini feito" disabled>&#10003; No pipeline</button>' :
+            '<button class="mini gerar" onclick="gerarConteudo('+n.id+',this)">&#9998; Gerar conteudo</button>') +
+          (n.link ? '<a class="mini" href="'+esc(n.link)+'" target="_blank" rel="noopener">Ver fonte</a>' : '') +
+          '<button class="mini" onclick="excluirItem('+n.id+',this)">Excluir</button>' +
+          '</div></div></div>';
+      }
+      if(!c.noticias.length) nots = '<div style="padding:16px 0;color:var(--cinza);font-size:13px">Nenhuma noticia encaixada ainda neste concurso.</div>';
+      fichasHtml += '<div class="ficha '+aberta+'" data-id="'+c.id+'">' +
+        '<div class="ficha-head '+headClass+'" onclick="toggleFicha(this)">' +
+        '<span class="chev">&#9656;</span>' +
+        '<div class="ficha-tit"><h3 class="serif">'+esc(c.nome)+'</h3>' +
+        '<div class="meta">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas &middot; '+c.noticias.length+' noticia(s)</div></div>' +
+        (novas > 0 ? '<span class="novelty"><span class="dot"></span> '+novas+' novas</span>' : '') +
+        '<button class="stage-dot" title="'+PRIO_LABEL[c.prioridade]+'" style="background:'+cor+'" onclick="event.stopPropagation();ciclarPrio('+c.id+',this)"></button>' +
+        '</div><div class="ficha-body">'+nots+'</div></div>';
     }
 
-    function fmtData(iso) {
-      if (!iso) return '-';
-      try {
-        const d = new Date(iso);
-        return d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-      } catch (e) { return iso.substring(0, 16); }
+    let temasHtml = '';
+    for(const t of temas) {
+      const kind = t.tipo_transversal || 'jurisprudencia';
+      const kindLabel = kind==='jurisprudencia'?'Jurisprudencia':kind==='concorrencia'?'Concorrencia':'Tendencia';
+      temasHtml += '<div class="sitem"><div class="sk '+kind+'">'+kindLabel+'</div>' +
+        '<div class="si-title">'+esc(t.titulo)+'</div>' +
+        (t.link ? '<a class="mini" href="'+esc(t.link)+'" target="_blank" style="font-size:10px">Ver fonte</a> ' : '') +
+        '<button class="mini gerar" onclick="gerarConteudo('+t.id+',this)" style="font-size:10px">&#9998; Gerar</button></div>';
     }
+    if(!temasHtml) temasHtml = '<div style="color:var(--cinza);font-size:12px;padding:14px 0">Nenhum tema transversal recente.</div>';
 
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str).replace(/[&<>"']/g, c => ({
-        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-      }[c]));
+    cont.innerHTML = '<div class="tela active">' +
+      '<div class="legenda"><span><span class="sq" style="background:var(--urgente)"></span>Urgente</span>' +
+      '<span><span class="sq" style="background:var(--importante)"></span>Importante</span>' +
+      '<span><span class="sq" style="background:var(--naourgente)"></span>Nao urgente</span>' +
+      '<span style="margin-left:auto;font-style:italic;font-size:10px">Clique na bolinha para alternar</span></div>' +
+      '<div class="split"><div class="split-main">'+fichasHtml+'</div>' +
+      '<aside class="side"><h4 class="serif">Temas do momento</h4>' +
+      '<div class="side-sub">Jurisprudencia, concorrencia e tendencias (transversais).</div>' +
+      temasHtml+'</aside></div></div>';
+  }
+
+  // ===== TELA 2: CAIXA DE ENTRADA =====
+  async function renderTelaInbox() {
+    const cont = document.getElementById('telas-container');
+    cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando...</div>';
+    const data = await GET('/api/inbox');
+    const encaixes = data.encaixes || [];
+    const novos = data.novos || [];
+
+    let encHtml = '';
+    for(const e of encaixes) {
+      encHtml += '<div class="triagem-card" data-id="'+e.id+'">' +
+        '<div class="tc-main"><div class="tc-tit">'+esc(e.titulo)+'</div>' +
+        '<div class="tc-sug">Parece ser de: <b>'+esc(e.sugestao_concurso)+'</b></div></div>' +
+        '<div class="tc-acts">' +
+        '<button class="btn-conf" onclick="confirmarEnc('+e.id+')">Confirmar</button>' +
+        '<button class="btn-outro" onclick="abrirOutro('+e.id+')">Outro concurso</button>' +
+        '<button class="btn-rej" onclick="excluirEnc('+e.id+')">Excluir</button>' +
+        '</div></div>';
     }
+    if(!encHtml) encHtml = '<div style="color:var(--cinza);font-size:13px">Nenhum encaixe pendente.</div>';
 
-    async function carregarStatus() {
-      try {
-        const r = await fetch('/api/status');
-        const data = await r.json();
-        document.getElementById('stat-nao-lidos').textContent = data.nao_lidos;
-        if (data.tier_counts) {
-          document.getElementById('stat-tier1').textContent = data.tier_counts.tier1 || 0;
-          document.getElementById('stat-tier2').textContent = data.tier_counts.tier2 || 0;
-          document.getElementById('stat-tier3').textContent = data.tier_counts.tier3 || 0;
-        }
-        if (data.ultima_execucao) {
-          const ue = data.ultima_execucao;
-          let txt = fmtData(ue.data_execucao) + ' | ' + ue.itens_novos + ' novos';
-          if (ue.tipo_run) txt += ' (' + ue.tipo_run + ')';
-          if (!ue.sucesso) txt += ' [com erros]';
-          document.getElementById('stat-ultima').textContent = txt;
-        } else {
-          document.getElementById('stat-ultima').textContent = 'Aguardando coleta';
-        }
-      } catch (e) { console.error(e); }
+    let novHtml = '';
+    for(const n of novos) {
+      novHtml += '<div class="triagem-card sug-monit" data-id="sug-'+n.id+'">' +
+        '<div class="tc-main"><div class="tc-tit">'+esc(n.nome_exibicao)+'</div>' +
+        '<div class="tc-sug">Apareceu <b>'+n.vezes+'x</b> &middot; '+esc(n.ultima_evidencia||'')+'</div></div>' +
+        '<div class="tc-acts"><button class="btn-conf" onclick="monitorarSug('+n.id+')">Monitorar</button>' +
+        '<button class="btn-rej" onclick="ignorarSug('+n.id+')">Ignorar</button></div></div>';
     }
+    if(!novHtml) novHtml = '<div style="color:var(--cinza);font-size:13px">Nenhuma sugestao de concurso novo.</div>';
 
-    async function carregarTier(tier) {
-      const container = document.getElementById('container-tier-' + tier);
-      const params = new URLSearchParams();
-      params.set('tier', tier);
-      if (mostrarLidos) params.set('incluir_lidos', '1');
-      if (filtroEstado) params.set('estado', filtroEstado);
-      if (janelaCompleta) params.set('dias', '30');
-      // se janelaCompleta = false, backend usa default 7 dias
+    // Atualiza badge de contagem na nav
+    const badge = document.querySelector('.mainnav .nav-badge');
+    if(badge) badge.textContent = (encaixes.length + novos.length);
 
-      try {
-        const r = await fetch('/api/oportunidades?' + params);
-        const data = await r.json();
-        renderizarTier(container, data.itens, tier);
-      } catch (e) {
-        container.innerHTML = '<div class="empty"><p>Erro ao carregar.</p></div>';
-      }
-    }
-
-    function renderizarTier(container, itens, tier) {
-      // Popula o cache global pra que os botoes do card (Selecionar, etc) acessem
-      // os dados completos pelo id.
-      for (const it of itens) {
-        if (it && typeof it.id !== 'undefined') itensPorId[it.id] = it;
-      }
-
-      if (!itens.length) {
-        let parts = [];
-        if (!mostrarLidos) parts.push('nao lidos');
-        if (!janelaCompleta) parts.push('dos ultimos 7 dias');
-        const filtro_str = parts.join(' ');
-        let msg = 'Nenhum item' + (filtro_str ? ' ' + filtro_str : '') + '. ';
-        if (tier === 1) msg += 'Tier 1 atualiza 4x ao dia.';
-        else msg += 'Tier 2 e 3 atualizam 2x ao dia.';
-        msg += ' Marque \"ver tudo\" ou \"mostrar lidos\" para ampliar.';
-        container.innerHTML = '<div class="empty"><p>' + msg + '</p></div>';
-        return;
-      }
-
-      if (tier === 1 || tier === 2) {
-        const apos = itens.filter(i => i.etapa_concurso === 'apos_prova');
-        const antes = itens.filter(i => i.etapa_concurso === 'antes_prova');
-        const semEtapa = itens.filter(i => !i.etapa_concurso);
-
-        let html = '';
-        if (apos.length) {
-          html += '<div class="phase-divider apos">Apos primeira etapa &middot; ' + apos.length + '</div>';
-          html += '<div class="cards-grid">' + apos.map(renderCard).join('') + '</div>';
-        }
-        if (antes.length) {
-          html += '<div class="phase-divider antes">Antes da prova objetiva &middot; ' + antes.length + '</div>';
-          html += '<div class="cards-grid">' + antes.map(renderCard).join('') + '</div>';
-        }
-        if (semEtapa.length) {
-          if (apos.length || antes.length) html += '<div class="phase-divider">Outros &middot; ' + semEtapa.length + '</div>';
-          html += '<div class="cards-grid">' + semEtapa.map(renderCard).join('') + '</div>';
-        }
-        container.innerHTML = html;
-      } else {
-        container.innerHTML = '<div class="cards-grid">' + itens.map(renderCard).join('') + '</div>';
-      }
-    }
-
-    function renderCard(item) {
-      // Espectro arco-iris invertido: r10 vermelho, r1 azul
-      let r = parseInt(item.relevancia, 10);
-      if (isNaN(r) || r < 1) r = 1;
-      if (r > 10) r = 10;
-      const relClass = 'r' + r;
-
-      const flagSafe = (item.flag || '').replace(/[^A-Z]/g, '');
-      let flagPretty = (item.flag || '').replace('CONCORRENCIA', 'CONCORR.');
-      if (item.flag === 'FASE' && item.extras && item.extras.fase_eliminacao) {
-        flagPretty = String(item.extras.fase_eliminacao).toUpperCase().substring(0, 18);
-      }
-
-      const isConcurso = (item.tier === 1 || item.tier === 2) && (item.vagas || item.salario || item.concurso);
-      let concursoBlock = '';
-      if (isConcurso && (item.vagas || item.salario)) {
-        const vagasHtml = item.vagas
-          ? '<div class="info-value">' + escapeHtml(item.vagas) + '</div>'
-          : '<div class="info-value muted">nao informado</div>';
-        const salarioHtml = item.salario
-          ? '<div class="info-value">' + escapeHtml(item.salario) + '</div>'
-          : '<div class="info-value muted">nao informado</div>';
-        concursoBlock =
-          '<div class="card-concurso-info">' +
-            '<div class="info-block"><div class="info-label">Vagas</div>' + vagasHtml + '</div>' +
-            '<div class="info-block"><div class="info-label">Salario</div>' + salarioHtml + '</div>' +
-          '</div>';
-      }
-
-      // Layout do titulo varia por categoria
-      let titleArea;
-      if (item.categoria === 'jurisprudencia') {
-        // Para jurisprudencia: titulo da materia em destaque, concurso/contexto embaixo menor
-        titleArea = '<div class="card-title">' + escapeHtml(item.titulo) + '</div>';
-        const subParts = [];
-        if (item.concurso) subParts.push(item.concurso);
-        if (item.cargo) subParts.push(item.cargo);
-        if (subParts.length) {
-          titleArea += '<div class="card-subtitle">' + escapeHtml(subParts.join(' \u00B7 ')) + '</div>';
-        }
-      } else if (item.concurso) {
-        // Padrao: nome do concurso primeiro, titulo da materia embaixo
-        const cargoStr = item.cargo ? ' &middot; ' + escapeHtml(item.cargo) : '';
-        titleArea = '<div class="card-title">' + escapeHtml(item.concurso) + cargoStr + '</div>';
-        if (item.titulo && item.titulo !== item.concurso) {
-          titleArea += '<div class="card-subtitle">' + escapeHtml(item.titulo) + '</div>';
-        }
-      } else {
-        titleArea = '<div class="card-title">' + escapeHtml(item.titulo) + '</div>';
-      }
-
-      const badges = [];
-      if (item.estado) badges.push('<span class="badge estado">' + escapeHtml(item.estado) + '</span>');
-      if (item.banca) badges.push('<span class="badge banca">' + escapeHtml(item.banca) + '</span>');
-      if (item.fase_atual) badges.push('<span class="badge fase">' + escapeHtml(item.fase_atual) + '</span>');
-      if (item.prazo_inscricao) badges.push('<span class="badge fase">Inscr.: ' + escapeHtml(item.prazo_inscricao) + '</span>');
-      if (item.data_prova) badges.push('<span class="badge">Prova: ' + escapeHtml(item.data_prova) + '</span>');
-      if (item.data_publicacao) badges.push('<span class="badge data">' + escapeHtml(item.data_publicacao) + '</span>');
-
-      // Metricas reais (YouTube/Reddit)
-      let metricasBlock = '';
-      if (item.metricas) {
-        const m = item.metricas;
-        const partes = [];
-        if (m.fonte === 'youtube') {
-          partes.push('<span class="met-source">YouTube</span>');
-          if (m.views !== null && m.views !== undefined) partes.push('<span><span class="met-label">Views:</span> ' + Number(m.views).toLocaleString('pt-BR') + '</span>');
-          if (m.likes !== null && m.likes !== undefined) partes.push('<span><span class="met-label">Likes:</span> ' + Number(m.likes).toLocaleString('pt-BR') + '</span>');
-          if (m.comments !== null && m.comments !== undefined) partes.push('<span><span class="met-label">Coment.:</span> ' + Number(m.comments).toLocaleString('pt-BR') + '</span>');
-          if (m.published_at) partes.push('<span><span class="met-label">Publicado:</span> ' + escapeHtml(m.published_at) + '</span>');
-          if (m.channel) partes.push('<span><span class="met-label">Canal:</span> ' + escapeHtml(m.channel) + '</span>');
-        } else if (m.fonte === 'reddit') {
-          partes.push('<span class="met-source">Reddit</span>');
-          if (m.subreddit) partes.push('<span class="met-label">' + escapeHtml(m.subreddit) + '</span>');
-          if (m.score !== null && m.score !== undefined) partes.push('<span><span class="met-label">Score:</span> ' + Number(m.score).toLocaleString('pt-BR') + '</span>');
-          if (m.upvotes !== null && m.upvotes !== undefined) partes.push('<span><span class="met-label">Upvotes:</span> ' + Number(m.upvotes).toLocaleString('pt-BR') + '</span>');
-          if (m.comments !== null && m.comments !== undefined) partes.push('<span><span class="met-label">Coment.:</span> ' + Number(m.comments).toLocaleString('pt-BR') + '</span>');
-          if (m.published_at) partes.push('<span><span class="met-label">Publicado:</span> ' + escapeHtml(m.published_at) + '</span>');
-        }
-        if (partes.length) {
-          metricasBlock = '<div class="metricas-reais">' + partes.join(' ') + '</div>';
-        }
-      }
-
-      let extrasBlock = '';
-      if (item.extras && Object.keys(item.extras).length) {
-        const extrasParts = [];
-        for (const [k, v] of Object.entries(item.extras)) {
-          if (!v) continue;
-          if (k === 'citacao_candidato') {
-            extrasParts.push('<div class="citacao">"' + escapeHtml(v) + '"</div>');
-          } else {
-            const labelMap = {
-              'candidatos_estimados': 'Eliminados (est.)',
-              'fase_eliminacao': 'Fase',
-              'tipo_irregularidade': 'Tipo',
-              'questao_numero': 'Questao',
-              'afetados_estimados': 'Afetados',
-              'tribunal': 'Tribunal',
-              'tema': 'Tema',
-              'numero_processo': 'Processo',
-              'tese': 'Tese',
-              'concurso_mencionado': 'Concurso',
-              'padrao_emocional': 'Padrao',
-              'escritorio_concorrente': 'Concorrente',
-              'concurso_tema': 'Tema',
-              'gap_identificado': 'Gap',
-            };
-            extrasParts.push('<strong>' + (labelMap[k] || k) + ':</strong> ' + escapeHtml(v));
-          }
-        }
-        if (extrasParts.length) {
-          extrasBlock = '<div class="extras">' + extrasParts.join(' &middot; ') + '</div>';
-        }
-      }
-
-      const linkHtml = item.link ?
-        '<a class="card-link" href="' + escapeHtml(item.link) + '" target="_blank" rel="noopener">Ver fonte &rarr;</a>' : '';
-
-      // Botao Notas - varia se ja tem nota
-      const notasCount = parseInt(item.notas_count || 0, 10);
-      const notasClass = notasCount > 0 ? 'card-action notas tem-notas' : 'card-action notas';
-      const notasLabel = notasCount > 0 ? ('Notas (' + notasCount + ')') : 'Notas';
-
-      // Painel de notas (escondido por padrao)
-      const notasPanel =
-        '<div class="notas-panel" id="notas-panel-' + item.id + '">' +
-          '<textarea class="notas-textarea" id="nota-input-' + item.id + '" maxlength="500" placeholder="Escreva uma nota (max 500 caracteres)..." oninput="atualizarContador(' + item.id + ')"></textarea>' +
-          '<div class="notas-bottom">' +
-            '<span class="notas-counter" id="contador-' + item.id + '">0/500</span>' +
-            '<button class="notas-btn-salvar" onclick="salvarNota(' + item.id + ')">Salvar nota</button>' +
-          '</div>' +
-          '<div class="notas-lista" id="notas-lista-' + item.id + '"></div>' +
-        '</div>';
-
-      // Selo NOVO no topo central, se item da ultima coleta
-      const seloNovo = item.eh_novo ? '<div class="selo-novo">Novo</div>' : '';
-
-      return '<div class="card tier' + item.tier + '" data-id="' + item.id + '">' +
-        seloNovo +
-        '<div class="card-flag-row">' +
-          '<span class="flag-badge ' + flagSafe + '">' + escapeHtml(flagPretty) + '</span>' +
-          '<span class="relevancia ' + relClass + '">' + item.relevancia + '/10</span>' +
-        '</div>' +
-        titleArea +
-        concursoBlock +
-        (badges.length ? '<div class="card-meta">' + badges.join('') + '</div>' : '') +
-        '<div class="card-desc">' + escapeHtml(item.descricao || '') + '</div>' +
-        metricasBlock +
-        extrasBlock +
-        '<div class="card-actions">' +
-          '<button class="card-action" onclick="marcarLido(' + item.id + ')">Lido</button>' +
-          '<button class="card-action excluir" onclick="excluir(' + item.id + ')" title="Apaga permanentemente do banco">Excluir</button>' +
-          (item.selecionado_marketing
-            ? '<button class="card-action selecionar sucesso" id="btn-sel-' + item.id + '" disabled title="Ja enviado ao sistema comercial">&#10003; Selecionado</button>'
-            : '<button class="card-action selecionar" onclick="selecionarMarketing(' + item.id + ', this)" id="btn-sel-' + item.id + '" title="Adiciona como oportunidade no sistema comercial">&rarr; Marcar Concurso</button>'
-          ) +
-          '<button class="card-action" onclick="gerarConteudo(' + item.id + ', this)" title="Envia card completo para Conteudo a ser Produzido">&#128203; Gerar Conteudo</button>' +
-          '<button class="' + notasClass + '" onclick="toggleNotas(' + item.id + ')" id="btn-notas-' + item.id + '">' + notasLabel + '</button>' +
-          linkHtml +
-        '</div>' +
-        notasPanel +
+    cont.innerHTML = '<div class="tela active">' +
+      '<div class="inbox-grupo"><h3 class="serif">Encaixes a confirmar <span class="nav-badge">'+encaixes.length+'</span></h3>' +
+      '<div class="gsub">Noticias que parecem ser de concursos monitorados. Confirme para entrarem na ficha.</div>'+encHtml+'</div>' +
+      '<div class="inbox-grupo"><h3 class="serif">Concursos novos sugeridos <span class="nav-badge cinza">'+novos.length+'</span></h3>' +
+      '<div class="gsub">Concursos que apareceram varias vezes. Vale acompanhar?</div>'+novHtml+'</div>' +
+      '<div style="margin-top:20px"><button class="add-btn" onclick="rodarTriagemRetroativa()">Rodar triagem retroativa (acervo antigo)</button></div>' +
       '</div>';
+  }
+
+  // ===== TELA 3: GERENCIAR CONCURSOS =====
+  async function renderTelaGerenciar() {
+    const cont = document.getElementById('telas-container');
+    cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando...</div>';
+    const data = await GET('/api/concursos');
+    const concursos = data.concursos || [];
+
+    let cards = '';
+    for(const c of concursos) {
+      const cor = PRIO_COR[c.prioridade]||PRIO_COR.importante;
+      const kws = (c.palavras_chave||'').split(',').filter(k=>k.trim()).map(k=>'<span class="kw">'+esc(k.trim())+'</span>').join('');
+      cards += '<div class="monit-card"><h4 class="serif">'+esc(c.nome)+'</h4>' +
+        '<div class="mc-meta">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas</div>' +
+        '<div>'+kws+'</div>' +
+        '<div class="mc-foot"><span class="mc-count">'+c.noticias_count+' noticia(s)</span>' +
+        '<button class="mini" style="color:#b23b32;border-color:#b23b32" onclick="excluirConcurso('+c.id+',\''+esc(c.nome)+'\')">Excluir</button>' +
+        '<button class="stage-dot" title="'+PRIO_LABEL[c.prioridade]+'" style="background:'+cor+'" onclick="ciclarPrio('+c.id+',this)"></button>' +
+        '</div></div>';
     }
+    if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso monitorado. Adicione o primeiro!</div>';
 
-    // ===== NOTAS =====
+    cont.innerHTML = '<div class="tela active">' +
+      '<div class="add-bar"><button class="add-btn" onclick="abrirModal()">+ Monitorar novo concurso</button></div>' +
+      '<div class="monit-grid">'+cards+'</div></div>';
+  }
 
-    async function toggleNotas(id) {
-      const panel = document.getElementById('notas-panel-' + id);
-      if (!panel) return;
-      const aberto = panel.classList.contains('aberto');
-      if (aberto) {
-        panel.classList.remove('aberto');
-        return;
-      }
-      panel.classList.add('aberto');
-      // Carrega lista de notas
-      await carregarNotas(id);
+  // ===== ACOES =====
+  function toggleFicha(head) { head.closest('.ficha').classList.toggle('aberta'); }
+
+  async function ciclarPrio(cid, btn) {
+    const cur = PRIO_ORDEM.find(p=>PRIO_COR[p]===btn.style.background.includes(PRIO_COR[p])) || 'importante';
+    // Detecta prioridade atual pelo titulo
+    const curTitle = (btn.title||'').toLowerCase();
+    let idx = PRIO_ORDEM.findIndex(p=>curTitle.includes(p));
+    if(idx<0) idx = 1;
+    const nova = PRIO_ORDEM[(idx+1)%PRIO_ORDEM.length];
+    const r = await POST('/api/concursos/'+cid+'/prioridade', {prioridade:nova});
+    if(r.ok) {
+      btn.style.background = PRIO_COR[nova];
+      btn.title = PRIO_LABEL[nova];
+      const head = btn.closest('.ficha-head');
+      if(head) { PRIO_ORDEM.forEach(p=>head.classList.remove(p)); head.classList.add(nova); }
+      toast('Prioridade: '+PRIO_LABEL[nova]);
+      // TODO: quando CONCURSOS_MKT_ENDPOINT estiver definido, atualizar etapa no marketing
     }
+  }
 
-    async function carregarNotas(id) {
-      try {
-        const r = await fetch('/api/oportunidades/' + id + '/notas');
-        const data = await r.json();
-        const lista = document.getElementById('notas-lista-' + id);
-        if (!lista) return;
-        if (!data.notas || data.notas.length === 0) {
-          lista.innerHTML = '<div style="font-size:11px;color:var(--text-muted);font-style:italic;padding:6px 0">Nenhuma nota ainda.</div>';
-          return;
-        }
-        lista.innerHTML = data.notas.map(n => {
-          const dt = formatarDataNota(n.data_criacao);
-          return '<div class="nota-item">' +
-            '<div class="nota-conteudo">' +
-              escapeHtml(n.texto) +
-              '<div class="nota-meta">' + dt + '</div>' +
-            '</div>' +
-            '<button class="nota-deletar" onclick="deletarNota(' + n.id + ', ' + id + ')" title="Apagar nota">&times;</button>' +
-          '</div>';
-        }).join('');
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
-    function formatarDataNota(iso) {
-      if (!iso) return '';
-      try {
-        const d = new Date(iso);
-        return d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-      } catch (e) { return iso.substring(0, 16); }
-    }
-
-    function atualizarContador(id) {
-      const input = document.getElementById('nota-input-' + id);
-      const counter = document.getElementById('contador-' + id);
-      if (!input || !counter) return;
-      const len = input.value.length;
-      counter.textContent = len + '/500';
-      counter.classList.toggle('warn', len > 450);
-    }
-
-    async function salvarNota(id) {
-      const input = document.getElementById('nota-input-' + id);
-      if (!input) return;
-      const texto = input.value.trim();
-      if (!texto) { toast('Escreva algo antes de salvar'); return; }
-      try {
-        const r = await fetch('/api/oportunidades/' + id + '/notas', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ texto })
-        });
-        const data = await r.json();
-        if (data.erro) { toast('Erro: ' + data.erro); return; }
-        input.value = '';
-        atualizarContador(id);
-        await carregarNotas(id);
-        // Atualiza o botao com novo contador
-        atualizarBotaoNotas(id);
-      } catch (e) {
-        toast('Erro ao salvar nota');
-      }
-    }
-
-    async function deletarNota(notaId, opId) {
-      if (!confirm('Apagar esta nota?')) return;
-      try {
-        await fetch('/api/notas/' + notaId, { method: 'DELETE' });
-        await carregarNotas(opId);
-        atualizarBotaoNotas(opId);
-      } catch (e) {
-        toast('Erro ao apagar');
-      }
-    }
-
-    async function atualizarBotaoNotas(id) {
-      // Recontagem rapida buscando a lista
-      try {
-        const r = await fetch('/api/oportunidades/' + id + '/notas');
-        const data = await r.json();
-        const btn = document.getElementById('btn-notas-' + id);
-        if (!btn) return;
-        const total = data.total || 0;
-        if (total > 0) {
-          btn.classList.add('tem-notas');
-          btn.textContent = 'Notas (' + total + ')';
-        } else {
-          btn.classList.remove('tem-notas');
-          btn.textContent = 'Notas';
-        }
-      } catch (e) { /* ignora */ }
-    }
-
-    async function marcarLido(id) {
-      try {
-        await fetch('/api/oportunidades/' + id + '/marcar_lido', { method: 'POST' });
-        const card = document.querySelector('.card[data-id="' + id + '"]');
-        if (card) card.remove();
-        carregarStatus();
-      } catch (e) { toast('Erro ao marcar'); }
-    }
-
-    async function excluir(id) {
-      if (!confirm('EXCLUIR este item permanentemente?\n\nIsso apaga do banco de dados e NAO pode ser desfeito. Use apenas para itens claramente irrelevantes ou errados.')) return;
-      try {
-        const r = await fetch('/api/oportunidades/' + id, { method: 'DELETE' });
-        if (!r.ok) {
-          const err = await r.json().catch(() => ({}));
-          toast('Erro: ' + (err.erro || r.status));
-          return;
-        }
-        const card = document.querySelector('.card[data-id="' + id + '"]');
-        if (card) card.remove();
-        carregarStatus();
-      } catch (e) { toast('Erro ao excluir'); }
-    }
-
-    // ===== SELECIONAR (integracao com sistema comercial externo) =====
-    //
-    // Envia o item como nova oportunidade no sistema comercial em
-    // https://silvapinto-comercial.onrender.com.
-    //
-    // Mapeamento de campos:
-    //   nome   <- concurso (fallback: titulo)
-    //   banca  <- banca
-    //   orgao  <- orgao
-    //   vagas  <- vagas
-    //   zona   <- "yellow" (constante, conforme spec)
-    //
-    // Comportamento: apos sucesso o botao fica verde e DESABILITADO permanentemente
-    // (estado persistido no banco via /api/oportunidades/{id}/marcar_selecionado).
-    // Proxima carga da pagina ja renderiza ele assim. Em erro: 4s em vermelho + toast.
-    const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/concursos/adicionar-externo';
-    const CONTEUDO_ENDPOINT = 'https://silvapinto-comercial.onrender.com/api/conteudo/criar-externo';
-
-    async function selecionarMarketing(id, btn) {
-      if (!btn) btn = document.getElementById('btn-sel-' + id);
-      if (!btn || btn.disabled) return;
-      const item = itensPorId[id];
-      if (!item) { toast('Item nao encontrado em cache. Recarregue a pagina.'); return; }
-
+  async function gerarConteudo(itemId, btn) {
+    btn.disabled=true; btn.textContent='Enviando...';
+    try {
+      // Busca dados do item
+      const d = await GET('/api/oportunidades?incluir_lidos=1&dias=365&limite=1&concurso_id='+itemId);
+      let item = (d.itens||[])[0];
+      if(!item) { const d2 = await GET('/api/oportunidades?incluir_lidos=1&dias=365&limite=500'); item = (d2.itens||[]).find(i=>i.id===itemId); }
       const payload = {
-        nome: String(item.concurso || item.titulo || '').trim(),
-        banca: String(item.banca || '').trim(),
-        orgao: String(item.orgao || '').trim(),
-        zona: 'yellow',
-        vagas: String(item.vagas || '').trim(),
+        nome: String((item&&item.concurso)||'').trim() || String((item&&item.titulo)||'').trim(),
+        banca: String((item&&item.banca)||'').trim(),
+        orgao: String((item&&item.orgao)||'').trim(),
+        zona: 'yellow', vagas: String((item&&item.vagas)||'').trim(),
+        destino: 'pipeline',
       };
+      const r = await fetch(SELECIONAR_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      if(r.ok) {
+        await POST('/api/oportunidades/'+itemId+'/marcar_selecionado');
+        btn.className='mini feito'; btn.innerHTML='&#10003; No pipeline'; toast('Enviado ao pipeline');
+      } else { btn.textContent='Erro'; setTimeout(()=>{btn.className='mini gerar';btn.innerHTML='&#9998; Gerar conteudo';btn.disabled=false},3000); }
+    } catch(e) { btn.textContent='Erro'; toast('Erro: '+e.message); setTimeout(()=>{btn.className='mini gerar';btn.innerHTML='&#9998; Gerar conteudo';btn.disabled=false},3000); }
+  }
 
-      // Estado: carregando
-      const labelOrig = btn.innerHTML;
-      btn.disabled = true;
-      btn.innerHTML = 'Enviando...';
-      btn.classList.remove('sucesso', 'erro');
+  async function excluirItem(itemId, btn) {
+    if(!confirm('Excluir esta noticia permanentemente?')) return;
+    const r = await DEL('/api/oportunidades/'+itemId);
+    if(r.ok) { const card = btn.closest('.linha'); if(card) card.remove(); toast('Excluido'); }
+  }
 
-      try {
-        const r = await fetch(SELECIONAR_ENDPOINT, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (!r.ok) {
-          let err_msg = 'HTTP ' + r.status;
-          try { const j = await r.json(); err_msg = j.erro || j.message || err_msg; } catch (_) {}
-          btn.classList.add('erro');
-          btn.innerHTML = 'Erro';
-          toast('Erro ao selecionar: ' + err_msg, 6000);
-          setTimeout(() => {
-            btn.classList.remove('erro');
-            btn.innerHTML = labelOrig;
-            btn.disabled = false;
-          }, 4000);
-          return;
-        }
-        // Sucesso no sistema comercial. Agora persiste o estado localmente
-        // (proxima carga do painel, o botao ja vem desabilitado e em verde).
-        try {
-          await fetch('/api/oportunidades/' + id + '/marcar_selecionado', { method: 'POST' });
-          if (itensPorId[id]) itensPorId[id].selecionado_marketing = 1;
-        } catch (persistErr) {
-          // Se nao conseguir persistir, ainda mostra como sucesso na sessao
-          // atual (o POST externo ja foi feito).
-          console.warn('Falha ao persistir selecionado:', persistErr);
-        }
+  async function confirmarEnc(itemId) {
+    const r = await POST('/api/inbox/'+itemId+'/confirmar');
+    if(r.ok||!r.erro) { const c=document.querySelector('.triagem-card[data-id="'+itemId+'"]'); if(c){c.style.opacity='0.4';c.querySelector('.tc-acts').innerHTML='<span style="color:var(--gold-dark);font-weight:700;font-size:11px">&#10003; Confirmado</span>';} toast('Encaixado'); }
+    else toast('Erro: '+(r.erro||''));
+  }
 
-        // Botao fica desabilitado e verde permanentemente
-        btn.classList.add('sucesso');
-        btn.innerHTML = '&#10003; Selecionado';
-        btn.title = 'Ja enviado ao sistema comercial';
-        // btn.disabled continua true - NAO ha setTimeout para resetar
-      } catch (e) {
-        // Erro de rede / CORS / etc
-        btn.classList.add('erro');
-        btn.innerHTML = 'Erro';
-        toast('Erro de rede ao selecionar. Detalhe: ' + (e && e.message ? e.message : 'desconhecido'), 6000);
-        setTimeout(() => {
-          btn.classList.remove('erro');
-          btn.innerHTML = labelOrig;
-          btn.disabled = false;
-        }, 4000);
-      }
-    }
+  async function excluirEnc(itemId) {
+    const r = await DEL('/api/oportunidades/'+itemId);
+    if(r.ok) { const c=document.querySelector('.triagem-card[data-id="'+itemId+'"]'); if(c) c.remove(); toast('Excluido'); }
+  }
 
-    async function limparExemplos() {
-      if (!confirm('Apagar todos os itens [EXEMPLO] do banco?')) return;
-      try {
-        const r = await fetch('/api/limpar_exemplos', { method: 'POST' });
-        const data = await r.json();
-        toast(data.removidos + ' exemplos removidos');
-        carregarStatus();
-        carregarTudo();
-      } catch (e) { toast('Erro'); }
-    }
+  let _outroAlvo = null;
+  async function abrirOutro(itemId) {
+    _outroAlvo = itemId;
+    const data = await GET('/api/concursos');
+    const lista = (data.concursos||[]).map(c=>'<div class="outro-item" onclick="encaixarEm('+c.id+')">'+esc(c.nome)+'</div>').join('');
+    document.getElementById('outro-list').innerHTML = lista || '<div style="color:var(--cinza);font-size:12px">Nenhum concurso monitorado.</div>';
+    document.getElementById('outro-novo-nome').value='';
+    document.getElementById('outro-menu').classList.add('show');
+  }
+  function fecharOutro() { document.getElementById('outro-menu').classList.remove('show'); _outroAlvo=null; }
+  async function encaixarEm(concursoId) {
+    fecharOutro();
+    const r = await POST('/api/inbox/'+_outroAlvo+'/confirmar', {concurso_id:concursoId});
+    if(r.ok||!r.erro) { const c=document.querySelector('.triagem-card[data-id="'+_outroAlvo+'"]'); if(c){c.style.opacity='0.4';c.querySelector('.tc-acts').innerHTML='<span style="color:var(--gold-dark);font-weight:700;font-size:11px">&#10003; Encaixado</span>';} toast('Encaixado'); }
+  }
+  async function criarEEncaixar() {
+    const nome = document.getElementById('outro-novo-nome').value.trim();
+    if(!nome){toast('Digite o nome');return;}
+    fecharOutro();
+    const r = await POST('/api/inbox/'+_outroAlvo+'/criar-e-encaixar', {nome:nome});
+    if(r.ok||!r.erro) { const c=document.querySelector('.triagem-card[data-id="'+_outroAlvo+'"]'); if(c){c.style.opacity='0.4';c.querySelector('.tc-acts').innerHTML='<span style="color:var(--gold-dark);font-weight:700;font-size:11px">&#10003; Novo criado</span>';} toast('Concurso criado e encaixado'); }
+  }
 
-    async function rodarTier(tier) {
-      const tipo = tier === 1 ? 'tier1' : 'tier23';
-      const btn = document.getElementById('btn-tier' + tier);
-      if (!confirm('Disparar coleta de Tier ' + tier + ' agora? Demora ~1-2 minutos.')) return;
-      btn.disabled = true;
-      btn.textContent = 'Coletando...';
-      try {
-        const r = await fetch('/cron/manual?tipo=' + tipo, { method: 'POST' });
-        const data = await r.json();
-        if (data.erro) { toast('Erro: ' + data.erro); btn.disabled = false; btn.textContent = 'Coletar Tier ' + tier; return; }
-        toast(data.mensagem, 8000);
-        startPolling(btn, 'Coletar Tier ' + tier);
-      } catch (e) {
-        toast('Erro');
-        btn.disabled = false; btn.textContent = 'Coletar Tier ' + tier;
-      }
-    }
+  async function monitorarSug(sugId) {
+    const r = await POST('/api/sugestoes/'+sugId+'/monitorar');
+    if(r.ok||!r.erro) { const c=document.querySelector('[data-id="sug-'+sugId+'"]'); if(c){c.style.opacity='0.4';c.querySelector('.tc-acts').innerHTML='<span style="color:var(--gold-dark);font-weight:700;font-size:11px">&#10003; Monitorando</span>';} toast('Concurso monitorado'); }
+  }
+  async function ignorarSug(sugId) {
+    const r = await POST('/api/sugestoes/'+sugId+'/ignorar');
+    if(r.ok||!r.erro) { const c=document.querySelector('[data-id="sug-'+sugId+'"]'); if(c) c.remove(); toast('Ignorado'); }
+  }
 
-    async function rodarCompleto() {
-      const btn = document.getElementById('btn-completo');
-      if (!confirm('Disparar coleta COMPLETA (7 categorias)? Demora 3-6 minutos.')) return;
-      btn.disabled = true;
-      btn.textContent = 'Coletando...';
-      try {
-        const r = await fetch('/cron/manual?tipo=completo', { method: 'POST' });
-        const data = await r.json();
-        if (data.erro) { toast('Erro: ' + data.erro); btn.disabled = false; btn.textContent = 'Coletar Tudo'; return; }
-        toast(data.mensagem, 10000);
-        startPolling(btn, 'Coletar Tudo');
-      } catch (e) {
-        toast('Erro');
-        btn.disabled = false; btn.textContent = 'Coletar Tudo';
-      }
-    }
+  async function rodarTriagemRetroativa() {
+    if(!confirm('Rodar triagem sobre todo o acervo antigo? Pode demorar alguns segundos.')) return;
+    toast('Triando acervo...',10000);
+    const r = await POST('/api/triagem/retroativa');
+    if(r.stats) toast('Triagem: '+r.stats.auto_confirmado+' encaixados, '+r.stats.transversal+' transversais, '+r.stats.sugerido+' sugeridos',8000);
+    else toast('Concluido');
+    renderTelaInbox();
+  }
 
-    async function rodarDedupe() {
-      const btn = document.getElementById('btn-dedupe');
-      if (!confirm('Limpar duplicatas do banco?\n\nRecalcula o hash de TODOS os registros e apaga os duplicados, mantendo sempre o mais antigo. As notas associadas aos duplicados tambem somem.\n\nE seguro, mas demora 10-30s.')) return;
-      btn.disabled = true;
-      const labelOrig = btn.textContent;
-      btn.textContent = 'Limpando...';
-      try {
-        const r = await fetch('/api/dedupe', { method: 'POST' });
-        const data = await r.json();
-        if (data.erro) {
-          toast('Erro: ' + data.erro, 8000);
-        } else {
-          toast('Dedupe concluido: ' + data.total_antes + ' -> ' + data.total_apos + ' (' + data.duplicados_deletados + ' duplicados apagados)', 10000);
-          await carregarStatus();
-          await carregarTudo();
-        }
-      } catch (e) {
-        toast('Erro ao rodar dedupe');
-      }
-      btn.disabled = false;
-      btn.textContent = labelOrig;
-    }
+  async function excluirConcurso(cid, nome) {
+    if(!confirm('Parar de monitorar "'+nome+'"?\n\nAs noticias encaixadas nao serao apagadas, apenas desvinculadas.')) return;
+    const r = await DEL('/api/concursos/'+cid);
+    if(r.ok) { toast('Concurso removido'); renderTelaGerenciar(); }
+  }
 
-    function startPolling(btn, txtFinal) {
-      let polls = 0;
-      const interval = setInterval(async () => {
-        polls++;
-        await carregarStatus();
-        await carregarTudo();
-        if (polls >= 30) {
-          clearInterval(interval);
-          btn.disabled = false;
-          btn.textContent = txtFinal;
-        }
-      }, 12000);
-    }
+  // ===== MODAL CRIAR CONCURSO =====
+  function abrirModal() { document.getElementById('modal-add').classList.add('show'); }
+  function fecharModal() { document.getElementById('modal-add').classList.remove('show'); }
+  async function salvarConcurso() {
+    const nome = document.getElementById('add-nome').value.trim();
+    if(!nome){toast('Informe o nome');return;}
+    const banca = document.getElementById('add-banca').value.trim();
+    const kw = document.getElementById('add-kw').value.trim();
+    const r = await POST('/api/concursos', {nome:nome, banca:banca, palavras_chave:kw, prioridade:'importante'});
+    if(r.ok||r.concurso) {
+      fecharModal(); toast('Monitorando: '+nome);
+      document.getElementById('add-nome').value='';
+      document.getElementById('add-banca').value='';
+      document.getElementById('add-kw').value='';
+      if(telAtual==='gerenciar') renderTelaGerenciar();
+    } else toast('Erro: '+(r.erro||''));
+  }
 
-    function carregarTudo() {
-      carregarTier(1);
-      carregarTier(2);
-      carregarTier(3);
-    }
+  // ===== BUSCA AO VIVO =====
+  async function buscaAoVivo(termo) {
+    if(!termo.trim()) return;
+    toast('Buscando: "'+termo+'"... (busca sob demanda sera implementada na proxima versao)',5000);
+  }
 
+  // ===== COLETA MANUAL =====
+  async function coletarTudo() {
+    if(!confirm('Disparar coleta completa? Demora 3-6 minutos.')) return;
+    toast('Coleta disparada em background...',6000);
+    await POST('/cron/manual?tipo=completo');
+  }
 
-    async function gerarConteudo(id, btn) {
-      const item = itensPorId[id];
-      if (!item) { toast('Item não encontrado. Recarregue.'); return; }
-
-      // Perguntar zona
-      const zona = prompt('Adicionar ao pipeline:\n1 = Quente\n2 = Morno\n3 = Frio', '1');
-      if (!zona) return;
-      const zonaMap = {'1':'quente','2':'morno','3':'frio','quente':'quente','morno':'morno','frio':'frio'};
-      const z = zonaMap[String(zona).toLowerCase()] || 'quente';
-
-      const payload = {
-        titulo: String(item.titulo || '').trim(),
-        nome: String(item.concurso || item.titulo || '').trim(),
-        descricao: String(item.descricao || '').trim(),
-        concurso: String(item.concurso || '').trim(),
-        banca: String(item.banca || '').trim(),
-        orgao: String(item.orgao || '').trim(),
-        vagas: String(item.vagas || '').trim(),
-        salario: String(item.salario || '').trim(),
-        prazo_inscricao: String(item.prazo_inscricao || '').trim(),
-        data_prova: String(item.data_prova || '').trim(),
-        fase_atual: String(item.fase_atual || '').trim(),
-        estado: String(item.estado || '').trim(),
-        link: String(item.link || '').trim(),
-        zona: z,
-      };
-
-      if (btn) { btn.disabled = true; btn.textContent = 'Enviando...'; }
-      try {
-        const r = await fetch(CONTEUDO_ENDPOINT, {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify(payload),
-          // sem credentials — rota pública
-        });
-        if (r.ok || r.status === 200 || r.status === 201) {
-          toast('✓ Enviado para Conteúdo (' + z + ')!');
-          if (btn) { btn.style.color = '#16a34a'; btn.style.borderColor = '#16a34a'; btn.textContent = '✓ Enviado'; }
-        } else {
-          toast('Erro ao enviar para Conteúdo: ' + r.status);
-          if (btn) { btn.disabled = false; btn.textContent = '📋 Gerar Conteúdo'; }
-        }
-      } catch(e) {
-        toast('Erro de rede: ' + e.message);
-        if (btn) { btn.disabled = false; btn.textContent = '📋 Gerar Conteúdo'; }
-      }
-    }
-
-    carregarStatus();
-    carregarTudo();
-
-    setInterval(() => {
-      carregarStatus();
-      carregarTudo();
-    }, 5 * 60 * 1000);
-  </script>
+  // ===== INIT =====
+  async function init() {
+    // Carrega contagem da inbox pra badge
+    const inbox = await GET('/api/inbox');
+    const badge = document.querySelector('.mainnav .nav-badge');
+    if(badge && inbox) badge.textContent = (inbox.total||0);
+    // Renderiza tela inicial
+    renderTelaConcursos();
+  }
+  init();
+</script>
 </body>
 </html>
 """
