@@ -2576,6 +2576,109 @@ def api_triagem_retroativa():
         return jsonify({"erro": str(e)}), 500
 
 
+@app.route("/api/concursos/importar-do-radar", methods=["POST"])
+def api_importar_do_radar():
+    """Importa concursos automaticamente a partir dos itens JA COLETADOS no banco.
+
+    Varre todas as oportunidades que tem o campo 'concurso' preenchido (coletados pelo
+    radar_volume, elim_ativas, taf_fases, recurso_anulacao, etc.), extrai os nomes
+    unicos de concurso, e cria um concurso_monitorado para cada um que ainda nao exista.
+
+    Depois roda triagem retroativa pra encaixar as noticias nos concursos recem-criados.
+
+    Retorna: quantos concursos foram criados, quantos ja existiam, e stats da triagem.
+    """
+    try:
+        agora = datetime.now(timezone.utc).isoformat()
+        criados = 0
+        ja_existiam = 0
+
+        with db_conn() as conn:
+            # 1. Pega todos os nomes de concurso unicos + banca + vagas
+            rows = conn.execute(
+                "SELECT concurso, banca, vagas, orgao, COUNT(*) as qtd "
+                "FROM oportunidades "
+                "WHERE concurso IS NOT NULL AND concurso != '' "
+                "GROUP BY concurso "
+                "ORDER BY qtd DESC"
+            ).fetchall()
+
+            # 2. Carrega concursos ja monitorados pra evitar duplicatas
+            existentes = conn.execute(
+                "SELECT nome FROM concursos_monitorados"
+            ).fetchall()
+            nomes_existentes = set()
+            for r in existentes:
+                d = _dict_from_row(r)
+                nomes_existentes.add(_normalizar_nome_concurso(d.get("nome", "")))
+
+            # 3. Para cada concurso unico, cria se nao existe
+            for r in rows:
+                d = _dict_from_row(r)
+                nome = (d.get("concurso") or "").strip()
+                if not nome or len(nome) < 3:
+                    continue
+
+                nome_norm = _normalizar_nome_concurso(nome)
+                if nome_norm in nomes_existentes:
+                    ja_existiam += 1
+                    continue
+
+                banca = (d.get("banca") or "").strip()
+                vagas = (d.get("vagas") or "").strip()
+                orgao = (d.get("orgao") or "").strip()
+
+                # Palavras-chave: nome do concurso + orgao (se diferente)
+                kws = [nome]
+                if orgao and orgao.lower() != nome.lower():
+                    kws.append(orgao)
+                palavras = ", ".join(kws)
+
+                # Prioridade default: importante (amarelo)
+                # Se o concurso tem itens no Tier 1 (eliminacoes ativas), marca como urgente
+                tier1_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM oportunidades WHERE concurso = ? AND tier = 1",
+                    (nome,)
+                ).fetchone()
+                t1c = _dict_from_row(tier1_count)["c"] if tier1_count else 0
+                prioridade = "urgente" if t1c > 0 else "importante"
+
+                conn.execute(
+                    "INSERT INTO concursos_monitorados "
+                    "(nome, banca, palavras_chave, prioridade, vagas, data_criacao, ativo) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1)",
+                    (nome, banca, palavras, prioridade, vagas, agora)
+                )
+                nomes_existentes.add(nome_norm)
+                criados += 1
+
+        log.info("v7 importar-do-radar: %d criados, %d ja existiam", criados, ja_existiam)
+
+        # 4. Roda triagem retroativa pra encaixar as noticias nos concursos recem-criados
+        stats_triagem = {"info": "nao rodou"}
+        if criados > 0:
+            try:
+                with db_conn() as conn:
+                    conn.execute(
+                        "UPDATE oportunidades SET status_triagem='pendente' "
+                        "WHERE status_triagem IS NULL OR status_triagem = '' OR status_triagem = 'sem_concurso'"
+                    )
+                stats_triagem = triar_itens(item_ids=None)
+            except Exception as e:
+                log.warning("triagem pos-importacao falhou: %s", e)
+                stats_triagem = {"erro": str(e)}
+
+        return jsonify({
+            "ok": True,
+            "concursos_criados": criados,
+            "ja_existiam": ja_existiam,
+            "triagem": stats_triagem,
+        })
+    except Exception as e:
+        log.error("api_importar_do_radar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
 @app.route("/api/oportunidades/<int:item_id>/notas", methods=["GET"])
 def api_listar_notas(item_id):
     """Lista todas as notas de uma oportunidade, mais recentes primeiro."""
@@ -3201,9 +3304,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
 <script>
   // ===== v7: API-CONNECTED JS =====
   // Constantes de integracao com sistema de marketing
-  const SELECIONAR_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/selecionados/adicionar-externo';
+  const PIPELINE_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/pipeline/criar-externo';
   // TODO: preencher quando tiver a rota do endpoint de concursos do marketing
-  const CONCURSOS_MKT_ENDPOINT = '';  // ex: 'https://silvapinto-comercial.onrender.com/marketing/concursos/adicionar-externo'
+  const CONCURSOS_MKT_ENDPOINT = '';
 
   const PRIO_COR = { urgente: '#c0392b', importante: '#BB904C', naourgente: '#2e9e5b' };
   const PRIO_LABEL = { urgente: 'Urgente', importante: 'Importante', naourgente: 'Nao urgente' };
@@ -3384,7 +3487,8 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso monitorado. Adicione o primeiro!</div>';
 
     cont.innerHTML = '<div class="tela active">' +
-      '<div class="add-bar"><button class="add-btn" onclick="abrirModal()">+ Monitorar novo concurso</button></div>' +
+      '<div class="add-bar"><button class="add-btn" onclick="abrirModal()">+ Monitorar novo concurso</button>' +
+      '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar do Radar</button></div>' +
       '<div class="monit-grid">'+cards+'</div></div>';
   }
 
@@ -3417,13 +3521,12 @@ HTML_INDEX = r"""<!DOCTYPE html>
       let item = (d.itens||[])[0];
       if(!item) { const d2 = await GET('/api/oportunidades?incluir_lidos=1&dias=365&limite=500'); item = (d2.itens||[]).find(i=>i.id===itemId); }
       const payload = {
-        nome: String((item&&item.concurso)||'').trim() || String((item&&item.titulo)||'').trim(),
-        banca: String((item&&item.banca)||'').trim(),
-        orgao: String((item&&item.orgao)||'').trim(),
-        zona: 'yellow', vagas: String((item&&item.vagas)||'').trim(),
-        destino: 'pipeline',
+        titulo: String((item&&item.concurso)||'').trim() || String((item&&item.titulo)||'').trim(),
+        descricao: String((item&&item.descricao)||'').trim(),
+        tipo: 'operacional',
+        link: String((item&&item.link)||'').trim(),
       };
-      const r = await fetch(SELECIONAR_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const r = await fetch(PIPELINE_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       if(r.ok) {
         await POST('/api/oportunidades/'+itemId+'/marcar_selecionado');
         btn.className='mini feito'; btn.innerHTML='&#10003; No pipeline'; toast('Enviado ao pipeline');
@@ -3493,6 +3596,21 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(!confirm('Parar de monitorar "'+nome+'"?\n\nAs noticias encaixadas nao serao apagadas, apenas desvinculadas.')) return;
     const r = await DEL('/api/concursos/'+cid);
     if(r.ok) { toast('Concurso removido'); renderTelaGerenciar(); }
+  }
+
+  async function importarDoRadar() {
+    if(!confirm('Importar concursos do radar?\n\nVai criar automaticamente um concurso monitorado para cada concurso que ja apareceu nas coletas anteriores. Depois encaixa as noticias existentes neles.\n\nIsso pode levar alguns segundos.')) return;
+    toast('Importando concursos do radar...',10000);
+    const r = await POST('/api/concursos/importar-do-radar');
+    if(r.ok || r.concursos_criados !== undefined) {
+      const msg = r.concursos_criados + ' concursos importados' +
+        (r.ja_existiam ? ', ' + r.ja_existiam + ' ja existiam' : '') +
+        (r.triagem && r.triagem.auto_confirmado ? ', ' + r.triagem.auto_confirmado + ' noticias encaixadas' : '');
+      toast(msg, 8000);
+      renderTelaGerenciar();
+    } else {
+      toast('Erro: ' + (r.erro || 'desconhecido'), 6000);
+    }
   }
 
   // ===== MODAL CRIAR CONCURSO =====
