@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.0.1-2026-06-10"
+APP_VERSION = "v7.0.2-2026-06-10"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1710,18 +1710,37 @@ def _compactar_nome(nome_norm):
 def _nomes_sao_similares(nome_a, nome_b):
     """Detecta se dois nomes de concurso sao variacoes do mesmo (PM-RJ vs PMERJ).
 
-    Compara as versoes compactadas (sem espacos/stopwords) com:
-    - igualdade direta
-    - um contido no outro (pmrj em pmerj? nao, mas 'tjrj' em 'tjrjtecnico' sim)
+    v7.0.2: compara apenas a parte DISTINTIVA dos nomes - tokens comuns aos
+    dois (ex 'soldado') sao removidos antes, senao palavras genericas inflam a
+    similaridade e PM-ES Soldado casaria com PMERJ Soldado (falso positivo).
+
+    Regras sobre os tokens distintivos restantes:
+    - ambos vazios -> mesmos tokens (ordem diferente) -> similar
+    - um vazio -> subconjunto (CNU 2 vs CNU 2 Enfermagem) -> similar
+    - restos muito curtos (<3 chars: '1' vs '2', 'rr' vs 'sp') -> DISTINTOS
+    - um contido no outro (>=4 chars) -> similar
     - similaridade de sequencia >= 0.8 (pega pmrj vs pmerj = 0.89)
     """
     import difflib
-    ca = _compactar_nome(_normalizar_nome_concurso(nome_a))
-    cb = _compactar_nome(_normalizar_nome_concurso(nome_b))
-    if not ca or not cb or len(ca) < 3 or len(cb) < 3:
+    ta = _tokens_uteis(_normalizar_nome_concurso(nome_a))
+    tb = _tokens_uteis(_normalizar_nome_concurso(nome_b))
+    if not ta or not tb:
         return False
-    if ca == cb:
+    ca_full, cb_full = "".join(ta), "".join(tb)
+    if len(ca_full) < 3 or len(cb_full) < 3:
+        return False
+    if ca_full == cb_full:
         return True
+    comuns = set(ta) & set(tb)
+    ra = [t for t in ta if t not in comuns]
+    rb = [t for t in tb if t not in comuns]
+    if not ra and not rb:
+        return True  # mesmos tokens em ordem diferente
+    if not ra or not rb:
+        return True  # um e subconjunto do outro
+    ca, cb = "".join(ra), "".join(rb)
+    if len(ca) < 3 or len(cb) < 3:
+        return False  # diferenca curta mas decisiva (CNU 1 vs CNU 2, PM RR vs PM SP)
     if (ca in cb or cb in ca) and min(len(ca), len(cb)) >= 4:
         return True
     return difflib.SequenceMatcher(None, ca, cb).ratio() >= 0.8
@@ -2411,11 +2430,31 @@ def api_concursos_listar():
         return jsonify({"erro": str(e), "total": 0, "concursos": []}), 500
 
 
+def _concurso_existente_por_nome(conn, nome):
+    """v7.0.2: retorna concurso ATIVO ja monitorado cujo nome e identico ou
+    variacao do informado (CNU 2 == CNU 2; PM-RJ ~ PMERJ). Evita duplicatas
+    em TODOS os caminhos de criacao."""
+    try:
+        rows = conn.execute(
+            "SELECT id, nome, palavras_chave FROM concursos_monitorados WHERE ativo = 1"
+        ).fetchall()
+        existentes = [_dict_from_row(r) for r in rows]
+        nome_norm = _normalizar_nome_concurso(nome)
+        for c in existentes:
+            if _normalizar_nome_concurso(c.get("nome", "")) == nome_norm:
+                return c
+        return _achar_concurso_similar(nome, existentes)
+    except Exception:
+        return None
+
+
 @app.route("/api/concursos", methods=["POST"])
 def api_concursos_criar():
     """Cria um novo concurso monitorado.
 
     Body JSON: { nome, banca?, palavras_chave?, prioridade?, vagas? }
+    v7.0.2: se ja existe concurso ativo com nome identico/similar, NAO cria
+    duplicata - retorna o existente.
     """
     try:
         data = request.get_json(force=True) or {}
@@ -2431,6 +2470,11 @@ def api_concursos_criar():
         agora = datetime.now(timezone.utc).isoformat()
 
         with db_conn() as conn:
+            existente = _concurso_existente_por_nome(conn, nome)
+            if existente:
+                log.info("v7: criacao bloqueada - '%s' ja existe como '%s' (id %s)",
+                         nome, existente.get("nome"), existente.get("id"))
+                return jsonify({"ok": True, "ja_existia": True, "concurso": existente})
             conn.execute(
                 """INSERT INTO concursos_monitorados
                    (nome, banca, palavras_chave, prioridade, vagas, data_criacao, ativo)
@@ -2611,6 +2655,83 @@ def api_concursos_mesclar():
         return jsonify({"erro": str(e)}), 500
 
 
+@app.route("/api/concursos/limpar-duplicados", methods=["POST"])
+def api_concursos_limpar_duplicados():
+    """v7.0.2: detecta e mescla automaticamente concursos duplicados.
+
+    Agrupa os concursos ativos por nome identico/similar. Em cada grupo,
+    mantem o de menor id (o mais antigo, que prevalece) e mescla os demais
+    nele: noticias migram, nomes diferentes viram palavras-chave, duplicatas
+    sao desativadas.
+    """
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, nome, palavras_chave FROM concursos_monitorados "
+                "WHERE ativo = 1 ORDER BY id ASC"
+            ).fetchall()
+            concursos = [_dict_from_row(r) for r in rows]
+
+        # Agrupa por similaridade (o primeiro de cada grupo = mantido)
+        grupos = []  # lista de [mantido, dup1, dup2...]
+        usados = set()
+        for i, c in enumerate(concursos):
+            if c["id"] in usados:
+                continue
+            grupo = [c]
+            usados.add(c["id"])
+            for c2 in concursos[i+1:]:
+                if c2["id"] in usados:
+                    continue
+                nome_a = _normalizar_nome_concurso(c.get("nome", ""))
+                nome_b = _normalizar_nome_concurso(c2.get("nome", ""))
+                if nome_a == nome_b or _nomes_sao_similares(c.get("nome", ""), c2.get("nome", "")):
+                    grupo.append(c2)
+                    usados.add(c2["id"])
+            if len(grupo) > 1:
+                grupos.append(grupo)
+
+        grupos_mesclados = 0
+        duplicatas_removidas = 0
+        noticias_movidas = 0
+        for grupo in grupos:
+            destino = grupo[0]
+            origens = grupo[1:]
+            with db_conn() as conn:
+                kws = [k.strip() for k in (destino.get("palavras_chave") or "").split(",") if k.strip()]
+                for o in origens:
+                    candidatos = [o.get("nome", "")]
+                    candidatos += [k.strip() for k in (o.get("palavras_chave") or "").split(",")]
+                    for cand in candidatos:
+                        cand = (cand or "").strip()
+                        if cand and cand not in kws and cand.lower() != (destino.get("nome") or "").lower():
+                            kws.append(cand)
+                    cur = conn.execute(
+                        "UPDATE oportunidades SET concurso_id = ? WHERE concurso_id = ?",
+                        (destino["id"], o["id"])
+                    )
+                    try:
+                        noticias_movidas += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                    except Exception:
+                        pass
+                    conn.execute("UPDATE concursos_monitorados SET ativo = 0 WHERE id = ?", (o["id"],))
+                    duplicatas_removidas += 1
+                conn.execute(
+                    "UPDATE concursos_monitorados SET palavras_chave = ? WHERE id = ?",
+                    (", ".join(kws), destino["id"])
+                )
+            grupos_mesclados += 1
+
+        log.info("v7: limpar-duplicados -> %d grupos, %d duplicatas removidas, %d noticias movidas",
+                 grupos_mesclados, duplicatas_removidas, noticias_movidas)
+        return jsonify({"ok": True, "grupos_mesclados": grupos_mesclados,
+                        "duplicatas_removidas": duplicatas_removidas,
+                        "noticias_movidas": noticias_movidas})
+    except Exception as e:
+        log.error("api_concursos_limpar_duplicados erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
 # ===== v7: CAIXA DE ENTRADA (triagem) =====
 
 @app.route("/api/inbox", methods=["GET"])
@@ -2698,20 +2819,26 @@ def api_inbox_criar_encaixar(item_id):
             prioridade = "importante"
         agora = datetime.now(timezone.utc).isoformat()
         with db_conn() as conn:
-            conn.execute(
-                "INSERT INTO concursos_monitorados (nome, banca, palavras_chave, prioridade, data_criacao, ativo) "
-                "VALUES (?, ?, ?, ?, ?, 1)",
-                (nome, banca, palavras, prioridade, agora)
-            )
-            crow = conn.execute(
-                "SELECT id FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1", (nome,)
-            ).fetchone()
-            cid = _dict_from_row(crow)["id"]
+            # v7.0.2: se ja existe identico/similar, encaixa nele em vez de duplicar
+            existente = _concurso_existente_por_nome(conn, nome)
+            if existente:
+                cid = existente["id"]
+            else:
+                conn.execute(
+                    "INSERT INTO concursos_monitorados (nome, banca, palavras_chave, prioridade, data_criacao, ativo) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (nome, banca, palavras, prioridade, agora)
+                )
+                crow = conn.execute(
+                    "SELECT id FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1", (nome,)
+                ).fetchone()
+                cid = _dict_from_row(crow)["id"]
             conn.execute(
                 "UPDATE oportunidades SET status_triagem='confirmado', concurso_id=?, sugestao_concurso=NULL WHERE id=?",
                 (cid, item_id)
             )
-        log.info("v7: concurso '%s' criado e item %d encaixado", nome, item_id)
+        log.info("v7: concurso '%s' %s e item %d encaixado", nome,
+                 "ja existia" if existente else "criado", item_id)
         return jsonify({"ok": True, "concurso_id": cid, "item_id": item_id})
     except Exception as e:
         log.error("api_inbox_criar_encaixar erro: %s", e)
@@ -2747,16 +2874,27 @@ def api_sugestao_monitorar(sug_id):
             s = _dict_from_row(srow)
             nome = s["nome_exibicao"]
             banca = s.get("banca", "")
-            # Cria o concurso monitorado
-            conn.execute(
-                "INSERT INTO concursos_monitorados (nome, banca, palavras_chave, prioridade, data_criacao, ativo) "
-                "VALUES (?, ?, ?, 'importante', ?, 1)",
-                (nome, banca, nome, agora)  # usa o proprio nome como palavra-chave inicial
-            )
-            crow = conn.execute(
-                "SELECT id FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1", (nome,)
-            ).fetchone()
-            cid = _dict_from_row(crow)["id"]
+            # v7.0.2: se ja existe identico/similar, usa o existente (variacao vira kw)
+            existente = _concurso_existente_por_nome(conn, nome)
+            if existente:
+                cid = existente["id"]
+                kws = [k.strip() for k in (existente.get("palavras_chave") or "").split(",") if k.strip()]
+                if nome not in kws and nome.lower() != (existente.get("nome") or "").lower():
+                    kws.append(nome)
+                    conn.execute(
+                        "UPDATE concursos_monitorados SET palavras_chave = ? WHERE id = ?",
+                        (", ".join(kws), cid)
+                    )
+            else:
+                conn.execute(
+                    "INSERT INTO concursos_monitorados (nome, banca, palavras_chave, prioridade, data_criacao, ativo) "
+                    "VALUES (?, ?, ?, 'importante', ?, 1)",
+                    (nome, banca, nome, agora)  # usa o proprio nome como palavra-chave inicial
+                )
+                crow = conn.execute(
+                    "SELECT id FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1", (nome,)
+                ).fetchone()
+                cid = _dict_from_row(crow)["id"]
             # Marca a sugestao como aceita
             conn.execute("UPDATE sugestoes_concurso SET status='monitorado' WHERE id=?", (sug_id,))
         # Re-tria os itens sem_concurso (alguns vao encaixar agora)
@@ -3913,7 +4051,8 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
     cont.innerHTML = '<div class="tela active">' +
       '<div class="add-bar"><button class="add-btn" onclick="abrirModal()">+ Monitorar novo concurso</button>' +
-      '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar concursos do acervo</button></div>' +
+      '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar concursos do acervo</button>' +
+      '<button class="add-btn" style="background:var(--cinza)" onclick="limparDuplicados()">Limpar duplicados</button></div>' +
       '<div class="monit-grid">'+cards+'</div></div>';
   }
 
@@ -3985,7 +4124,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     document.getElementById('outro-novo-nome').value='';
     document.getElementById('outro-menu').classList.add('show');
   }
-  function fecharOutro() { document.getElementById('outro-menu').classList.remove('show'); _outroAlvo=null; _mesclarOrigem=null; document.querySelector('#outro-menu .outro-novo').style.display=''; document.querySelector('#outro-menu h3').textContent='Encaixar em outro concurso'; }
+  function fecharOutro() { document.getElementById('outro-menu').classList.remove('show'); _outroAlvo=null; _mesclarDestino=null; document.querySelector('#outro-menu .outro-novo').style.display=''; document.querySelector('#outro-menu h3').textContent='Encaixar em outro concurso'; }
   async function encaixarEm(concursoId) {
     fecharOutro();
     const r = await POST('/api/inbox/'+_outroAlvo+'/confirmar', {concurso_id:concursoId});
@@ -4036,31 +4175,49 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(r.ok) { const el = btn.closest('.sitem'); if(el) el.remove(); toast('Tema excluido'); }
   }
 
-  // v7.0.1: mesclar concursos
-  let _mesclarOrigem = null;
+  // v7.0.2: mesclar VARIOS concursos de uma vez
+  // Semantica: o card onde voce clica "Mesclar" e o que FICA (destino).
+  // No modal voce marca todos os que serao incorporados a ele.
+  let _mesclarDestino = null;
   function abrirMesclar(cid) {
-    _mesclarOrigem = cid;
+    _mesclarDestino = cid;
     const outros = (window._concursosCache||[]).filter(c => c.id !== cid);
     if(!outros.length) { toast('Nao ha outro concurso para mesclar'); return; }
-    const origem = (window._concursosCache||[]).find(c=>c.id===cid);
-    const lista = outros.map(c=>'<div class="outro-item" onclick="mesclarCom('+c.id+')">'+esc(c.nome)+'</div>').join('');
+    const destino = (window._concursosCache||[]).find(c=>c.id===cid);
+    const lista = outros.map(c=>
+      '<label class="outro-item" style="display:flex;align-items:center;gap:10px;cursor:pointer">' +
+      '<input type="checkbox" class="mesclar-chk" value="'+c.id+'" style="width:16px;height:16px;accent-color:var(--gold)">' +
+      '<span>'+esc(c.nome)+' <span style="color:var(--cinza);font-size:11px">('+(c.noticias_count||0)+' noticias)</span></span></label>'
+    ).join('');
     document.getElementById('outro-list').innerHTML =
-      '<div style="font-size:12px;color:var(--cinza);margin-bottom:10px">Mesclar <b>'+esc(origem?origem.nome:'')+'</b> com qual concurso? O escolhido sera o nome principal; este vira variacao (palavra-chave) e as noticias migram.</div>' + lista;
+      '<div style="font-size:12px;color:var(--cinza);margin-bottom:10px"><b>'+esc(destino?destino.nome:'')+'</b> sera mantido. Marque os concursos que serao incorporados a ele (noticias migram, nomes viram variacoes/palavras-chave):</div>' +
+      lista +
+      '<button class="add-btn" style="width:100%;margin-top:12px" onclick="confirmarMesclaMulti()">Mesclar selecionados</button>';
     document.getElementById('outro-novo-nome').value='';
     document.querySelector('#outro-menu .outro-novo').style.display='none';
     document.querySelector('#outro-menu h3').textContent='Mesclar concursos';
     document.getElementById('outro-menu').classList.add('show');
   }
-  async function mesclarCom(destinoId) {
-    const origem = _mesclarOrigem;
-    document.getElementById('outro-menu').classList.remove('show');
-    document.querySelector('#outro-menu .outro-novo').style.display='';
-    document.querySelector('#outro-menu h3').textContent='Encaixar em outro concurso';
-    _mesclarOrigem = null;
-    toast('Mesclando...');
-    const r = await POST('/api/concursos/mesclar', {destino_id:destinoId, origem_ids:[origem]});
-    if(r.ok) { toast('Mesclado: '+(r.noticias_movidas||0)+' noticia(s) migraram'); renderTelaGerenciar(); }
+  async function confirmarMesclaMulti() {
+    const marcados = Array.from(document.querySelectorAll('.mesclar-chk:checked')).map(x=>parseInt(x.value));
+    if(!marcados.length) { toast('Marque ao menos um concurso'); return; }
+    const destino = _mesclarDestino;
+    fecharOutro();
+    toast('Mesclando '+marcados.length+' concurso(s)...');
+    const r = await POST('/api/concursos/mesclar', {destino_id:destino, origem_ids:marcados});
+    if(r.ok) { toast('Mesclados: '+r.origens_mescladas+' concurso(s), '+(r.noticias_movidas||0)+' noticia(s) migraram', 6000); renderTelaGerenciar(); }
     else toast('Erro: '+(r.erro||''));
+  }
+
+  // v7.0.2: limpa duplicatas automaticamente (nomes identicos/similares)
+  async function limparDuplicados() {
+    if(!confirm('Detectar e mesclar concursos duplicados automaticamente?\n\nConcursos com nomes identicos ou muito parecidos (ex: CNU 2 repetido, PM-RJ vs PMERJ) serao unificados. Prevalece o mais antigo; os outros viram variacoes dele.')) return;
+    toast('Limpando duplicatas...', 8000);
+    const r = await POST('/api/concursos/limpar-duplicados');
+    if(r.ok) {
+      toast(r.duplicatas_removidas+' duplicata(s) mescladas em '+r.grupos_mesclados+' grupo(s), '+(r.noticias_movidas||0)+' noticia(s) reorganizadas', 8000);
+      renderTelaGerenciar();
+    } else toast('Erro: '+(r.erro||''));
   }
 
   // v7.0.1: busca dirigida - coleta focada num concurso especifico
