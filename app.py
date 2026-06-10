@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.0.3-2026-06-10"
+APP_VERSION = "v7.0.4-2026-06-10"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2806,20 +2806,73 @@ def api_concursos_limpar_duplicados():
 
 @app.route("/api/concursos/sincronizar-marketing", methods=["POST"])
 def api_concursos_sincronizar_marketing():
-    """v7.0.3: envia TODOS os concursos monitorados ativos pra pagina 'Concursos'
-    do sistema de marketing (upsert em massa). Use para o sync inicial ou para
-    realinhar os dois sistemas."""
+    """v7.0.4: envia TODOS os concursos ativos pra pagina 'Concursos' do marketing,
+    de forma SINCRONA, e reporta o resultado REAL de cada envio.
+
+    Assim o usuario sabe na hora se o receptor do marketing existe e respondeu,
+    em vez de um 'enviado' cego."""
     try:
         with db_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM concursos_monitorados WHERE ativo = 1"
             ).fetchall()
             concursos = [_dict_from_row(r) for r in rows]
+
+        prio_map = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
+        confirmados = 0
+        falhas = 0
+        primeiro_erro = ""
         for c in concursos:
-            _sync_concurso_marketing(c, "upsert")
-        log.info("v7: sync completo com marketing disparado (%d concursos)", len(concursos))
-        return jsonify({"ok": True, "enviados": len(concursos),
-                        "destino": CONCURSOS_MKT_URL})
+            payload = {
+                "nome": (c.get("nome") or "").strip(),
+                "banca": (c.get("banca") or "").strip(),
+                "vagas": (c.get("vagas") or "").strip(),
+                "etapa": prio_map.get(c.get("prioridade", "importante"), "importante"),
+                "acao": "upsert",
+                "origem": "painel-oportunidades",
+            }
+            if not payload["nome"]:
+                continue
+            try:
+                req = urllib.request.Request(
+                    CONCURSOS_MKT_URL,
+                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    if resp.status < 300:
+                        confirmados += 1
+                    else:
+                        falhas += 1
+                        if not primeiro_erro:
+                            primeiro_erro = f"status HTTP {resp.status}"
+            except urllib.error.HTTPError as he:
+                falhas += 1
+                if not primeiro_erro:
+                    if he.code == 404:
+                        primeiro_erro = "404 - a rota /marketing/concursos/sincronizar-externo NAO EXISTE no sistema de marketing (o receptor ainda nao foi implementado la)"
+                    else:
+                        try:
+                            corpo = he.read().decode("utf-8", "ignore")[:200]
+                        except Exception:
+                            corpo = ""
+                        primeiro_erro = f"HTTP {he.code} - {corpo}"
+            except Exception as e:
+                falhas += 1
+                if not primeiro_erro:
+                    primeiro_erro = str(e)[:200]
+
+        log.info("v7: sync completo -> %d confirmados, %d falhas (%s)",
+                 confirmados, falhas, primeiro_erro or "-")
+        return jsonify({
+            "ok": falhas == 0,
+            "total": len(concursos),
+            "confirmados": confirmados,
+            "falhas": falhas,
+            "erro_detalhe": primeiro_erro,
+            "destino": CONCURSOS_MKT_URL,
+        })
     except Exception as e:
         log.error("api_concursos_sincronizar_marketing erro: %s", e)
         return jsonify({"erro": str(e)}), 500
@@ -4327,13 +4380,18 @@ HTML_INDEX = r"""<!DOCTYPE html>
     } else toast('Erro: '+(r.erro||''));
   }
 
-  // v7.0.3: sync completo com a pagina Concursos do marketing
+  // v7.0.4: sync completo SINCRONO - reporta resultado real de cada envio
   async function sincronizarMarketing() {
     if(!confirm('Enviar todos os concursos monitorados para a pagina Concursos do sistema de marketing?\n\nCada concurso vira/atualiza um card na etapa da sua cor (Urgente / Importante / Nao Urgente).')) return;
-    toast('Sincronizando...', 6000);
+    toast('Sincronizando... aguarde, estou confirmando cada envio', 15000);
     const r = await POST('/api/concursos/sincronizar-marketing');
-    if(r.ok) toast(r.enviados+' concurso(s) enviados ao marketing', 6000);
-    else toast('Erro: '+(r.erro||''), 5000);
+    if(r.ok) {
+      toast(r.confirmados+' de '+r.total+' concursos CONFIRMADOS pelo marketing', 8000);
+    } else if(r.falhas !== undefined) {
+      toast('FALHOU: '+r.falhas+' de '+r.total+' nao foram aceitos. Motivo: '+(r.erro_detalhe||'desconhecido'), 15000);
+    } else {
+      toast('Erro: '+(r.erro||''), 8000);
+    }
   }
 
   // v7.0.1: busca dirigida - coleta focada num concurso especifico
