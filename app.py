@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.0.0-rc1"
+APP_VERSION = "v7.0.1-2026-06-10"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -380,6 +380,14 @@ CREATE TABLE IF NOT EXISTS sugestoes_concurso (
     status TEXT DEFAULT 'pendente'
 );
 CREATE INDEX IF NOT EXISTS idx_sugest_status ON sugestoes_concurso(status);
+
+-- v7.0.1: Nomes de concursos que o usuario EXCLUIU do monitoramento.
+-- Qualquer noticia futura desses concursos e descartada na coleta (nao entra no banco).
+CREATE TABLE IF NOT EXISTS concursos_excluidos (
+    nome_normalizado TEXT PRIMARY KEY,
+    nome_exibicao TEXT,
+    data_exclusao TEXT NOT NULL
+);
 """
 
 
@@ -1675,40 +1683,128 @@ CATEGORIAS_TRANSVERSAIS = {
 }
 
 
+_STOPWORDS_CONCURSO = {
+    "concurso", "concursos", "publico", "publica", "edital", "selecao",
+    "processo", "seletivo", "vagas", "vaga", "inscricao", "inscricoes",
+    "de", "do", "da", "dos", "das", "para", "e", "o", "a", "os", "as",
+    "em", "no", "na", "ate", "com", "novo", "nova",
+}
+
+_UFS_BR = {
+    "ac", "al", "ap", "am", "ba", "ce", "df", "es", "go", "ma", "mt", "ms",
+    "mg", "pa", "pb", "pr", "pe", "pi", "rj", "rn", "rs", "ro", "rr", "sc",
+    "sp", "se", "to",
+}
+
+
+def _tokens_uteis(nome_norm):
+    """Tokens de um nome normalizado, sem stopwords genericas de concurso."""
+    return [t for t in nome_norm.split() if t and t not in _STOPWORDS_CONCURSO]
+
+
+def _compactar_nome(nome_norm):
+    """Versao compactada (sem espacos) p/ comparar variacoes: 'pm rj' -> 'pmrj'."""
+    return "".join(_tokens_uteis(nome_norm))
+
+
+def _nomes_sao_similares(nome_a, nome_b):
+    """Detecta se dois nomes de concurso sao variacoes do mesmo (PM-RJ vs PMERJ).
+
+    Compara as versoes compactadas (sem espacos/stopwords) com:
+    - igualdade direta
+    - um contido no outro (pmrj em pmerj? nao, mas 'tjrj' em 'tjrjtecnico' sim)
+    - similaridade de sequencia >= 0.8 (pega pmrj vs pmerj = 0.89)
+    """
+    import difflib
+    ca = _compactar_nome(_normalizar_nome_concurso(nome_a))
+    cb = _compactar_nome(_normalizar_nome_concurso(nome_b))
+    if not ca or not cb or len(ca) < 3 or len(cb) < 3:
+        return False
+    if ca == cb:
+        return True
+    if (ca in cb or cb in ca) and min(len(ca), len(cb)) >= 4:
+        return True
+    return difflib.SequenceMatcher(None, ca, cb).ratio() >= 0.8
+
+
+def _achar_concurso_similar(nome, concursos):
+    """Retorna o concurso monitorado cujo nome (ou palavras-chave) e variacao de `nome`."""
+    for c in concursos:
+        if _nomes_sao_similares(nome, c.get("nome", "")):
+            return c
+        for kw in (c.get("palavras_chave") or "").split(","):
+            kw = kw.strip()
+            if kw and _nomes_sao_similares(nome, kw):
+                return c
+    return None
+
+
 def _triar_item_por_palavras(item, concursos_monitorados):
     """Tenta encaixar um item num concurso monitorado SO por palavras-chave (sem IA).
 
     Retorna (concurso_id, confianca) onde confianca in ('alta','media',None).
-    - alta: match forte (palavra-chave especifica bateu)
-    - media: match fraco (so o orgao/nome generico bateu)
-    - None: nao encaixou em nenhum
+    - alta: palavra-chave especifica do concurso bateu como frase no texto
+    - media: os tokens identificadores do nome batem como PALAVRAS INTEIRAS
+    - None: nao encaixou
+
+    Regras anti-falso-positivo (corrige bug PM RR casando com tudo):
+    - stopwords ('concurso', 'edital', 'vagas'...) nunca identificam um concurso
+    - comparacao por palavra inteira, nunca substring solta
+    - se o nome do concurso tem UF e o texto menciona OUTRA UF (sem a do
+      concurso), rejeita - PM SP nunca casa com PM RR
+    - exige ao menos 1 token distintivo (>=5 chars, ex 'pmerj') ou 2+ tokens
+      casando juntos (ex 'pm'+'rr')
     """
-    # Texto do item pra buscar (titulo + concurso + orgao)
-    alvo = _normalizar_nome_concurso(
+    alvo_norm = _normalizar_nome_concurso(
         f"{item.get('titulo','')} {item.get('concurso','')} {item.get('orgao','')}"
     )
-    if not alvo:
+    if not alvo_norm:
         return (None, None)
+    alvo_tokens = set(alvo_norm.split())
+    alvo_ufs = alvo_tokens & _UFS_BR
 
     melhor_id = None
     melhor_conf = None
     for c in concursos_monitorados:
-        # Palavras-chave do concurso
-        kws = [k.strip() for k in (c.get("palavras_chave") or "").split(",") if k.strip()]
         nome_norm = _normalizar_nome_concurso(c.get("nome", ""))
-        # Match por palavra-chave especifica = alta confianca
-        for kw in kws:
-            kw_norm = _normalizar_nome_concurso(kw)
-            if kw_norm and len(kw_norm) >= 3 and kw_norm in alvo:
+        toks = _tokens_uteis(nome_norm)
+        ufs_concurso = set(toks) & _UFS_BR
+
+        # Guarda de UF: se o concurso tem UF e o texto cita so OUTRAS UFs, pula
+        if ufs_concurso and alvo_ufs and not (ufs_concurso & alvo_ufs):
+            continue
+
+        # 1) Palavras-chave especificas = ALTA confianca (frase inteira no texto)
+        for kw in (c.get("palavras_chave") or "").split(","):
+            kw_norm = _normalizar_nome_concurso(kw.strip())
+            kw_toks = _tokens_uteis(kw_norm)
+            if not kw_toks:
+                continue
+            kw_compact = "".join(kw_toks)
+            if len(kw_compact) < 4:
+                continue  # kw curta demais (ex 'pm') e perigosa
+            # frase: todos os tokens da kw presentes como palavras inteiras
+            if all(t in alvo_tokens for t in kw_toks):
                 return (c["id"], "alta")
-        # Match pelo nome do concurso (primeiras 2-3 palavras) = media confianca
-        nome_tokens = nome_norm.split()
-        if nome_tokens:
-            # tenta casar os tokens significativos do nome (ignora palavras curtas)
-            sig = [t for t in nome_tokens if len(t) >= 4]
-            if sig and all(t in alvo for t in sig[:2]):
+            # sigla compactada presente como palavra inteira (pmerj)
+            if kw_compact in alvo_tokens:
+                return (c["id"], "alta")
+
+        # 2) Nome do concurso = MEDIA confianca (todos os tokens uteis presentes)
+        if not toks:
+            continue
+        if not all(t in alvo_tokens for t in toks):
+            # tenta tambem a versao compactada do nome ('pm rj' -> 'pmrj' no texto)
+            compact = "".join(toks)
+            if len(compact) >= 4 and compact in alvo_tokens:
                 melhor_id = c["id"]
                 melhor_conf = "media"
+            continue
+        # todos os tokens casaram - exige distintividade
+        tem_distintivo = any(len(t) >= 5 for t in toks)
+        if tem_distintivo or len(toks) >= 2:
+            melhor_id = c["id"]
+            melhor_conf = "media"
     return (melhor_id, melhor_conf)
 
 
@@ -1779,13 +1875,24 @@ def triar_itens(item_ids=None):
                 )
                 stats["sugerido"] += 1
             else:
-                # Sem concurso: marca e registra como possivel sugestao de monitoramento
-                conn.execute(
-                    "UPDATE oportunidades SET status_triagem='sem_concurso' WHERE id=?",
-                    (iid,)
-                )
-                stats["sem_concurso"] += 1
-                _registrar_sugestao_concurso(conn, item, agora)
+                # Antes de tratar como concurso novo: o nome do item e variacao
+                # de um concurso ja monitorado? (PM-RJ vs PMERJ) -> sugestao de encaixe
+                nome_item = (item.get("concurso") or item.get("orgao") or "").strip()
+                similar = _achar_concurso_similar(nome_item, concursos) if nome_item else None
+                if similar:
+                    conn.execute(
+                        "UPDATE oportunidades SET status_triagem='pendente', sugestao_concurso=? WHERE id=?",
+                        (similar["nome"], iid)
+                    )
+                    stats["sugerido"] += 1
+                else:
+                    # Sem concurso: marca e registra como possivel sugestao de monitoramento
+                    conn.execute(
+                        "UPDATE oportunidades SET status_triagem='sem_concurso' WHERE id=?",
+                        (iid,)
+                    )
+                    stats["sem_concurso"] += 1
+                    _registrar_sugestao_concurso(conn, item, agora)
 
     log.info("v7 triagem: %s", stats)
     return stats
@@ -1847,6 +1954,17 @@ def salvar_itens(itens):
         except Exception as e:
             log.warning("blocklist: nao foi possivel carregar (tabela ausente?): %s", e)
 
+        # v7.0.1: blocklist de CONCURSOS excluidos (descarta noticias deles)
+        concursos_bloqueados = set()
+        try:
+            rows = conn.execute("SELECT nome_normalizado FROM concursos_excluidos").fetchall()
+            for r in rows:
+                d = _dict_from_row(r)
+                if d.get("nome_normalizado"):
+                    concursos_bloqueados.add(d["nome_normalizado"])
+        except Exception:
+            pass
+
         for item in itens:
             h = hash_for_dedup(item["titulo"], item.get("orgao", ""), item.get("link", ""))
 
@@ -1855,6 +1973,23 @@ def salvar_itens(itens):
                 bloqueados_blocklist += 1
                 log.info("blocklist: bloqueado re-insercao de '%s'", item["titulo"][:60])
                 continue
+
+            # v7.0.1: BLOCKLIST DE CONCURSOS - noticia de concurso excluido e descartada
+            if concursos_bloqueados:
+                nome_item = (item.get("concurso") or item.get("orgao") or "").strip()
+                if nome_item:
+                    norm_item = _normalizar_nome_concurso(nome_item)
+                    bloqueado = norm_item in concursos_bloqueados
+                    if not bloqueado:
+                        # checa variacoes (PM-RJ vs PMERJ) contra a blocklist
+                        for nb in concursos_bloqueados:
+                            if _nomes_sao_similares(norm_item, nb):
+                                bloqueado = True
+                                break
+                    if bloqueado:
+                        bloqueados_blocklist += 1
+                        log.info("blocklist-concurso: descartado '%s'", item["titulo"][:60])
+                        continue
 
             # Enriquecimento de metricas (YouTube/Reddit) - silencioso se nao configurado
             metricas = enrich_metricas(item.get("link", ""))
@@ -2348,17 +2483,41 @@ def api_concursos_editar(concurso_id):
 def api_concursos_excluir(concurso_id):
     """Para de monitorar um concurso (soft delete: ativo=0).
 
-    As noticias que estavam encaixadas voltam a status 'sem_concurso' (nao somem).
+    v7.0.1: o nome (e palavras-chave) entram na blocklist de concursos -
+    noticias futuras desse concurso sao DESCARTADAS na coleta.
+    As noticias ja encaixadas voltam a status 'sem_concurso' (nao somem).
     """
     try:
+        agora = datetime.now(timezone.utc).isoformat()
         with db_conn() as conn:
+            crow = conn.execute(
+                "SELECT nome, palavras_chave FROM concursos_monitorados WHERE id = ?",
+                (concurso_id,)
+            ).fetchone()
             conn.execute("UPDATE concursos_monitorados SET ativo = 0 WHERE id = ?", (concurso_id,))
             conn.execute(
                 "UPDATE oportunidades SET concurso_id = NULL, status_triagem = 'sem_concurso' "
                 "WHERE concurso_id = ?",
                 (concurso_id,)
             )
-        log.info("v7: concurso %d desmonitorado", concurso_id)
+            # Blocklist: nome + cada palavra-chave viram entradas bloqueadas
+            if crow:
+                d = _dict_from_row(crow)
+                nomes = [d.get("nome", "")]
+                nomes += [k.strip() for k in (d.get("palavras_chave") or "").split(",")]
+                for n in nomes:
+                    n = (n or "").strip()
+                    norm = _normalizar_nome_concurso(n)
+                    if norm and len(norm) >= 3:
+                        try:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO concursos_excluidos "
+                                "(nome_normalizado, nome_exibicao, data_exclusao) VALUES (?, ?, ?)",
+                                (norm, n, agora)
+                            )
+                        except Exception:
+                            pass
+        log.info("v7: concurso %d desmonitorado e adicionado a blocklist", concurso_id)
         return jsonify({"ok": True, "id": concurso_id})
     except Exception as e:
         log.error("api_concursos_excluir erro: %s", e)
@@ -2377,6 +2536,78 @@ def api_concursos_prioridade(concurso_id):
             conn.execute("UPDATE concursos_monitorados SET prioridade = ? WHERE id = ?", (p, concurso_id))
         return jsonify({"ok": True, "id": concurso_id, "prioridade": p})
     except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/mesclar", methods=["POST"])
+def api_concursos_mesclar():
+    """Mescla um ou mais concursos num concurso de destino.
+
+    Body: { destino_id: int, origem_ids: [int, ...] }
+    - As noticias dos concursos de origem migram pro destino
+    - Os nomes e palavras-chave de origem viram palavras-chave do destino
+      (prevalece o nome do destino)
+    - Os concursos de origem sao desativados (sem entrar na blocklist)
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        destino_id = data.get("destino_id")
+        origem_ids = data.get("origem_ids") or []
+        if not destino_id or not origem_ids:
+            return jsonify({"erro": "destino_id e origem_ids obrigatorios"}), 400
+        origem_ids = [int(x) for x in origem_ids if int(x) != int(destino_id)]
+        if not origem_ids:
+            return jsonify({"erro": "nenhuma origem valida"}), 400
+
+        with db_conn() as conn:
+            drow = conn.execute(
+                "SELECT id, nome, palavras_chave FROM concursos_monitorados WHERE id = ?",
+                (destino_id,)
+            ).fetchone()
+            if not drow:
+                return jsonify({"erro": "destino nao encontrado"}), 404
+            destino = _dict_from_row(drow)
+            kws = [k.strip() for k in (destino.get("palavras_chave") or "").split(",") if k.strip()]
+
+            noticias_movidas = 0
+            for oid in origem_ids:
+                orow = conn.execute(
+                    "SELECT id, nome, palavras_chave FROM concursos_monitorados WHERE id = ?",
+                    (oid,)
+                ).fetchone()
+                if not orow:
+                    continue
+                origem = _dict_from_row(orow)
+                # nome + kws da origem viram kws do destino
+                candidatos = [origem.get("nome", "")]
+                candidatos += [k.strip() for k in (origem.get("palavras_chave") or "").split(",")]
+                for cand in candidatos:
+                    cand = (cand or "").strip()
+                    if cand and cand not in kws and cand.lower() != destino.get("nome", "").lower():
+                        kws.append(cand)
+                # move noticias
+                cur = conn.execute(
+                    "UPDATE oportunidades SET concurso_id = ? WHERE concurso_id = ?",
+                    (destino_id, oid)
+                )
+                try:
+                    noticias_movidas += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                except Exception:
+                    pass
+                # desativa origem (sem blocklist - foi mescla, nao exclusao)
+                conn.execute("UPDATE concursos_monitorados SET ativo = 0 WHERE id = ?", (oid,))
+
+            conn.execute(
+                "UPDATE concursos_monitorados SET palavras_chave = ? WHERE id = ?",
+                (", ".join(kws), destino_id)
+            )
+
+        log.info("v7: mescla -> destino %s, origens %s", destino_id, origem_ids)
+        return jsonify({"ok": True, "destino_id": destino_id,
+                        "origens_mescladas": len(origem_ids),
+                        "noticias_movidas": noticias_movidas})
+    except Exception as e:
+        log.error("api_concursos_mesclar erro: %s", e)
         return jsonify({"erro": str(e)}), 500
 
 
@@ -2605,13 +2836,22 @@ def api_importar_do_radar():
 
             # 2. Carrega concursos ja monitorados pra evitar duplicatas
             existentes = conn.execute(
-                "SELECT nome FROM concursos_monitorados"
+                "SELECT id, nome, palavras_chave FROM concursos_monitorados WHERE ativo = 1"
             ).fetchall()
+            concursos_existentes = [_dict_from_row(r) for r in existentes]
             nomes_existentes = set()
-            for r in existentes:
-                d = _dict_from_row(r)
-                nomes_existentes.add(_normalizar_nome_concurso(d.get("nome", "")))
+            for c in concursos_existentes:
+                nomes_existentes.add(_normalizar_nome_concurso(c.get("nome", "")))
 
+            # v7.0.1: blocklist - concursos excluidos nao renascem na importacao
+            bloqueados = set()
+            try:
+                for r in conn.execute("SELECT nome_normalizado FROM concursos_excluidos").fetchall():
+                    bloqueados.add(_dict_from_row(r)["nome_normalizado"])
+            except Exception:
+                pass
+
+            incorporados = 0
             # 3. Para cada concurso unico, cria se nao existe
             for r in rows:
                 d = _dict_from_row(r)
@@ -2622,6 +2862,24 @@ def api_importar_do_radar():
                 nome_norm = _normalizar_nome_concurso(nome)
                 if nome_norm in nomes_existentes:
                     ja_existiam += 1
+                    continue
+                if nome_norm in bloqueados:
+                    continue  # concurso excluido pelo usuario - nao renasce
+
+                # v7.0.1: variacao de concurso existente? (PM-RJ vs PMERJ)
+                # Prevalece o nome JA CADASTRADO; a variacao vira palavra-chave dele.
+                similar = _achar_concurso_similar(nome, concursos_existentes)
+                if similar:
+                    kws_atuais = [k.strip() for k in (similar.get("palavras_chave") or "").split(",") if k.strip()]
+                    if nome not in kws_atuais:
+                        kws_atuais.append(nome)
+                        novas_kw = ", ".join(kws_atuais)
+                        conn.execute(
+                            "UPDATE concursos_monitorados SET palavras_chave = ? WHERE id = ?",
+                            (novas_kw, similar["id"])
+                        )
+                        similar["palavras_chave"] = novas_kw
+                    incorporados += 1
                     continue
 
                 banca = (d.get("banca") or "").strip()
@@ -2650,9 +2908,16 @@ def api_importar_do_radar():
                     (nome, banca, palavras, prioridade, vagas, agora)
                 )
                 nomes_existentes.add(nome_norm)
+                crow2 = conn.execute(
+                    "SELECT id, nome, palavras_chave FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1",
+                    (nome,)
+                ).fetchone()
+                if crow2:
+                    concursos_existentes.append(_dict_from_row(crow2))
                 criados += 1
 
-        log.info("v7 importar-do-radar: %d criados, %d ja existiam", criados, ja_existiam)
+        log.info("v7 importar-do-radar: %d criados, %d ja existiam, %d incorporados como variacao",
+                 criados, ja_existiam, incorporados)
 
         # 4. Roda triagem retroativa pra encaixar as noticias nos concursos recem-criados
         stats_triagem = {"info": "nao rodou"}
@@ -2671,6 +2936,7 @@ def api_importar_do_radar():
         return jsonify({
             "ok": True,
             "concursos_criados": criados,
+            "incorporados_como_variacao": incorporados,
             "ja_existiam": ja_existiam,
             "triagem": stats_triagem,
         })
@@ -2934,6 +3200,155 @@ def cron_manual():
         "categorias": cats,
         "mensagem": f"Coleta iniciada ({len(cats)} categorias). Aguarde 2-4 minutos e recarregue."
     })
+
+
+def coletar_concurso_especifico(api_key, termo):
+    """v7.0.1: coleta DIRIGIDA sobre um concurso especifico pedido pelo usuario.
+
+    Mesma infra anti-fake da coleta normal: web_search real, link obrigatorio
+    citado nas buscas, dominio na whitelist. Salva via salvar_itens (dedupe +
+    blocklist + triagem automatica).
+    """
+    hoje = datetime.now(timezone.utc)
+    data_limite = (hoje - timedelta(days=30)).strftime("%d/%m/%Y")
+    prompt = f"""Voce e um pesquisador do escritorio Silva Pinto Advocacia, especializado em concursos publicos.
+
+MISSAO: levantar as noticias mais recentes e relevantes sobre UM CONCURSO ESPECIFICO: "{termo}"
+
+Realize 3 a 5 buscas com a ferramenta web_search, variando os termos, por exemplo:
+  1. {termo} concurso noticias
+  2. {termo} edital gabarito resultado
+  3. {termo} eliminados TAF recurso
+  4. {termo} convocacao nomeacao
+
+== REGRAS RIGIDAS (anti-invencao) ==
+1. So inclua itens encontrados de VERDADE nas buscas. NUNCA invente.
+2. Cada item DEVE ter o link EXATO retornado pela web_search. Nao construa URLs.
+3. Apenas conteudo publicado em {data_limite} ou DEPOIS.
+4. Apenas noticias factuais de eventos especificos (gabarito, edital, eliminacao, TAF, convocacao, recurso, nomeacao). Nada de artigos explicativos ou material de cursinho.
+5. Se nada relevante for encontrado, retorne {{"itens": []}} - isso e aceitavel.
+6. Nao repita o mesmo evento em itens diferentes.
+
+== FORMATO ==
+Retorne SOMENTE JSON puro, sem markdown e sem texto fora do JSON:
+{{
+  "itens": [
+    {{
+      "titulo": "Titulo objetivo real",
+      "descricao": "Resumo de 2-3 frases com dados concretos",
+      "data_publicacao": "DD/MM/AAAA",
+      "orgao": "Orgao ou vazio",
+      "estado": "UF ou Brasil",
+      "concurso": "Nome do concurso (ex: {termo})",
+      "cargo": "Cargo ou vazio",
+      "banca": "Banca ou vazio",
+      "vagas": "Numero ou vazio",
+      "salario": "R$ ou vazio",
+      "prazo_inscricao": "Data ou vazio",
+      "data_prova": "Data ou vazio",
+      "fase_atual": "Fase atual ou vazio",
+      "link": "URL exata da web_search",
+      "relevancia": 1 a 10
+    }}
+  ]
+}}"""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=240.0, max_retries=2)
+        msg = client.messages.create(
+            model=MODEL_TIER1,
+            max_tokens=8000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text_parts = []
+        urls_citadas = set()
+        for block in msg.content:
+            btype = getattr(block, "type", "")
+            if btype == "web_search_tool_result":
+                content = getattr(block, "content", None)
+                if isinstance(content, list):
+                    for result in content:
+                        url = getattr(result, "url", None)
+                        if url:
+                            urls_citadas.add(url)
+            elif hasattr(block, "text") and block.text:
+                text_parts.append(block.text)
+                citations = getattr(block, "citations", None)
+                if isinstance(citations, list):
+                    for cit in citations:
+                        url = getattr(cit, "url", None)
+                        if url:
+                            urls_citadas.add(url)
+        raw = "".join(text_parts).strip()
+        data = parse_json_robusto(raw)
+        if data is None:
+            log.warning("[busca-dirigida] JSON nao parseado")
+            return 0
+        brutos = data.get("itens", [])
+        itens = []
+        for it in brutos:
+            link = (it.get("link") or "").strip()
+            if not link or not _dominio_permitido(link):
+                continue
+            if not _link_em_citacoes(link, urls_citadas):
+                continue
+            itens.append({
+                "categoria": "busca_dirigida",
+                "tier": 1,
+                "flag": "BUSCA",
+                "titulo": str(it.get("titulo", ""))[:300],
+                "descricao": str(it.get("descricao", ""))[:1000],
+                "orgao": str(it.get("orgao", ""))[:120],
+                "estado": str(it.get("estado", ""))[:40],
+                "concurso": str(it.get("concurso", "") or termo)[:160],
+                "cargo": str(it.get("cargo", ""))[:120],
+                "banca": str(it.get("banca", ""))[:80],
+                "vagas": str(it.get("vagas", ""))[:40],
+                "salario": str(it.get("salario", ""))[:60],
+                "prazo_inscricao": str(it.get("prazo_inscricao", ""))[:60],
+                "data_prova": str(it.get("data_prova", ""))[:60],
+                "fase_atual": str(it.get("fase_atual", ""))[:120],
+                "data_publicacao": str(it.get("data_publicacao", ""))[:20],
+                "extras_json": "{}",
+                "link": link,
+                "relevancia": int(it.get("relevancia", 7) or 7),
+                "etapa_concurso": "",
+            })
+        inseridos = salvar_itens(itens)
+        log.info("[busca-dirigida] '%s': %d brutos, %d validos, %d inseridos",
+                 termo, len(brutos), len(itens), len(inseridos))
+        return len(inseridos)
+    except Exception as e:
+        log.error("[busca-dirigida] erro: %s", e)
+        return 0
+
+
+@app.route("/api/coleta/concurso", methods=["POST"])
+def api_coleta_concurso():
+    """v7.0.1: dispara coleta dirigida sobre um concurso especifico (em background).
+
+    Body: { termo: "PC-SP 2026" }
+    O concurso NAO precisa estar na lista de monitorados. As noticias achadas
+    passam pela triagem normal (encaixam se monitorado; senao viram sugestao).
+    """
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
+    data = request.get_json(force=True) or {}
+    termo = str(data.get("termo", "")).strip()
+    if not termo or len(termo) < 3:
+        return jsonify({"erro": "termo muito curto"}), 400
+
+    def run():
+        try:
+            coletar_concurso_especifico(ANTHROPIC_API_KEY, termo)
+        except Exception as e:
+            log.error("coleta dirigida falhou: %s", e)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    log.info("v7: coleta dirigida disparada: '%s'", termo)
+    return jsonify({"ok": True, "termo": termo, "status": "coletando em background (1-2 min)"})
 
 
 @app.route("/debug")
@@ -3241,10 +3656,6 @@ HTML_INDEX = r"""<!DOCTYPE html>
 </head>
 <body>
 
-<div class="mockup-banner">
-  PROTOTIPO v7 &mdash; dados ficticios, nada conectado ainda. <b>Navegue pelas 3 telas no menu para validar o fluxo completo.</b>
-</div>
-
 <header>
   <img src="data:image/png;base64,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" alt="Silva Pinto" style="height:52px;width:auto;flex-shrink:0;object-fit:contain;">
   <div class="brand">
@@ -3254,7 +3665,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   <div class="search-wrap">
     <div class="search-box">
       <span class="icon">&#128269;</span>
-      <input type="text" placeholder="Pesquisar concurso ao vivo &#8212; ex: PMERJ, Receita, TJRJ..." onkeydown="if(event.key==='Enter')buscaAoVivo(this.value)">
+      <input type="text" placeholder="Coletar noticias de um concurso especifico &#8212; ex: PC-SP 2026" onkeydown="if(event.key==='Enter'){buscaDirigida(this.value);this.value='';}">
       <span class="hint">enter busca</span>
     </div>
   </div>
@@ -3311,7 +3722,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   const PRIO_COR = { urgente: '#c0392b', importante: '#BB904C', naourgente: '#2e9e5b' };
   const PRIO_LABEL = { urgente: 'Urgente', importante: 'Importante', naourgente: 'Nao urgente' };
   const PRIO_ORDEM = ['urgente','importante','naourgente'];
-  const TAG_CSS = { gabarito:'t-gabarito', recurso:'t-recurso', fase:'t-fase', nomeacao:'t-nomeacao', inscricao:'t-inscricao' };
+  const TAG_CSS = { gabarito:'t-gabarito', recurso:'t-recurso', fase:'t-fase', nomeacao:'t-nomeacao', inscricao:'t-inscricao', busca:'t-recurso' };
 
   function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   function tn(s) { return String(s||'').replace(/[^\w\s]/g,' ').replace(/\s+/g,' ').trim().toLowerCase(); }
@@ -3364,18 +3775,24 @@ HTML_INDEX = r"""<!DOCTYPE html>
     // Ordena por prioridade (urgente primeiro)
     concursos.sort((a,b) => PRIO_ORDEM.indexOf(a.prioridade) - PRIO_ORDEM.indexOf(b.prioridade));
 
+    // v7.0.1: na primeira pagina, so aparecem concursos COM noticias
+    // (os sem noticia continuam visiveis em "Gerenciar concursos")
+    const visiveis = concursos.filter(c => c.noticias.length > 0);
+
     let fichasHtml = '';
     if(!concursos.length) {
       fichasHtml = '<div style="padding:40px;text-align:center;color:var(--cinza)">Nenhum concurso monitorado ainda. Va em \"Gerenciar concursos\" para adicionar.</div>';
+    } else if(!visiveis.length) {
+      fichasHtml = '<div style="padding:40px;text-align:center;color:var(--cinza)">Nenhum concurso com noticias no momento. Use \"Coletar agora\" ou a busca no topo.</div>';
     }
-    for(const c of concursos) {
+    for(const c of visiveis) {
       const novas = c.noticias.filter(n=>n.eh_novo).length;
       const aberta = novas > 0 ? 'aberta' : '';
       const cor = PRIO_COR[c.prioridade]||PRIO_COR.importante;
       const headClass = c.prioridade || 'importante';
       let nots = '';
       for(const n of c.noticias) {
-        const cat = (n.categoria||'').replace('elim_ativas','gabarito').replace('taf_fases','fase').replace('recurso_anulacao','recurso').replace('radar_volume','inscricao');
+        const cat = (n.categoria||'').replace('elim_ativas','gabarito').replace('taf_fases','fase').replace('recurso_anulacao','recurso').replace('radar_volume','inscricao').replace('busca_dirigida','busca');
         const tagCss = TAG_CSS[cat] || 'ntag';
         const tagLabel = cat.charAt(0).toUpperCase()+cat.slice(1);
         const gerado = n.selecionado_marketing ? true : false;
@@ -3388,7 +3805,6 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '<button class="mini" onclick="excluirItem('+n.id+',this)">Excluir</button>' +
           '</div></div></div>';
       }
-      if(!c.noticias.length) nots = '<div style="padding:16px 0;color:var(--cinza);font-size:13px">Nenhuma noticia encaixada ainda neste concurso.</div>';
       fichasHtml += '<div class="ficha '+aberta+'" data-id="'+c.id+'">' +
         '<div class="ficha-head '+headClass+'" onclick="toggleFicha(this)">' +
         '<span class="chev">&#9656;</span>' +
@@ -3403,10 +3819,11 @@ HTML_INDEX = r"""<!DOCTYPE html>
     for(const t of temas) {
       const kind = t.tipo_transversal || 'jurisprudencia';
       const kindLabel = kind==='jurisprudencia'?'Jurisprudencia':kind==='concorrencia'?'Concorrencia':'Tendencia';
-      temasHtml += '<div class="sitem"><div class="sk '+kind+'">'+kindLabel+'</div>' +
+      temasHtml += '<div class="sitem" data-tema-id="'+t.id+'"><div class="sk '+kind+'">'+kindLabel+'</div>' +
         '<div class="si-title">'+esc(t.titulo)+'</div>' +
         (t.link ? '<a class="mini" href="'+esc(t.link)+'" target="_blank" style="font-size:10px">Ver fonte</a> ' : '') +
-        '<button class="mini gerar" onclick="gerarConteudo('+t.id+',this)" style="font-size:10px">&#9998; Gerar</button></div>';
+        '<button class="mini gerar" onclick="gerarConteudo('+t.id+',this)" style="font-size:10px">&#9998; Gerar</button> ' +
+        '<button class="mini" onclick="excluirTema('+t.id+',this)" style="font-size:10px">Excluir</button></div>';
     }
     if(!temasHtml) temasHtml = '<div style="color:var(--cinza);font-size:12px;padding:14px 0">Nenhum tema transversal recente.</div>';
 
@@ -3414,7 +3831,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
       '<div class="legenda"><span><span class="sq" style="background:var(--urgente)"></span>Urgente</span>' +
       '<span><span class="sq" style="background:var(--importante)"></span>Importante</span>' +
       '<span><span class="sq" style="background:var(--naourgente)"></span>Nao urgente</span>' +
-      '<span style="margin-left:auto;font-style:italic;font-size:10px">Clique na bolinha para alternar</span></div>' +
+      '<button class="add-btn" style="margin-left:auto;padding:8px 16px;font-size:11px" onclick="coletarTudo()">&#8635; Coletar agora</button></div>' +
       '<div class="split"><div class="split-main">'+fichasHtml+'</div>' +
       '<aside class="side"><h4 class="serif">Temas do momento</h4>' +
       '<div class="side-sub">Jurisprudencia, concorrencia e tendencias (transversais).</div>' +
@@ -3471,24 +3888,32 @@ HTML_INDEX = r"""<!DOCTYPE html>
     cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando...</div>';
     const data = await GET('/api/concursos');
     const concursos = data.concursos || [];
+    window._concursosCache = concursos;
 
     let cards = '';
     for(const c of concursos) {
-      const cor = PRIO_COR[c.prioridade]||PRIO_COR.importante;
       const kws = (c.palavras_chave||'').split(',').filter(k=>k.trim()).map(k=>'<span class="kw">'+esc(k.trim())+'</span>').join('');
+      // v7.0.1: seletor de prioridade com as 3 bolinhas (escolha direta)
+      let seletor = '';
+      for(const p of PRIO_ORDEM) {
+        const ativa = (c.prioridade === p);
+        seletor += '<button class="stage-dot" title="'+PRIO_LABEL[p]+'" style="background:'+PRIO_COR[p]+';width:14px;height:14px;'+(ativa?'box-shadow:0 0 0 2px var(--preto);':'opacity:0.35;')+'" onclick="definirPrio('+c.id+',\''+p+'\',this)"></button>';
+      }
       cards += '<div class="monit-card"><h4 class="serif">'+esc(c.nome)+'</h4>' +
         '<div class="mc-meta">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas</div>' +
         '<div>'+kws+'</div>' +
         '<div class="mc-foot"><span class="mc-count">'+c.noticias_count+' noticia(s)</span>' +
+        '<span style="display:flex;gap:5px;align-items:center">'+seletor+'</span></div>' +
+        '<div style="display:flex;gap:7px;margin-top:10px">' +
+        '<button class="mini" onclick="abrirMesclar('+c.id+')">Mesclar</button>' +
         '<button class="mini" style="color:#b23b32;border-color:#b23b32" onclick="excluirConcurso('+c.id+',\''+esc(c.nome)+'\')">Excluir</button>' +
-        '<button class="stage-dot" title="'+PRIO_LABEL[c.prioridade]+'" style="background:'+cor+'" onclick="ciclarPrio('+c.id+',this)"></button>' +
         '</div></div>';
     }
     if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso monitorado. Adicione o primeiro!</div>';
 
     cont.innerHTML = '<div class="tela active">' +
       '<div class="add-bar"><button class="add-btn" onclick="abrirModal()">+ Monitorar novo concurso</button>' +
-      '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar do Radar</button></div>' +
+      '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar concursos do acervo</button></div>' +
       '<div class="monit-grid">'+cards+'</div></div>';
   }
 
@@ -3560,7 +3985,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     document.getElementById('outro-novo-nome').value='';
     document.getElementById('outro-menu').classList.add('show');
   }
-  function fecharOutro() { document.getElementById('outro-menu').classList.remove('show'); _outroAlvo=null; }
+  function fecharOutro() { document.getElementById('outro-menu').classList.remove('show'); _outroAlvo=null; _mesclarOrigem=null; document.querySelector('#outro-menu .outro-novo').style.display=''; document.querySelector('#outro-menu h3').textContent='Encaixar em outro concurso'; }
   async function encaixarEm(concursoId) {
     fecharOutro();
     const r = await POST('/api/inbox/'+_outroAlvo+'/confirmar', {concurso_id:concursoId});
@@ -3593,9 +4018,57 @@ HTML_INDEX = r"""<!DOCTYPE html>
   }
 
   async function excluirConcurso(cid, nome) {
-    if(!confirm('Parar de monitorar "'+nome+'"?\n\nAs noticias encaixadas nao serao apagadas, apenas desvinculadas.')) return;
+    if(!confirm('Parar de monitorar "'+nome+'"?\n\nO nome entra na lista de bloqueio: noticias futuras desse concurso serao DESCARTADAS pela coleta.\nAs noticias ja encaixadas nao serao apagadas, apenas desvinculadas.')) return;
     const r = await DEL('/api/concursos/'+cid);
-    if(r.ok) { toast('Concurso removido'); renderTelaGerenciar(); }
+    if(r.ok) { toast('Concurso removido e bloqueado nas proximas coletas'); renderTelaGerenciar(); }
+  }
+
+  // v7.0.1: define prioridade direta (3 bolinhas)
+  async function definirPrio(cid, prio, btn) {
+    const r = await POST('/api/concursos/'+cid+'/prioridade', {prioridade:prio});
+    if(r.ok) { toast('Prioridade: '+PRIO_LABEL[prio]); renderTelaGerenciar(); }
+  }
+
+  // v7.0.1: excluir tema transversal (mesma exclusao permanente de noticia)
+  async function excluirTema(itemId, btn) {
+    if(!confirm('Excluir este tema permanentemente?')) return;
+    const r = await DEL('/api/oportunidades/'+itemId);
+    if(r.ok) { const el = btn.closest('.sitem'); if(el) el.remove(); toast('Tema excluido'); }
+  }
+
+  // v7.0.1: mesclar concursos
+  let _mesclarOrigem = null;
+  function abrirMesclar(cid) {
+    _mesclarOrigem = cid;
+    const outros = (window._concursosCache||[]).filter(c => c.id !== cid);
+    if(!outros.length) { toast('Nao ha outro concurso para mesclar'); return; }
+    const origem = (window._concursosCache||[]).find(c=>c.id===cid);
+    const lista = outros.map(c=>'<div class="outro-item" onclick="mesclarCom('+c.id+')">'+esc(c.nome)+'</div>').join('');
+    document.getElementById('outro-list').innerHTML =
+      '<div style="font-size:12px;color:var(--cinza);margin-bottom:10px">Mesclar <b>'+esc(origem?origem.nome:'')+'</b> com qual concurso? O escolhido sera o nome principal; este vira variacao (palavra-chave) e as noticias migram.</div>' + lista;
+    document.getElementById('outro-novo-nome').value='';
+    document.querySelector('#outro-menu .outro-novo').style.display='none';
+    document.querySelector('#outro-menu h3').textContent='Mesclar concursos';
+    document.getElementById('outro-menu').classList.add('show');
+  }
+  async function mesclarCom(destinoId) {
+    const origem = _mesclarOrigem;
+    document.getElementById('outro-menu').classList.remove('show');
+    document.querySelector('#outro-menu .outro-novo').style.display='';
+    document.querySelector('#outro-menu h3').textContent='Encaixar em outro concurso';
+    _mesclarOrigem = null;
+    toast('Mesclando...');
+    const r = await POST('/api/concursos/mesclar', {destino_id:destinoId, origem_ids:[origem]});
+    if(r.ok) { toast('Mesclado: '+(r.noticias_movidas||0)+' noticia(s) migraram'); renderTelaGerenciar(); }
+    else toast('Erro: '+(r.erro||''));
+  }
+
+  // v7.0.1: busca dirigida - coleta focada num concurso especifico
+  async function buscaDirigida(termo) {
+    if(!termo || termo.trim().length < 3) { toast('Digite o nome do concurso'); return; }
+    const r = await POST('/api/coleta/concurso', {termo: termo.trim()});
+    if(r.ok) toast('Coletando noticias de "'+termo.trim()+'" em background. Aguarde 1-2 min e recarregue.', 8000);
+    else toast('Erro: '+(r.erro||''), 5000);
   }
 
   async function importarDoRadar() {
@@ -3629,12 +4102,6 @@ HTML_INDEX = r"""<!DOCTYPE html>
       document.getElementById('add-kw').value='';
       if(telAtual==='gerenciar') renderTelaGerenciar();
     } else toast('Erro: '+(r.erro||''));
-  }
-
-  // ===== BUSCA AO VIVO =====
-  async function buscaAoVivo(termo) {
-    if(!termo.trim()) return;
-    toast('Buscando: "'+termo+'"... (busca sob demanda sera implementada na proxima versao)',5000);
   }
 
   // ===== COLETA MANUAL =====
