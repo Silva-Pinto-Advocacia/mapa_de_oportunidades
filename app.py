@@ -15,6 +15,7 @@ import logging
 import sqlite3
 import threading
 import traceback
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.0.2-2026-06-10"
+APP_VERSION = "v7.0.3-2026-06-10"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +57,14 @@ DEMO_MODE = os.environ.get("DEMO_MODE", "0") == "1"
 
 # Notificacao Discord (webhook URL). Se vazio, nao envia.
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+
+# v7.0.3: sincronizacao com a pagina 'Concursos' do sistema de marketing.
+# O painel envia upserts/remocoes pra manter os dois espelhados.
+# Mapeamento de etapas 1:1 -> urgente | importante | nao_urgente
+CONCURSOS_MKT_URL = os.environ.get(
+    "CONCURSOS_MKT_URL",
+    "https://silvapinto-comercial.onrender.com/marketing/concursos/sincronizar-externo"
+).strip()
 
 # YouTube Data API (opcional). Se vazio, pula enrichment.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
@@ -1219,6 +1228,53 @@ def enrich_metricas(link):
 
 
 # ===== NOTIFICACAO: Discord webhook =====
+
+def _sync_concurso_marketing(concurso, acao="upsert"):
+    """v7.0.3: espelha um concurso monitorado na pagina 'Concursos' do marketing.
+
+    Roda em THREAD (fire-and-forget): nunca bloqueia nem quebra o painel se o
+    sistema de marketing estiver fora do ar.
+
+    Payload enviado (contrato definido pelo painel):
+      { "nome": str,            # identificador do card (upsert por nome)
+        "banca": str, "vagas": str,
+        "etapa": "urgente" | "importante" | "nao_urgente",
+        "acao": "upsert" | "remover",
+        "origem": "painel-oportunidades" }
+    """
+    if not CONCURSOS_MKT_URL:
+        return
+
+    prio_map = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
+    payload = {
+        "nome": (concurso.get("nome") or "").strip(),
+        "banca": (concurso.get("banca") or "").strip(),
+        "vagas": (concurso.get("vagas") or "").strip(),
+        "etapa": prio_map.get(concurso.get("prioridade", "importante"), "importante"),
+        "acao": acao,
+        "origem": "painel-oportunidades",
+    }
+    if not payload["nome"]:
+        return
+
+    def _send():
+        try:
+            req = urllib.request.Request(
+                CONCURSOS_MKT_URL,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                if resp.status >= 300:
+                    log.warning("sync-mkt: status %d para '%s'", resp.status, payload["nome"])
+                else:
+                    log.info("sync-mkt: %s '%s' -> %s", acao, payload["nome"], payload["etapa"])
+        except Exception as e:
+            log.warning("sync-mkt: falha para '%s' (%s) - painel segue normal", payload["nome"], e)
+
+    threading.Thread(target=_send, daemon=True).start()
+
 
 def notificar_discord(itens_novos):
     """Envia mensagem no Discord com lista de novos itens. Silencioso se DISCORD_WEBHOOK_URL nao configurado."""
@@ -2485,8 +2541,9 @@ def api_concursos_criar():
                 "SELECT * FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1",
                 (nome,)
             ).fetchone()
-        novo = _dict_from_row(row) if row else {"nome": nome}
+        novo = _dict_from_row(row) if row else {"nome": nome, "prioridade": prioridade, "banca": banca, "vagas": vagas}
         log.info("v7: concurso monitorado criado: %s", nome)
+        _sync_concurso_marketing(novo, "upsert")
         return jsonify({"ok": True, "concurso": novo})
     except Exception as e:
         log.error("api_concursos_criar erro: %s", e)
@@ -2535,7 +2592,7 @@ def api_concursos_excluir(concurso_id):
         agora = datetime.now(timezone.utc).isoformat()
         with db_conn() as conn:
             crow = conn.execute(
-                "SELECT nome, palavras_chave FROM concursos_monitorados WHERE id = ?",
+                "SELECT * FROM concursos_monitorados WHERE id = ?",
                 (concurso_id,)
             ).fetchone()
             conn.execute("UPDATE concursos_monitorados SET ativo = 0 WHERE id = ?", (concurso_id,))
@@ -2562,6 +2619,8 @@ def api_concursos_excluir(concurso_id):
                         except Exception:
                             pass
         log.info("v7: concurso %d desmonitorado e adicionado a blocklist", concurso_id)
+        if crow:
+            _sync_concurso_marketing(_dict_from_row(crow), "remover")
         return jsonify({"ok": True, "id": concurso_id})
     except Exception as e:
         log.error("api_concursos_excluir erro: %s", e)
@@ -2578,6 +2637,9 @@ def api_concursos_prioridade(concurso_id):
             return jsonify({"erro": "prioridade invalida"}), 400
         with db_conn() as conn:
             conn.execute("UPDATE concursos_monitorados SET prioridade = ? WHERE id = ?", (p, concurso_id))
+            crow = conn.execute("SELECT * FROM concursos_monitorados WHERE id = ?", (concurso_id,)).fetchone()
+        if crow:
+            _sync_concurso_marketing(_dict_from_row(crow), "upsert")
         return jsonify({"ok": True, "id": concurso_id, "prioridade": p})
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
@@ -2647,6 +2709,15 @@ def api_concursos_mesclar():
             )
 
         log.info("v7: mescla -> destino %s, origens %s", destino_id, origem_ids)
+        # sync marketing: origens somem, destino atualiza
+        with db_conn() as conn:
+            for oid in origem_ids:
+                orow = conn.execute("SELECT * FROM concursos_monitorados WHERE id = ?", (oid,)).fetchone()
+                if orow:
+                    _sync_concurso_marketing(_dict_from_row(orow), "remover")
+            drow2 = conn.execute("SELECT * FROM concursos_monitorados WHERE id = ?", (destino_id,)).fetchone()
+            if drow2:
+                _sync_concurso_marketing(_dict_from_row(drow2), "upsert")
         return jsonify({"ok": True, "destino_id": destino_id,
                         "origens_mescladas": len(origem_ids),
                         "noticias_movidas": noticias_movidas})
@@ -2715,6 +2786,7 @@ def api_concursos_limpar_duplicados():
                     except Exception:
                         pass
                     conn.execute("UPDATE concursos_monitorados SET ativo = 0 WHERE id = ?", (o["id"],))
+                    _sync_concurso_marketing(o, "remover")
                     duplicatas_removidas += 1
                 conn.execute(
                     "UPDATE concursos_monitorados SET palavras_chave = ? WHERE id = ?",
@@ -2729,6 +2801,27 @@ def api_concursos_limpar_duplicados():
                         "noticias_movidas": noticias_movidas})
     except Exception as e:
         log.error("api_concursos_limpar_duplicados erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/sincronizar-marketing", methods=["POST"])
+def api_concursos_sincronizar_marketing():
+    """v7.0.3: envia TODOS os concursos monitorados ativos pra pagina 'Concursos'
+    do sistema de marketing (upsert em massa). Use para o sync inicial ou para
+    realinhar os dois sistemas."""
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM concursos_monitorados WHERE ativo = 1"
+            ).fetchall()
+            concursos = [_dict_from_row(r) for r in rows]
+        for c in concursos:
+            _sync_concurso_marketing(c, "upsert")
+        log.info("v7: sync completo com marketing disparado (%d concursos)", len(concursos))
+        return jsonify({"ok": True, "enviados": len(concursos),
+                        "destino": CONCURSOS_MKT_URL})
+    except Exception as e:
+        log.error("api_concursos_sincronizar_marketing erro: %s", e)
         return jsonify({"erro": str(e)}), 500
 
 
@@ -2839,6 +2932,10 @@ def api_inbox_criar_encaixar(item_id):
             )
         log.info("v7: concurso '%s' %s e item %d encaixado", nome,
                  "ja existia" if existente else "criado", item_id)
+        with db_conn() as conn:
+            crow2 = conn.execute("SELECT * FROM concursos_monitorados WHERE id = ?", (cid,)).fetchone()
+        if crow2:
+            _sync_concurso_marketing(_dict_from_row(crow2), "upsert")
         return jsonify({"ok": True, "concurso_id": cid, "item_id": item_id})
     except Exception as e:
         log.error("api_inbox_criar_encaixar erro: %s", e)
@@ -2907,6 +3004,10 @@ def api_sugestao_monitorar(sug_id):
         except Exception as e:
             log.warning("re-triagem pos-monitorar falhou: %s", e)
         log.info("v7: sugestao %d virou concurso monitorado '%s'", sug_id, nome)
+        with db_conn() as conn:
+            crow2 = conn.execute("SELECT * FROM concursos_monitorados WHERE id = ?", (cid,)).fetchone()
+        if crow2:
+            _sync_concurso_marketing(_dict_from_row(crow2), "upsert")
         return jsonify({"ok": True, "concurso_id": cid, "nome": nome})
     except Exception as e:
         log.error("api_sugestao_monitorar erro: %s", e)
@@ -3051,7 +3152,12 @@ def api_importar_do_radar():
                     (nome,)
                 ).fetchone()
                 if crow2:
-                    concursos_existentes.append(_dict_from_row(crow2))
+                    novo_c = _dict_from_row(crow2)
+                    novo_c["prioridade"] = prioridade
+                    novo_c["banca"] = banca
+                    novo_c["vagas"] = vagas
+                    concursos_existentes.append(novo_c)
+                    _sync_concurso_marketing(novo_c, "upsert")
                 criados += 1
 
         log.info("v7 importar-do-radar: %d criados, %d ja existiam, %d incorporados como variacao",
@@ -4052,7 +4158,8 @@ HTML_INDEX = r"""<!DOCTYPE html>
     cont.innerHTML = '<div class="tela active">' +
       '<div class="add-bar"><button class="add-btn" onclick="abrirModal()">+ Monitorar novo concurso</button>' +
       '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar concursos do acervo</button>' +
-      '<button class="add-btn" style="background:var(--cinza)" onclick="limparDuplicados()">Limpar duplicados</button></div>' +
+      '<button class="add-btn" style="background:var(--cinza)" onclick="limparDuplicados()">Limpar duplicados</button>' +
+      '<button class="add-btn" style="background:var(--preto);border:1px solid var(--gold)" onclick="sincronizarMarketing()">Sincronizar com marketing</button></div>' +
       '<div class="monit-grid">'+cards+'</div></div>';
   }
 
@@ -4218,6 +4325,15 @@ HTML_INDEX = r"""<!DOCTYPE html>
       toast(r.duplicatas_removidas+' duplicata(s) mescladas em '+r.grupos_mesclados+' grupo(s), '+(r.noticias_movidas||0)+' noticia(s) reorganizadas', 8000);
       renderTelaGerenciar();
     } else toast('Erro: '+(r.erro||''));
+  }
+
+  // v7.0.3: sync completo com a pagina Concursos do marketing
+  async function sincronizarMarketing() {
+    if(!confirm('Enviar todos os concursos monitorados para a pagina Concursos do sistema de marketing?\n\nCada concurso vira/atualiza um card na etapa da sua cor (Urgente / Importante / Nao Urgente).')) return;
+    toast('Sincronizando...', 6000);
+    const r = await POST('/api/concursos/sincronizar-marketing');
+    if(r.ok) toast(r.enviados+' concurso(s) enviados ao marketing', 6000);
+    else toast('Erro: '+(r.erro||''), 5000);
   }
 
   // v7.0.1: busca dirigida - coleta focada num concurso especifico
