@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.0.4-2026-06-10"
+APP_VERSION = "v7.2.0-dois-modos"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3499,6 +3499,222 @@ def cron_manual():
     })
 
 
+def _ctx_bancas():
+    return (
+        "Historico tipico das bancas (use como angulo tecnico quando a banca do concurso "
+        "for uma delas; nao invente se nao souber): FGV - formalismo e disputas sobre "
+        "criterios de cotas/heteroidentificacao e recursos; IDECAN e AOCP - rigor e "
+        "eliminacoes em fases subjetivas (TAF, exame medico, psicotecnico); Vunesp - "
+        "psicotecnico e juntas medicas; Cebraspe/Cespe - volume de questoes anuladas e o "
+        "sistema certo/errado que gera litigio; Fundatec - regional, comum em concursos do RS. "
+    )
+
+
+def _regras_tom():
+    # Leitura estrategica agressiva, MAS sem promessa de resultado garantido (vedacao dura OAB).
+    return (
+        "TOM: direto, estrategico e vendedor, falando a lingua do concurseiro. Identifique a "
+        "DOR exata e a FASE onde o candidato esta vulneravel. PODE usar urgencia real (prazos, "
+        "proximas eliminatorias) e apontar fraquezas da banca. NAO prometa resultado garantido: "
+        "escreva 'atuacao tecnica para contestar', 'cabe questionamento judicial', NUNCA "
+        "'devolve voce ao concurso' ou 'garante sua vaga'. Sem promessa de vitoria."
+    )
+
+
+def gerar_relatorio_concurso(api_key, termo, profundidade="enxuto"):
+    """v7.2.0: RAIO-X de um concurso, focado em LINHA DO TEMPO e FASE ATUAL.
+
+    Reescrito para o modelo temporal (estilo do GEM do usuario): conta a historia
+    do certame - o que ja aconteceu, em que fase esta AGORA, o que vem a seguir -
+    com leitura estrategica de captacao por fase. Mantem anti-invencao (web_search
+    real + fontes). Tom agressivo/vendedor, sem promessa de resultado.
+    """
+    hoje = datetime.now(timezone.utc)
+    detalhe = (profundidade == "detalhado")
+    tam = ("Seja DIRETO e escaneavel. Frases curtas."
+           if not detalhe else
+           "Pode aprofundar: contexto de cada fase, implicacoes, e mais detalhe nas teses.")
+
+    prompt = f"""Voce e o analista de inteligencia do escritorio Silva Pinto Advocacia (resgate de carreiras em concursos: reversao de eliminacoes, recursos, mandado de seguranca).
+
+TAREFA: pesquisar AGORA, com web_search, o ANDAMENTO do concurso "{termo}" e contar a historia dele no tempo. Hoje e {hoje.strftime('%d/%m/%Y')}.
+
+Faca 4 a 7 buscas reais variando termos (edital, data da prova, gabarito, resultado objetiva, convocacao, TAF, exame medico, psicotecnico, investigacao social, heteroidentificacao, recurso, nomeacao, polemica). Priorize o que e RECENTE.
+
+== O QUE IMPORTA (foco temporal) ==
+1. LINHA DO TEMPO: as etapas que ja aconteceram, com DATAS (prova objetiva, gabaritos, resultados, convocacoes).
+2. FASE ATUAL: em que ponto o concurso esta AGORA, neste mes.
+3. PROXIMAS ETAPAS eliminatorias e quando (TAF, medico, psicotecnico, investigacao social, heteroidentificacao).
+4. NUMEROS: vagas, salario do cargo, banca.
+5. PONTOS QUENTES: questoes contestadas, anulacoes, criterios polemicos, atrasos, decisoes judiciais.
+
+{_ctx_bancas()}
+
+== LEITURA ESTRATEGICA ==
+Diga em que FASE esta o dinheiro agora. Ex: se a objetiva acabou e vem TAF/medico/psico, o foco sai de 'anular questao' e vai para as fases subjetivas. Aponte a dor do candidato (salario alto que ele nao quer perder, ja investiu tempo). {_regras_tom()}
+
+{tam}
+
+== SAIDA: JSON puro, sem markdown, exatamente nestes campos ==
+{{
+  "concurso": "nome",
+  "banca": "banca ou vazio",
+  "cargo": "cargo ou vazio",
+  "vagas": "numero ou vazio",
+  "salario": "salario ou vazio",
+  "linha_do_tempo": [
+    {{"data": "DD/MM/AAAA ou mes/ano", "evento": "o que aconteceu", "status": "concluido"}}
+  ],
+  "fase_atual": "1-2 frases: onde o concurso esta AGORA",
+  "proximas_etapas": ["etapa eliminatoria + quando, se houver"],
+  "pontos_quentes": ["questoes contestadas / anulacoes / criterios polemicos reais"],
+  "leitura_estrategica": "2-4 frases: em que fase esta o dinheiro, qual a dor do candidato, qual o angulo de captacao agora (tom vendedor, sem prometer resultado)",
+  "fontes": ["URLs reais da web_search"],
+  "encontrou_dados": true
+}}
+
+Ordene a linha_do_tempo da mais antiga para a mais recente. Se nao encontrar dados confiaveis, retorne encontrou_dados=false. NUNCA invente datas, vagas ou questoes."""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=240.0, max_retries=2)
+        msg = client.messages.create(
+            model=MODEL_TIER1,
+            max_tokens=7000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text_parts, urls = [], set()
+        for block in msg.content:
+            if getattr(block, "type", "") == "web_search_tool_result":
+                content = getattr(block, "content", None)
+                if isinstance(content, list):
+                    for r in content:
+                        u = getattr(r, "url", None)
+                        if u:
+                            urls.add(u)
+            elif hasattr(block, "text") and block.text:
+                text_parts.append(block.text)
+        data = parse_json_robusto("".join(text_parts).strip())
+        if data is None:
+            return {"encontrou_dados": False, "erro": "resposta nao interpretada", "concurso": termo}
+        fontes = [u for u in (data.get("fontes") or []) if isinstance(u, str) and _dominio_permitido(u)]
+        if not fontes and urls:
+            fontes = [u for u in list(urls)[:6] if _dominio_permitido(u)]
+        data["fontes"] = fontes[:6]
+        data.setdefault("concurso", termo)
+        log.info("v7.2 raio-x '%s': encontrou=%s", termo, data.get("encontrou_dados"))
+        return data
+    except Exception as e:
+        log.error("gerar_relatorio_concurso erro: %s", e)
+        return {"encontrou_dados": False, "erro": str(e)[:200], "concurso": termo}
+
+
+def gerar_giro_novidades(api_key, min_vagas=200, uf=""):
+    """v7.2.0: GIRO de novidades - varredura ampla de concursos do Brasil com volume,
+    agrupados por estagio (abertos / no gatilho / radar). Estilo do GEM do usuario.
+
+    Foco: volume de candidatos (onde ha fases subjetivas = oportunidade do escritorio).
+    """
+    hoje = datetime.now(timezone.utc)
+    filtro_uf = f" Priorize/destaque concursos do estado: {uf}." if uf else ""
+    prompt = f"""Voce e o analista de inteligencia do escritorio Silva Pinto Advocacia (resgate de carreiras em concursos publicos, com foco em fases subjetivas: TAF, exame medico, psicotecnico, investigacao social, heteroidentificacao).
+
+TAREFA: fazer um GIRO das novidades de concursos no Brasil AGORA ({hoje.strftime('%d/%m/%Y')}), com web_search. Foque em concursos de VOLUME - com mais de {min_vagas} vagas - porque volume de candidatos = volume de eliminados nas fases subjetivas.{filtro_uf}
+
+Faca 5 a 10 buscas reais: "concursos abertos {hoje.year}", "editais publicados esta semana", "concursos autorizados {hoje.year}", "concurso PM edital {hoje.year}", "concurso bombeiros {hoje.year}", "concurso policia penal {hoje.year}", "maiores concursos {hoje.year} vagas", etc.
+
+Agrupe os concursos encontrados em 3 estagios:
+- ABERTOS: inscricoes acontecendo agora.
+- NO_GATILHO: autorizados, banca definida ou edital iminente (vao gerar TAF/exames em breve).
+- RADAR: pedidos/projecoes ainda dependendo de aval do governo.
+
+Para cada concurso: nome/orgao, vagas, banca (se houver), salario (se houver), e uma observacao estrategica curta quando relevante (ex: banca com historico de eliminacoes subjetivas). {_ctx_bancas()} {_regras_tom()}
+
+== SAIDA: JSON puro, sem markdown ==
+{{
+  "data": "{hoje.strftime('%d/%m/%Y')}",
+  "abertos": [
+    {{"nome": "orgao/concurso", "vagas": "numero", "banca": "ou vazio", "salario": "ou vazio", "uf": "UF ou Brasil", "obs": "observacao estrategica curta ou vazio", "fonte": "URL real"}}
+  ],
+  "no_gatilho": [ {{"nome":"", "vagas":"", "banca":"", "salario":"", "uf":"", "obs":"", "fonte":""}} ],
+  "radar": [ {{"nome":"", "vagas":"", "banca":"", "salario":"", "uf":"", "obs":"", "fonte":""}} ],
+  "resumo_estrategico": "3-5 frases: onde estao as melhores oportunidades agora, quais bancas/fases merecem atencao",
+  "encontrou_dados": true
+}}
+
+So inclua concursos com mais de {min_vagas} vagas e que voce encontrou DE VERDADE nas buscas, com fonte real. NUNCA invente numeros de vagas nem concursos."""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=300.0, max_retries=2)
+        msg = client.messages.create(
+            model=MODEL_TIER1,
+            max_tokens=8000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text_parts, urls = [], set()
+        for block in msg.content:
+            if getattr(block, "type", "") == "web_search_tool_result":
+                content = getattr(block, "content", None)
+                if isinstance(content, list):
+                    for r in content:
+                        u = getattr(r, "url", None)
+                        if u:
+                            urls.add(u)
+            elif hasattr(block, "text") and block.text:
+                text_parts.append(block.text)
+        data = parse_json_robusto("".join(text_parts).strip())
+        if data is None:
+            return {"encontrou_dados": False, "erro": "resposta nao interpretada"}
+        # filtra fontes invalidas de cada grupo (deixa o card, mas limpa link falso)
+        for grupo in ("abertos", "no_gatilho", "radar"):
+            for c in data.get(grupo, []) or []:
+                f = c.get("fonte", "")
+                if f and not _dominio_permitido(f):
+                    c["fonte"] = ""
+        log.info("v7.2 giro: encontrou=%s, abertos=%d gatilho=%d radar=%d",
+                 data.get("encontrou_dados"),
+                 len(data.get("abertos", [])), len(data.get("no_gatilho", [])),
+                 len(data.get("radar", [])))
+        return data
+    except Exception as e:
+        log.error("gerar_giro_novidades erro: %s", e)
+        return {"encontrou_dados": False, "erro": str(e)[:200]}
+
+
+@app.route("/api/pesquisar", methods=["POST"])
+def api_pesquisar():
+    """v7.2.0: raio-x de um concurso (modo temporal).
+    Body: { termo, profundidade: 'enxuto'|'detalhado' }
+    """
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
+    data = request.get_json(force=True) or {}
+    termo = str(data.get("termo", "")).strip()
+    profundidade = str(data.get("profundidade", "enxuto")).strip()
+    if not termo or len(termo) < 3:
+        return jsonify({"erro": "termo muito curto"}), 400
+    relatorio = gerar_relatorio_concurso(ANTHROPIC_API_KEY, termo, profundidade)
+    return jsonify({"ok": True, "relatorio": relatorio})
+
+
+@app.route("/api/giro", methods=["POST"])
+def api_giro():
+    """v7.2.0: giro de novidades - concursos do Brasil com volume, por estagio.
+    Body: { min_vagas: 200, uf: '' }
+    """
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
+    data = request.get_json(force=True) or {}
+    try:
+        min_vagas = int(data.get("min_vagas", 200))
+    except Exception:
+        min_vagas = 200
+    uf = str(data.get("uf", "")).strip()
+    giro = gerar_giro_novidades(ANTHROPIC_API_KEY, min_vagas, uf)
+    return jsonify({"ok": True, "giro": giro})
+
+
 def coletar_concurso_especifico(api_key, termo):
     """v7.0.1: coleta DIRIGIDA sobre um concurso especifico pedido pelo usuario.
 
@@ -3949,6 +4165,79 @@ HTML_INDEX = r"""<!DOCTYPE html>
   /* ===== Toast ===== */
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--navy); color: #fff; padding: 13px 22px; border-radius: 30px; font-size: 13px; font-weight: 600; box-shadow: 0 6px 20px rgba(0,0,0,0.25); z-index: 100; opacity: 0; transition: opacity 0.25s; }
   .toast.show { opacity: 1; }
+  /* ===== v7.1: Pesquisa sob demanda ===== */
+  .pesq-box { background: #fdfcf9; border: 1px solid var(--line); border-radius: 14px; padding: 26px; margin-bottom: 30px; }
+  .pesq-titulo { font-size: 26px; color: var(--preto); margin-bottom: 4px; }
+  .pesq-sub { font-size: 13px; color: var(--cinza); margin-bottom: 18px; max-width: 620px; line-height: 1.5; }
+  .pesq-input-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .pesq-input { flex: 1; min-width: 240px; padding: 14px 18px; border: 1.5px solid var(--line); border-radius: 30px; font-family: 'DM Sans', sans-serif; font-size: 15px; color: var(--preto); }
+  .pesq-input:focus { outline: none; border-color: var(--gold); }
+  .pesq-btn { padding: 14px 28px; background: var(--preto); color: #fff; border: none; border-radius: 30px; font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 14px; cursor: pointer; transition: background 0.15s; }
+  .pesq-btn:hover { background: var(--gold); }
+  .pesq-loading { padding: 26px; text-align: center; color: var(--cinza); font-size: 14px; font-style: italic; }
+  .pesq-erro { padding: 22px; text-align: center; color: var(--urgente); font-size: 14px; }
+
+  .rel-card { margin-top: 20px; background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 22px; }
+  .rel-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .rel-head h3 { font-size: 22px; color: var(--preto); }
+  .rel-banca { font-size: 12px; color: var(--gold-dark); font-weight: 700; }
+  .rel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .rel-item { border-left: 3px solid var(--gold); padding-left: 11px; }
+  .rel-k { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; color: var(--cinza); }
+  .rel-v { font-size: 14px; color: var(--preto); margin-top: 3px; line-height: 1.4; }
+  .rel-secao { margin-bottom: 16px; }
+  .rel-label { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; color: var(--cinza); margin-bottom: 7px; }
+  .rel-pontos { margin: 0; padding-left: 18px; }
+  .rel-pontos li { font-size: 13.5px; color: var(--preto); margin-bottom: 5px; line-height: 1.45; }
+  .rel-angulo { font-size: 13.5px; color: var(--preto); background: var(--gold-pale); padding: 11px 14px; border-radius: 8px; line-height: 1.5; }
+  .rel-fontes { font-size: 11px; color: var(--cinza); margin-bottom: 14px; }
+  .rel-fontes a { color: var(--gold-dark); text-decoration: none; font-weight: 700; margin-right: 4px; }
+  .rel-acts { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 14px; border-top: 1px solid #f0ebe0; }
+
+  /* ===== v7.1: Feed de novidades ===== */
+  .nov-header { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+  .nov-filtros { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
+  .chip-f { font-size: 11.5px; font-weight: 700; padding: 7px 14px; border-radius: 20px; border: 1.5px solid var(--line); background: #fff; color: var(--cinza); cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.12s; }
+  .chip-f:hover { border-color: var(--gold); }
+  .chip-f.active { background: var(--preto); color: #fff; border-color: var(--preto); }
+  .nov-item { display: flex; gap: 14px; padding: 14px 0; border-bottom: 1px solid #ece8de; }
+  .nov-tag { font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; padding-top: 3px; min-width: 80px; }
+  .nov-corpo { flex: 1; }
+  .nov-tit { font-size: 14.5px; font-weight: 600; color: var(--preto); line-height: 1.4; }
+  .nov-desc { font-size: 12.5px; color: var(--cinza); margin: 3px 0 8px; line-height: 1.45; }
+  .nov-acts { display: flex; gap: 7px; flex-wrap: wrap; }
+
+  /* ===== v7.2: modos, timeline, giro ===== */
+  .modo-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .modo-tab { flex: 1; padding: 12px; border: 1.5px solid var(--line); background: #fff; border-radius: 10px; font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 14px; color: var(--cinza); cursor: pointer; transition: all 0.15s; }
+  .modo-tab:hover { border-color: var(--gold); }
+  .modo-tab.active { background: var(--preto); color: #fff; border-color: var(--preto); }
+  .pesq-select { padding: 14px 18px; border: 1.5px solid var(--line); border-radius: 30px; font-family: 'DM Sans', sans-serif; font-size: 14px; color: var(--preto); background: #fff; cursor: pointer; }
+  .pesq-select:focus { outline: none; border-color: var(--gold); }
+
+  .fase-atual { background: var(--preto); color: #fff; border-radius: 10px; padding: 14px 18px; margin-bottom: 18px; font-size: 14.5px; line-height: 1.5; }
+  .fase-atual .fase-label { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; color: var(--gold-light); margin-bottom: 5px; }
+
+  .timeline { position: relative; padding-left: 6px; }
+  .tl-item { display: flex; gap: 14px; position: relative; padding-bottom: 16px; }
+  .tl-item:not(:last-child)::before { content: ''; position: absolute; left: 5px; top: 14px; bottom: 0; width: 2px; background: var(--line); }
+  .tl-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--gold); flex-shrink: 0; margin-top: 2px; position: relative; z-index: 1; }
+  .tl-cont { flex: 1; }
+  .tl-data { font-size: 11px; font-weight: 800; color: var(--gold-dark); text-transform: uppercase; letter-spacing: 0.3px; }
+  .tl-ev { font-size: 14px; color: var(--preto); margin-top: 2px; line-height: 1.4; }
+  .rel-pontos.prox li { color: var(--preto); }
+
+  .giro-data { font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; color: var(--cinza); margin-bottom: 16px; }
+  .giro-grupo { margin-bottom: 24px; }
+  .giro-gtit { font-family: 'DM Sans', sans-serif; font-weight: 800; font-size: 15px; color: var(--preto); padding: 8px 0 8px 14px; border-left: 4px solid var(--gold); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .giro-bola { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .giro-cont { font-size: 12px; color: var(--cinza); font-weight: 700; }
+  .giro-card { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }
+  .giro-nome { font-size: 15px; font-weight: 700; color: var(--preto); line-height: 1.35; }
+  .giro-meta { font-size: 12.5px; color: var(--cinza); margin-top: 4px; }
+  .giro-obs { font-size: 13px; color: var(--gold-dark); background: var(--gold-pale); padding: 8px 11px; border-radius: 7px; margin-top: 8px; line-height: 1.45; }
+  .giro-acts { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 10px; }
+
 </style>
 </head>
 <body>
@@ -3962,16 +4251,16 @@ HTML_INDEX = r"""<!DOCTYPE html>
   <div class="search-wrap">
     <div class="search-box">
       <span class="icon">&#128269;</span>
-      <input type="text" placeholder="Coletar noticias de um concurso especifico &#8212; ex: PC-SP 2026" onkeydown="if(event.key==='Enter'){buscaDirigida(this.value);this.value='';}">
+      <input type="text" placeholder="Coletar noticias de um concurso especifico &#8212; ex: PC-SP 2026" onkeydown="if(event.key==='Enter'){document.querySelector('.mainnav button').click();setTimeout(()=>{var i=document.getElementById('pesq-input');if(i){i.value=this.value;pesquisar();}},120);this.value='';}">
       <span class="hint">enter busca</span>
     </div>
   </div>
 </header>
 
 <nav class="mainnav">
-  <button class="active" onclick="showTela('concursos', this)">Concursos monitorados</button>
-  <button onclick="showTela('inbox', this)">Caixa de entrada <span class="nav-badge">5</span></button>
-  <button onclick="showTela('gerenciar', this)">Gerenciar concursos <span class="nav-badge cinza">3</span></button>
+  <button class="active" onclick="showTela('pesquisa', this)">Pesquisa &amp; Novidades</button>
+  <button onclick="showTela('inbox', this)">Caixa de entrada <span class="nav-badge">0</span></button>
+  <button onclick="showTela('gerenciar', this)">Concursos</button>
 </nav>
 
 <!-- conte&#250;do das telas vem na parte 2 -->
@@ -4049,12 +4338,238 @@ HTML_INDEX = r"""<!DOCTYPE html>
     telAtual = qual;
     document.querySelectorAll('.mainnav button').forEach(b=>b.classList.remove('active'));
     if(btn) btn.classList.add('active');
-    if(qual==='concursos') renderTelaConcursos();
+    if(qual==='pesquisa') renderTelaPesquisa();
     else if(qual==='inbox') renderTelaInbox();
     else if(qual==='gerenciar') renderTelaGerenciar();
   }
 
-  // ===== TELA 1: CONCURSOS MONITORADOS (fichas vivas + sidebar temas) =====
+  // ===== TELA PRINCIPAL: PESQUISA & NOVIDADES =====
+  let _ultimoRelatorio = null;
+  let _modoAtivo = 'raiox';
+  async function renderTelaPesquisa() {
+    const cont = document.getElementById('telas-container');
+    cont.innerHTML =
+      '<div class="tela active">' +
+      '<div class="pesq-box">' +
+        '<div class="modo-tabs">' +
+          '<button id="tab-raiox" class="modo-tab active" onclick="trocarModo(\'raiox\')">Raio-X de um concurso</button>' +
+          '<button id="tab-giro" class="modo-tab" onclick="trocarModo(\'giro\')">Giro de novidades</button>' +
+        '</div>' +
+        '<div id="modo-raiox">' +
+          '<div class="pesq-sub">Digite um concurso e receba a linha do tempo &mdash; o que ja aconteceu, em que fase esta agora, e o que vem a seguir.</div>' +
+          '<div class="pesq-input-row">' +
+            '<input type="text" id="pesq-input" class="pesq-input" placeholder="Ex: PC-RS, PPMG, PMERJ 2026..." onkeydown="if(event.key===\'Enter\')pesquisar()">' +
+            '<button class="pesq-btn" onclick="pesquisar()">Pesquisar</button>' +
+          '</div>' +
+        '</div>' +
+        '<div id="modo-giro" style="display:none">' +
+          '<div class="pesq-sub">Varredura dos concursos do Brasil com volume, agrupados por estagio: abertos, no gatilho e radar. Foco em volume de candidatos.</div>' +
+          '<div class="pesq-input-row">' +
+            '<select id="giro-vagas" class="pesq-select"><option value="200">+200 vagas</option><option value="100">+100 vagas</option><option value="500">+500 vagas</option><option value="1000">+1000 vagas</option></select>' +
+            '<input type="text" id="giro-uf" class="pesq-input" style="max-width:200px" placeholder="UF (opcional) ex: RJ">' +
+            '<button class="pesq-btn" onclick="rodarGiro()">Rodar giro</button>' +
+          '</div>' +
+        '</div>' +
+        '<div id="pesq-resultado"></div>' +
+      '</div>' +
+      '<div class="nov-header">' +
+        '<h2 class="serif" style="font-size:22px;color:var(--preto)">Novidades coletadas</h2>' +
+        '<div class="nov-filtros">' +
+          '<button class="chip-f active" data-f="tudo" onclick="filtrarNov(\'tudo\',this)">Tudo</button>' +
+          '<button class="chip-f" data-f="trabalho" onclick="filtrarNov(\'trabalho\',this)">Concursos que trabalho</button>' +
+          '<button class="chip-f" data-f="novos" onclick="filtrarNov(\'novos\',this)">Concursos novos</button>' +
+          '<button class="add-btn" style="padding:7px 14px;font-size:11px" onclick="coletarTudo()">&#8635; Coletar agora</button>' +
+        '</div>' +
+      '</div>' +
+      '<div id="nov-lista" style="margin-top:16px"><div style="color:var(--cinza);padding:30px;text-align:center">Carregando novidades...</div></div>' +
+      '</div>';
+    carregarNovidades('tudo');
+  }
+
+  function trocarModo(modo) {
+    _modoAtivo = modo;
+    document.getElementById('tab-raiox').classList.toggle('active', modo==='raiox');
+    document.getElementById('tab-giro').classList.toggle('active', modo==='giro');
+    document.getElementById('modo-raiox').style.display = modo==='raiox' ? '' : 'none';
+    document.getElementById('modo-giro').style.display = modo==='giro' ? '' : 'none';
+    document.getElementById('pesq-resultado').innerHTML = '';
+  }
+
+  // --- MODO 1: RAIO-X (linha do tempo) ---
+  async function pesquisar() {
+    const termo = (document.getElementById('pesq-input').value||'').trim();
+    if(termo.length < 3) { toast('Digite o nome do concurso'); return; }
+    const box = document.getElementById('pesq-resultado');
+    box.innerHTML = '<div class="pesq-loading">Levantando o andamento de "'+esc(termo)+'" na web... ~30 segundos</div>';
+    const r = await POST('/api/pesquisar', {termo:termo, profundidade:'enxuto'});
+    if(!r.ok || !r.relatorio) { box.innerHTML = '<div class="pesq-erro">Nao consegui pesquisar agora. Tente de novo.</div>'; return; }
+    _ultimoRelatorio = r.relatorio;
+    renderRelatorio(r.relatorio, termo, false);
+  }
+  async function aprofundar(termo) {
+    const box = document.getElementById('pesq-resultado');
+    box.innerHTML = '<div class="pesq-loading">Aprofundando "'+esc(termo)+'"...</div>';
+    const r = await POST('/api/pesquisar', {termo:termo, profundidade:'detalhado'});
+    if(r.ok && r.relatorio) { _ultimoRelatorio = r.relatorio; renderRelatorio(r.relatorio, termo, true); }
+  }
+  function renderRelatorio(rel, termo, detalhado) {
+    const box = document.getElementById('pesq-resultado');
+    if(rel.encontrou_dados === false) {
+      box.innerHTML = '<div class="pesq-erro">Nao encontrei dados recentes confiaveis sobre "'+esc(termo)+'". Tente um nome mais especifico (inclua o ano).</div>';
+      return;
+    }
+    const esq = (s)=>esc(termo).replace(/'/g,"\\'");
+    // linha do tempo
+    const tl = (rel.linha_do_tempo||[]).filter(e=>e && (e.evento||e.data));
+    let tlHtml = '';
+    for(const e of tl) {
+      tlHtml += '<div class="tl-item"><div class="tl-dot"></div>' +
+        '<div class="tl-cont"><div class="tl-data">'+esc(e.data||'')+'</div>' +
+        '<div class="tl-ev">'+esc(e.evento||'')+'</div></div></div>';
+    }
+    // proximas etapas
+    const prox = (rel.proximas_etapas||[]).filter(p=>p&&p.trim());
+    const proxHtml = prox.length ? prox.map(p=>'<li>'+esc(p)+'</li>').join('') : '<li style="color:var(--cinza)">Sem proxima etapa divulgada.</li>';
+    // pontos quentes
+    const pq = (rel.pontos_quentes||[]).filter(p=>p&&p.trim());
+    const pqHtml = pq.length ? '<div class="rel-secao"><div class="rel-label">Pontos quentes</div><ul class="rel-pontos">'+pq.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul></div>' : '';
+    // fontes
+    const fontes = (rel.fontes||[]).filter(f=>f);
+    const fontesHtml = fontes.length ? '<div class="rel-fontes">Fontes: '+fontes.map((f,i)=>'<a href="'+esc(f)+'" target="_blank" rel="noopener">['+(i+1)+']</a>').join(' ')+'</div>' : '';
+
+    box.innerHTML =
+      '<div class="rel-card">' +
+        '<div class="rel-head"><h3 class="serif">'+esc(rel.concurso||termo)+'</h3>' +
+          (rel.banca?'<span class="rel-banca">Banca '+esc(rel.banca)+'</span>':'')+'</div>' +
+        '<div class="rel-grid">' +
+          (rel.cargo?relLinha('Cargo', rel.cargo):'') +
+          relLinha('Vagas', rel.vagas) +
+          relLinha('Salario', rel.salario) +
+        '</div>' +
+        // FASE ATUAL em destaque
+        (rel.fase_atual?'<div class="fase-atual"><div class="fase-label">Fase atual</div>'+esc(rel.fase_atual)+'</div>':'') +
+        // LINHA DO TEMPO
+        (tlHtml?'<div class="rel-secao"><div class="rel-label">Linha do tempo</div><div class="timeline">'+tlHtml+'</div></div>':'') +
+        // PROXIMAS ETAPAS
+        '<div class="rel-secao"><div class="rel-label">Proximas etapas</div><ul class="rel-pontos prox">'+proxHtml+'</ul></div>' +
+        pqHtml +
+        // LEITURA ESTRATEGICA
+        (rel.leitura_estrategica?'<div class="rel-secao"><div class="rel-label">Leitura estrategica</div><div class="rel-angulo">'+esc(rel.leitura_estrategica)+'</div></div>':'') +
+        fontesHtml +
+        '<div class="rel-acts">' +
+          (detalhado?'':'<button class="mini" onclick="aprofundar(\''+esq()+'\')">Aprofundar</button>') +
+          '<button class="mini gerar" onclick="gerarDeRelatorio(\''+esc(rel.concurso||termo).replace(/'/g,"\\'")+'\')">&#9998; Gerar conteudo</button>' +
+          '<button class="mini" onclick="salvarDoRelatorio(\''+esc(rel.concurso||termo).replace(/'/g,"\\'")+'\',\''+esc(rel.banca||'').replace(/'/g,"\\'")+'\')">Salvar nos meus concursos</button>' +
+        '</div>' +
+      '</div>';
+  }
+  function relLinha(label, val) {
+    if(!val || !String(val).trim()) val = '&mdash;';
+    return '<div class="rel-item"><div class="rel-k">'+label+'</div><div class="rel-v">'+esc(val)+'</div></div>';
+  }
+
+  // --- MODO 2: GIRO DE NOVIDADES ---
+  async function rodarGiro() {
+    const vagas = document.getElementById('giro-vagas').value;
+    const uf = (document.getElementById('giro-uf').value||'').trim();
+    const box = document.getElementById('pesq-resultado');
+    box.innerHTML = '<div class="pesq-loading">Fazendo o giro de concursos com +'+vagas+' vagas'+(uf?' em '+esc(uf):'')+'... isso leva ~40 segundos</div>';
+    const r = await POST('/api/giro', {min_vagas:parseInt(vagas), uf:uf});
+    if(!r.ok || !r.giro) { box.innerHTML = '<div class="pesq-erro">Nao consegui rodar o giro agora.</div>'; return; }
+    renderGiro(r.giro);
+  }
+  function renderGiro(giro) {
+    const box = document.getElementById('pesq-resultado');
+    if(giro.encontrou_dados === false) {
+      box.innerHTML = '<div class="pesq-erro">Nao encontrei concursos com esse volume agora. Tente baixar o minimo de vagas.</div>';
+      return;
+    }
+    const grupo = (titulo, cor, lista) => {
+      const items = (lista||[]).filter(c=>c && c.nome);
+      if(!items.length) return '';
+      let h = '<div class="giro-grupo"><div class="giro-gtit" style="border-color:'+cor+'"><span class="giro-bola" style="background:'+cor+'"></span>'+titulo+' <span class="giro-cont">'+items.length+'</span></div>';
+      for(const c of items) {
+        const meta = [c.vagas?esc(c.vagas)+' vagas':'', c.banca?'Banca '+esc(c.banca):'', c.salario?esc(c.salario):'', c.uf?esc(c.uf):''].filter(x=>x).join(' &middot; ');
+        h += '<div class="giro-card">' +
+          '<div class="giro-nome">'+esc(c.nome)+'</div>' +
+          (meta?'<div class="giro-meta">'+meta+'</div>':'') +
+          (c.obs?'<div class="giro-obs">'+esc(c.obs)+'</div>':'') +
+          '<div class="giro-acts">' +
+            (c.fonte?'<a class="mini" href="'+esc(c.fonte)+'" target="_blank" rel="noopener">Ver fonte</a>':'') +
+            '<button class="mini gerar" onclick="gerarDeGiro(\''+esc(c.nome).replace(/'/g,"\\'")+'\',\''+esc(c.obs||'').replace(/'/g,"\\'")+'\')">&#9998; Gerar</button>' +
+            '<button class="mini" onclick="salvarDoRelatorio(\''+esc(c.nome).replace(/'/g,"\\'")+'\',\''+esc(c.banca||'').replace(/'/g,"\\'")+'\')">Salvar</button>' +
+          '</div></div>';
+      }
+      return h + '</div>';
+    };
+    box.innerHTML =
+      '<div class="giro-wrap">' +
+        '<div class="giro-data">Giro de ' + esc(giro.data||'hoje') + '</div>' +
+        grupo('Editais abertos', 'var(--naourgente)', giro.abertos) +
+        grupo('No gatilho', 'var(--importante)', giro.no_gatilho) +
+        grupo('Radar dos gigantes', 'var(--urgente)', giro.radar) +
+        (giro.resumo_estrategico?'<div class="rel-secao" style="margin-top:18px"><div class="rel-label">Resumo estrategico</div><div class="rel-angulo">'+esc(giro.resumo_estrategico)+'</div></div>':'') +
+      '</div>';
+  }
+  async function gerarDeGiro(nome, obs) {
+    const payload = { titulo: nome, descricao: obs||'', tipo:'operacional', link:'' };
+    try {
+      const r = await fetch(PIPELINE_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      toast(r.ok ? 'Enviado ao pipeline' : 'Erro ao enviar');
+    } catch(e) { toast('Erro: '+e.message); }
+  }
+
+  async function gerarDeRelatorio(nome) {
+    const payload = { titulo: nome, descricao: _ultimoRelatorio ? (_ultimoRelatorio.leitura_estrategica||'') : '', tipo:'operacional', link:'' };
+    try {
+      const r = await fetch(PIPELINE_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      toast(r.ok ? 'Enviado ao pipeline de conteudo' : 'Erro ao enviar');
+    } catch(e) { toast('Erro: '+e.message); }
+  }
+  async function salvarDoRelatorio(nome, banca) {
+    const r = await POST('/api/concursos', {nome:nome, banca:banca, palavras_chave:nome, prioridade:'importante'});
+    if(r.ok) toast(r.ja_existia ? 'Ja estava nos seus concursos' : 'Salvo nos seus concursos');
+    else toast('Erro: '+(r.erro||''));
+  }
+
+  // --- feed de novidades ---
+  let _novCache = [];
+  async function carregarNovidades(filtro) {
+    const [cData, novData] = await Promise.all([
+      GET('/api/concursos'),
+      GET('/api/oportunidades?incluir_lidos=1&dias=30&limite=100')
+    ]);
+    const monitorados = (cData.concursos||[]);
+    const idsMonit = new Set(monitorados.map(c=>c.id));
+    let itens = (novData.itens||[]);
+    window._novMonitIds = idsMonit;
+    _novCache = itens;
+    filtrarNov(filtro || 'tudo');
+  }
+  function filtrarNov(filtro, btn) {
+    if(btn) { document.querySelectorAll('.chip-f').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); }
+    let itens = _novCache.slice();
+    if(filtro==='trabalho') itens = itens.filter(i=>i.concurso_id && window._novMonitIds.has(i.concurso_id));
+    else if(filtro==='novos') itens = itens.filter(i=>!i.concurso_id);
+    const lista = document.getElementById('nov-lista');
+    if(!lista) return;
+    if(!itens.length) { lista.innerHTML = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhuma novidade nesse filtro.</div>'; return; }
+    lista.innerHTML = itens.slice(0,60).map(n => {
+      const tag = n.concurso_id ? 'No seu radar' : 'Novo';
+      const tagCor = n.concurso_id ? 'var(--gold)' : 'var(--cinza)';
+      return '<div class="nov-item">' +
+        '<div class="nov-tag" style="color:'+tagCor+'">'+tag+'</div>' +
+        '<div class="nov-corpo"><div class="nov-tit">'+esc(n.titulo)+'</div>' +
+        '<div class="nov-desc">'+esc((n.descricao||'').substring(0,160))+'</div>' +
+        '<div class="nov-acts">' +
+          (n.link?'<a class="mini" href="'+esc(n.link)+'" target="_blank" rel="noopener">Ver fonte</a>':'') +
+          '<button class="mini gerar" onclick="gerarConteudo('+n.id+',this)">&#9998; Gerar</button>' +
+          '<button class="mini" onclick="excluirItem('+n.id+',this)">Excluir</button>' +
+        '</div></div></div>';
+    }).join('');
+  }
+
+  // ===== TELA: CONCURSOS MONITORADOS (fichas vivas + sidebar temas) - legado, acessivel via gerenciar =====
   async function renderTelaConcursos() {
     const cont = document.getElementById('telas-container');
     cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando...</div>';
@@ -4444,12 +4959,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   // ===== INIT =====
   async function init() {
-    // Carrega contagem da inbox pra badge
     const inbox = await GET('/api/inbox');
     const badge = document.querySelector('.mainnav .nav-badge');
     if(badge && inbox) badge.textContent = (inbox.total||0);
-    // Renderiza tela inicial
-    renderTelaConcursos();
+    renderTelaPesquisa();
   }
   init();
 </script>
