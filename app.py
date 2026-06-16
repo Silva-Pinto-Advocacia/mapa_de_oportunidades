@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.2.0-dois-modos"
+APP_VERSION = "v7.3.1-trabalhar"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -484,6 +484,40 @@ def _ensure_triagem_columns():
                         log.warning("Falha ao adicionar %s: %s", nome, e)
     except Exception as e:
         log.warning("_ensure_triagem_columns erro: %s", e)
+
+
+def _ensure_v73_columns():
+    """v7.3: colunas novas.
+    Em oportunidades:
+      tipo_novidade -> 'jurisprudencia'|'concorrentes'|'edital_aberto'|'concurso_previsto'|'concurso_andamento'
+      data_fonte    -> data em que a noticia foi publicada na fonte (texto)
+    Em concursos_monitorados:
+      raiox_json    -> ultimo Raio-X salvo (JSON serializado)
+      raiox_data    -> quando o Raio-X foi gerado (ISO)
+    """
+    migracoes = [
+        ("oportunidades", "tipo_novidade", "TEXT"),
+        ("oportunidades", "data_fonte", "TEXT"),
+        ("concursos_monitorados", "raiox_json", "TEXT"),
+        ("concursos_monitorados", "raiox_data", "TEXT"),
+    ]
+    try:
+        with db_conn() as conn:
+            for tabela, nome, tipo in migracoes:
+                try:
+                    conn.execute(f"SELECT {nome} FROM {tabela} LIMIT 1")
+                    continue
+                except Exception:
+                    pass
+                try:
+                    conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {nome} {tipo}")
+                    log.info("DB v7.3: coluna %s.%s adicionada", tabela, nome)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "duplicate" not in msg and "exist" not in msg:
+                        log.warning("Falha ao adicionar %s.%s: %s", tabela, nome, e)
+    except Exception as e:
+        log.warning("_ensure_v73_columns erro: %s", e)
 
 
 class TursoConnWrapper:
@@ -1739,6 +1773,59 @@ CATEGORIAS_TRANSVERSAIS = {
 }
 
 
+def _classificar_tipo_novidade(item):
+    """v7.3: classifica o TIPO de novidade pra exibir o selo no card.
+
+    Retorna um de:
+      'jurisprudencia'      -> decisao judicial, liminar, STF/STJ/TJ
+      'concorrentes'        -> outro escritorio/advogado captando, acao coletiva concorrente
+      'edital_aberto'       -> edital publicado, inscricoes abertas
+      'concurso_previsto'   -> autorizado/pedido/projecao, ainda sem edital
+      'concurso_andamento'  -> etapas em curso (gabarito, TAF, convocacao, resultado)
+    """
+    cat = (item.get("categoria") or "").lower()
+    # Sinais por categoria de coleta
+    if cat == "jurisprudencia":
+        return "jurisprudencia"
+    if cat == "concorrencia":
+        return "concorrentes"
+
+    titulo = (item.get("titulo") or "").lower()
+    desc = (item.get("descricao") or "").lower()
+    txt = f"{titulo} {desc}"
+
+    # Jurisprudencia por conteudo
+    if any(k in txt for k in ["liminar", "sentenca", "decisao judicial", "mandado de seguranca",
+                               "stf", "stj", "tj-", "tribunal", "justica determinou", "acao judicial",
+                               "juiz ", "desembargador", "acordao"]):
+        return "jurisprudencia"
+    # Concorrentes
+    if any(k in txt for k in ["escritorio", "advocacia", "acao coletiva", "captacao",
+                               "advogado especialista", "oab"]):
+        return "concorrentes"
+    # Edital aberto / inscricoes
+    if any(k in txt for k in ["edital publicado", "edital aberto", "inscricoes abertas",
+                               "inscricoes ate", "edital divulgado", "saiu o edital",
+                               "edital de abertura", "inscricoes prorrogadas"]):
+        return "edital_aberto"
+    # Concurso previsto / autorizado / projecao
+    if any(k in txt for k in ["autorizado", "autorizou", "previsto", "solicitou", "solicitacao",
+                               "pedido de", "deve abrir", "deve sair", "projecao", "articulado",
+                               "comissao formada", "banca definida", "em breve"]):
+        return "concurso_previsto"
+    # Andamento (gabarito, resultado, fases) - default pra elim/taf
+    if any(k in txt for k in ["gabarito", "resultado", "convocacao", "convocados", "taf",
+                               "teste de aptidao", "exame medico", "psicotecnico", "avaliacao psicologica",
+                               "investigacao social", "heteroidentificacao", "nota de corte",
+                               "eliminados", "aprovados", "nomeacao", "posse"]):
+        return "concurso_andamento"
+    if cat in ("elim_ativas", "taf_fases", "recurso_anulacao"):
+        return "concurso_andamento"
+    if cat == "radar_volume":
+        return "edital_aberto"
+    return "concurso_andamento"
+
+
 _STOPWORDS_CONCURSO = {
     "concurso", "concursos", "publico", "publica", "edital", "selecao",
     "processo", "seletivo", "vagas", "vaga", "inscricao", "inscricoes",
@@ -1923,6 +2010,13 @@ def triar_itens(item_ids=None):
             cat = item.get("categoria", "")
             iid = item["id"]
 
+            # v7.3: classifica o tipo de novidade (selo) - sempre, independente do encaixe
+            try:
+                tipo_nov = _classificar_tipo_novidade(item)
+                conn.execute("UPDATE oportunidades SET tipo_novidade=? WHERE id=?", (tipo_nov, iid))
+            except Exception:
+                pass
+
             # 1. Transversal?
             if cat in CATEGORIAS_TRANSVERSAIS and CATEGORIAS_TRANSVERSAIS[cat] is not None:
                 tt = CATEGORIAS_TRANSVERSAIS[cat]
@@ -2077,8 +2171,8 @@ def salvar_itens(itens):
                      concurso, cargo, banca, vagas, salario, prazo_inscricao,
                      data_prova, fase_atual, data_publicacao, extras_json,
                      link, relevancia, etapa_concurso, data_coleta, hash_unico,
-                     metricas_json, status_triagem)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendente')""",
+                     metricas_json, status_triagem, data_fonte)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendente', ?)""",
                     (item["categoria"], item["tier"], item["flag"],
                      item["titulo"], item["descricao"], item["orgao"], item["estado"],
                      item["concurso"], item["cargo"], item["banca"], item["vagas"],
@@ -2086,7 +2180,7 @@ def salvar_itens(itens):
                      item["fase_atual"], item.get("data_publicacao", ""),
                      item["extras_json"], item["link"],
                      item["relevancia"], item["etapa_concurso"], agora, h,
-                     metricas_json)
+                     metricas_json, item.get("data_publicacao", ""))
                 )
                 # Captura o id inserido pra triagem posterior
                 try:
@@ -2380,6 +2474,61 @@ def api_marcar_selecionado(item_id):
         return jsonify({"ok": True})
     except Exception as e:
         log.error("Erro ao marcar selecionado %d: %s", item_id, e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/oportunidades/<int:item_id>/trabalhar", methods=["POST"])
+def api_oportunidade_trabalhar(item_id):
+    """v7.3.1: a partir de uma noticia, passa a 'trabalhar' o concurso dela.
+
+    Cria (ou reusa) o concurso monitorado a partir do nome do concurso/orgao da
+    noticia, encaixa a noticia nele, e sincroniza pro marketing automaticamente
+    (o _sync ja roda dentro de api_concursos_criar; aqui reforcamos via helper).
+    """
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT concurso, orgao, banca FROM oportunidades WHERE id = ?", (item_id,)
+            ).fetchone()
+            if not row:
+                return jsonify({"erro": "noticia nao encontrada"}), 404
+            d = _dict_from_row(row)
+            nome = (d.get("concurso") or d.get("orgao") or "").strip()
+            banca = (d.get("banca") or "").strip()
+            if not nome or len(nome) < 3:
+                return jsonify({"erro": "noticia sem nome de concurso identificavel"}), 400
+
+            existente = _concurso_existente_por_nome(conn, nome)
+            agora = datetime.now(timezone.utc).isoformat()
+            if existente:
+                cid = existente["id"]
+                concurso_obj = existente
+                ja_existia = True
+            else:
+                conn.execute(
+                    "INSERT INTO concursos_monitorados (nome, banca, palavras_chave, prioridade, data_criacao, ativo) "
+                    "VALUES (?, ?, ?, 'importante', ?, 1)",
+                    (nome, banca, nome, agora)
+                )
+                crow = conn.execute(
+                    "SELECT * FROM concursos_monitorados WHERE nome = ? ORDER BY id DESC LIMIT 1", (nome,)
+                ).fetchone()
+                concurso_obj = _dict_from_row(crow)
+                cid = concurso_obj["id"]
+                ja_existia = False
+            # encaixa a noticia no concurso
+            conn.execute(
+                "UPDATE oportunidades SET concurso_id=?, status_triagem='confirmado', sugestao_concurso=NULL WHERE id=?",
+                (cid, item_id)
+            )
+
+        # sincroniza pro marketing (item 4: automatico ao trabalhar)
+        _sync_concurso_marketing(concurso_obj, "upsert")
+        log.info("v7.3.1: trabalhar noticia %d -> concurso '%s' (%s)", item_id, nome,
+                 "existente" if ja_existia else "novo")
+        return jsonify({"ok": True, "concurso_id": cid, "nome": nome, "ja_existia": ja_existia})
+    except Exception as e:
+        log.error("api_oportunidade_trabalhar erro: %s", e)
         return jsonify({"erro": str(e)}), 500
 
 
@@ -2887,7 +3036,7 @@ def api_inbox():
         with db_conn() as conn:
             # Encaixes pendentes (a IA sugeriu um concurso, usuario confirma)
             erows = conn.execute(
-                "SELECT id, titulo, descricao, sugestao_concurso, orgao, banca "
+                "SELECT id, titulo, descricao, sugestao_concurso, orgao, banca, link, data_coleta, data_fonte, concurso "
                 "FROM oportunidades WHERE status_triagem = 'pendente' AND sugestao_concurso IS NOT NULL "
                 "ORDER BY data_coleta DESC LIMIT 100"
             ).fetchall()
@@ -3617,9 +3766,15 @@ def gerar_giro_novidades(api_key, min_vagas=200, uf=""):
     """
     hoje = datetime.now(timezone.utc)
     filtro_uf = f" Priorize/destaque concursos do estado: {uf}." if uf else ""
+    if min_vagas and min_vagas > 0:
+        regra_vagas = f"Foque em concursos de VOLUME - com mais de {min_vagas} vagas - porque volume de candidatos = volume de eliminados nas fases subjetivas."
+        regra_inclusao = f"So inclua concursos com mais de {min_vagas} vagas e que voce encontrou DE VERDADE nas buscas, com fonte real."
+    else:
+        regra_vagas = "Traga os concursos mais relevantes do momento (de qualquer numero de vagas), priorizando os de maior volume de candidatos e os com fases subjetivas (TAF, medico, psico) por serem onde estao as oportunidades."
+        regra_inclusao = "Inclua os concursos relevantes que voce encontrou DE VERDADE nas buscas, com fonte real, priorizando volume mas sem excluir oportunidades menores boas."
     prompt = f"""Voce e o analista de inteligencia do escritorio Silva Pinto Advocacia (resgate de carreiras em concursos publicos, com foco em fases subjetivas: TAF, exame medico, psicotecnico, investigacao social, heteroidentificacao).
 
-TAREFA: fazer um GIRO das novidades de concursos no Brasil AGORA ({hoje.strftime('%d/%m/%Y')}), com web_search. Foque em concursos de VOLUME - com mais de {min_vagas} vagas - porque volume de candidatos = volume de eliminados nas fases subjetivas.{filtro_uf}
+TAREFA: fazer um GIRO das novidades de concursos no Brasil AGORA ({hoje.strftime('%d/%m/%Y')}), com web_search. {regra_vagas}{filtro_uf}
 
 Faca 5 a 10 buscas reais: "concursos abertos {hoje.year}", "editais publicados esta semana", "concursos autorizados {hoje.year}", "concurso PM edital {hoje.year}", "concurso bombeiros {hoje.year}", "concurso policia penal {hoje.year}", "maiores concursos {hoje.year} vagas", etc.
 
@@ -3642,7 +3797,7 @@ Para cada concurso: nome/orgao, vagas, banca (se houver), salario (se houver), e
   "encontrou_dados": true
 }}
 
-So inclua concursos com mais de {min_vagas} vagas e que voce encontrou DE VERDADE nas buscas, com fonte real. NUNCA invente numeros de vagas nem concursos."""
+{regra_inclusao} NUNCA invente numeros de vagas nem concursos."""
 
     try:
         client = anthropic.Anthropic(api_key=api_key, timeout=300.0, max_retries=2)
@@ -3685,31 +3840,178 @@ So inclua concursos com mais de {min_vagas} vagas e que voce encontrou DE VERDAD
 @app.route("/api/pesquisar", methods=["POST"])
 def api_pesquisar():
     """v7.2.0: raio-x de um concurso (modo temporal).
-    Body: { termo, profundidade: 'enxuto'|'detalhado' }
+    Body: { termo, profundidade: 'enxuto'|'detalhado', salvar_em: concurso_id? }
+    Se salvar_em vier, grava o raio-x no concurso monitorado (item 4 da v7.3).
     """
     if not ANTHROPIC_API_KEY:
         return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
     data = request.get_json(force=True) or {}
     termo = str(data.get("termo", "")).strip()
     profundidade = str(data.get("profundidade", "enxuto")).strip()
+    salvar_em = data.get("salvar_em")
     if not termo or len(termo) < 3:
         return jsonify({"erro": "termo muito curto"}), 400
     relatorio = gerar_relatorio_concurso(ANTHROPIC_API_KEY, termo, profundidade)
+    # Salva no concurso se pedido
+    if salvar_em and relatorio.get("encontrou_dados") is not False:
+        try:
+            agora = datetime.now(timezone.utc).isoformat()
+            with db_conn() as conn:
+                conn.execute(
+                    "UPDATE concursos_monitorados SET raiox_json=?, raiox_data=? WHERE id=?",
+                    (json.dumps(relatorio, ensure_ascii=False), agora, int(salvar_em))
+                )
+        except Exception as e:
+            log.warning("salvar raiox falhou: %s", e)
     return jsonify({"ok": True, "relatorio": relatorio})
+
+
+@app.route("/api/concursos/<int:concurso_id>/salvar-raiox", methods=["POST"])
+def api_salvar_raiox(concurso_id):
+    """v7.3: salva um relatorio Raio-X (ja gerado no front) no card do concurso."""
+    try:
+        data = request.get_json(force=True) or {}
+        relatorio = data.get("relatorio")
+        if not relatorio:
+            return jsonify({"erro": "relatorio ausente"}), 400
+        agora = datetime.now(timezone.utc).isoformat()
+        with db_conn() as conn:
+            conn.execute(
+                "UPDATE concursos_monitorados SET raiox_json=?, raiox_data=? WHERE id=?",
+                (json.dumps(relatorio, ensure_ascii=False), agora, concurso_id)
+            )
+        return jsonify({"ok": True, "id": concurso_id})
+    except Exception as e:
+        log.error("api_salvar_raiox erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/<int:concurso_id>/ficha", methods=["GET"])
+def api_concurso_ficha(concurso_id):
+    """v7.3: ficha completa do concurso - dados + raio-x salvo + novidades agrupadas."""
+    try:
+        with db_conn() as conn:
+            crow = conn.execute(
+                "SELECT * FROM concursos_monitorados WHERE id = ?", (concurso_id,)
+            ).fetchone()
+            if not crow:
+                return jsonify({"erro": "concurso nao encontrado"}), 404
+            concurso = _dict_from_row(crow)
+            # Raio-X salvo
+            raiox = None
+            if concurso.get("raiox_json"):
+                try:
+                    raiox = json.loads(concurso["raiox_json"])
+                except Exception:
+                    raiox = None
+            # Novidades confirmadas deste concurso
+            nrows = conn.execute(
+                "SELECT id, titulo, descricao, link, categoria, tipo_novidade, "
+                "data_coleta, data_fonte, data_publicacao "
+                "FROM oportunidades WHERE concurso_id = ? AND status_triagem = 'confirmado' "
+                "ORDER BY data_coleta DESC LIMIT 100",
+                (concurso_id,)
+            ).fetchall()
+            novidades = [_dict_from_row(r) for r in nrows]
+        # Limpa o json pesado do retorno do concurso
+        concurso.pop("raiox_json", None)
+        return jsonify({
+            "ok": True,
+            "concurso": concurso,
+            "raiox": raiox,
+            "raiox_data": concurso.get("raiox_data"),
+            "novidades": novidades,
+        })
+    except Exception as e:
+        log.error("api_concurso_ficha erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/<int:concurso_id>/enviar-radar", methods=["POST"])
+def api_enviar_radar(concurso_id):
+    """v7.3 (Opcao A): empurra a INTELIGENCIA do concurso (raio-x + resumo) pro
+    RADAR do sistema comercial. Os dados juridicos/comerciais (honorarios, docs)
+    ficam SO no comercial - aqui so mandamos o que o Mapa sabe.
+
+    Reusa CONCURSOS_MKT_URL como base; manda pra rota /radar/inteligencia-externa.
+    """
+    try:
+        with db_conn() as conn:
+            crow = conn.execute(
+                "SELECT * FROM concursos_monitorados WHERE id = ?", (concurso_id,)
+            ).fetchone()
+            if not crow:
+                return jsonify({"erro": "concurso nao encontrado"}), 404
+            concurso = _dict_from_row(crow)
+            nrows = conn.execute(
+                "SELECT titulo, link, tipo_novidade, data_coleta FROM oportunidades "
+                "WHERE concurso_id = ? AND status_triagem = 'confirmado' "
+                "ORDER BY data_coleta DESC LIMIT 20",
+                (concurso_id,)
+            ).fetchall()
+            novidades = [_dict_from_row(r) for r in nrows]
+
+        raiox = None
+        if concurso.get("raiox_json"):
+            try:
+                raiox = json.loads(concurso["raiox_json"])
+            except Exception:
+                raiox = None
+
+        # Monta o destino: base do CONCURSOS_MKT_URL + rota de inteligencia
+        base = CONCURSOS_MKT_URL.rsplit("/marketing/", 1)[0] if "/marketing/" in CONCURSOS_MKT_URL else "https://silvapinto-comercial.onrender.com"
+        url_radar = base + "/radar/inteligencia-externa"
+
+        prio_map = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
+        payload = {
+            "nome": concurso.get("nome", ""),
+            "banca": concurso.get("banca", ""),
+            "vagas": concurso.get("vagas", ""),
+            "etapa": prio_map.get(concurso.get("prioridade", "importante"), "importante"),
+            "fase_atual": (raiox or {}).get("fase_atual", ""),
+            "linha_do_tempo": (raiox or {}).get("linha_do_tempo", []),
+            "proximas_etapas": (raiox or {}).get("proximas_etapas", []),
+            "leitura_estrategica": (raiox or {}).get("leitura_estrategica", ""),
+            "novidades": [{"titulo": n.get("titulo", ""), "link": n.get("link", ""),
+                           "tipo": n.get("tipo_novidade", "")} for n in novidades],
+            "origem": "painel-oportunidades",
+        }
+
+        try:
+            req = urllib.request.Request(
+                url_radar,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                ok = resp.status < 300
+                corpo = resp.read().decode("utf-8", "ignore")[:200]
+            return jsonify({"ok": ok, "destino": url_radar, "resposta": corpo})
+        except urllib.error.HTTPError as he:
+            detalhe = ("404 - a rota /radar/inteligencia-externa ainda nao existe no sistema comercial"
+                       if he.code == 404 else f"HTTP {he.code}")
+            return jsonify({"ok": False, "destino": url_radar, "erro_detalhe": detalhe}), 200
+        except Exception as e:
+            return jsonify({"ok": False, "destino": url_radar, "erro_detalhe": str(e)[:200]}), 200
+    except Exception as e:
+        log.error("api_enviar_radar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
 
 
 @app.route("/api/giro", methods=["POST"])
 def api_giro():
     """v7.2.0: giro de novidades - concursos do Brasil com volume, por estagio.
-    Body: { min_vagas: 200, uf: '' }
+    Body: { min_vagas: 0 (qualquer) | 200 | ..., uf: '' }
+    v7.3: min_vagas=0 significa 'qualquer numero de vagas' (padrao).
     """
     if not ANTHROPIC_API_KEY:
         return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
     data = request.get_json(force=True) or {}
     try:
-        min_vagas = int(data.get("min_vagas", 200))
+        min_vagas = int(data.get("min_vagas", 0))
     except Exception:
-        min_vagas = 200
+        min_vagas = 0
     uf = str(data.get("uf", "")).strip()
     giro = gerar_giro_novidades(ANTHROPIC_API_KEY, min_vagas, uf)
     return jsonify({"ok": True, "giro": giro})
@@ -3931,6 +4233,7 @@ init_db()
 _ensure_metricas_column()
 _ensure_selecionado_column()
 _ensure_triagem_columns()
+_ensure_v73_columns()
 
 
 # Logo PNG transparente embutido (gerado a partir da logo Silva Pinto)
@@ -4238,6 +4541,44 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .giro-obs { font-size: 13px; color: var(--gold-dark); background: var(--gold-pale); padding: 8px 11px; border-radius: 7px; margin-top: 8px; line-height: 1.45; }
   .giro-acts { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 10px; }
 
+  /* ===== v7.3: selos, grupos, datas, ficha ===== */
+  .grupo { background:#fff; border:1px solid var(--line); border-radius:14px; margin-bottom:18px; overflow:hidden; }
+  .grupo-head { padding:14px 18px; background:var(--gold-pale); display:flex; align-items:center; gap:12px; border-bottom:1px solid var(--line); }
+  .grupo-head .gnome { font-family:'Cormorant Garamond',serif; font-size:19px; font-weight:700; flex:1; color:var(--preto); }
+  .grupo-head .gcount { font-size:11px; color:var(--gold-dark); font-weight:700; background:#fff; padding:3px 10px; border-radius:20px; }
+  .grupo-head .g-ver { font-size:11px; color:var(--gold-dark); font-weight:700; margin-left:6px; }
+  .grupo-head[onclick]:hover { background:#ece3cf; }
+  .nov-item { display:flex; gap:14px; padding:15px 18px; border-bottom:1px solid var(--line); }
+  .nov-item:last-child { border-bottom:none; }
+  .selo { font-size:9.5px; font-weight:800; text-transform:uppercase; letter-spacing:.4px; padding:4px 9px; border-radius:6px; white-space:nowrap; height:fit-content; margin-top:2px; }
+  .selo.jur { background:#e8eef5; color:#2c5282; }
+  .selo.conc { background:#f5e8e8; color:#9b2c2c; }
+  .selo.edital { background:#e6f4ea; color:#276749; }
+  .selo.previsto { background:#fef5e7; color:#975a16; }
+  .selo.andamento { background:var(--gold-pale); color:var(--gold-dark); }
+  .nov-corpo { flex:1; }
+  .nov-tit { font-size:14.5px; font-weight:600; line-height:1.4; }
+  .nov-desc { font-size:12.5px; color:var(--cinza); margin:4px 0 8px; }
+  .nov-datas { display:flex; gap:16px; font-size:10.5px; color:var(--cinza); margin-bottom:8px; flex-wrap:wrap; }
+  .nov-datas b { color:var(--preto); font-weight:700; }
+  .nov-acts { display:flex; gap:7px; flex-wrap:wrap; }
+  .mini.fonte { background:var(--preto); color:#fff; border-color:var(--preto); }
+
+  /* Ficha do concurso */
+  .ficha-topo { display:flex; align-items:center; gap:16px; background:#fff; border:1px solid var(--line); border-radius:14px; padding:20px 24px; margin-bottom:22px; flex-wrap:wrap; }
+  .ficha-bola { width:16px; height:16px; border-radius:50%; flex-shrink:0; }
+  .ficha-secoes { display:grid; grid-template-columns:1fr 1fr; gap:22px; }
+  @media (max-width:820px){ .ficha-secoes { grid-template-columns:1fr; } }
+  .ficha-col { background:var(--branco); border:1px solid var(--line); border-radius:14px; padding:20px; }
+  .ficha-h { font-size:18px; color:var(--preto); margin-bottom:14px; padding-bottom:10px; border-bottom:2px solid var(--gold-pale); }
+
+  /* ===== v7.3.1: nome do concurso no card + botao trabalhar ===== */
+  .nov-conc { font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.4px; color:var(--gold-dark); margin-bottom:3px; }
+  .mini.trabalhar { background:var(--gold); color:#fff; border-color:var(--gold); font-weight:700; }
+  .mini.trabalhar:hover { background:var(--gold-dark); }
+  .mini.trabalhar:disabled { opacity:.6; cursor:default; }
+  .mc-nome:hover { color:var(--gold-dark); text-decoration:underline; }
+
 </style>
 </head>
 <body>
@@ -4353,7 +4694,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
       '<div class="pesq-box">' +
         '<div class="modo-tabs">' +
           '<button id="tab-raiox" class="modo-tab active" onclick="trocarModo(\'raiox\')">Raio-X de um concurso</button>' +
-          '<button id="tab-giro" class="modo-tab" onclick="trocarModo(\'giro\')">Giro de novidades</button>' +
+          '<button id="tab-todos" class="modo-tab" onclick="trocarModo(\'todos\')">Pesquisar todos</button>' +
         '</div>' +
         '<div id="modo-raiox">' +
           '<div class="pesq-sub">Digite um concurso e receba a linha do tempo &mdash; o que ja aconteceu, em que fase esta agora, e o que vem a seguir.</div>' +
@@ -4362,12 +4703,12 @@ HTML_INDEX = r"""<!DOCTYPE html>
             '<button class="pesq-btn" onclick="pesquisar()">Pesquisar</button>' +
           '</div>' +
         '</div>' +
-        '<div id="modo-giro" style="display:none">' +
-          '<div class="pesq-sub">Varredura dos concursos do Brasil com volume, agrupados por estagio: abertos, no gatilho e radar. Foco em volume de candidatos.</div>' +
+        '<div id="modo-todos" style="display:none">' +
+          '<div class="pesq-sub">Varredura ampla dos concursos do Brasil, agrupados por estagio: abertos, no gatilho e radar. Nao precisa digitar nada &mdash; e o panorama do momento.</div>' +
           '<div class="pesq-input-row">' +
-            '<select id="giro-vagas" class="pesq-select"><option value="200">+200 vagas</option><option value="100">+100 vagas</option><option value="500">+500 vagas</option><option value="1000">+1000 vagas</option></select>' +
+            '<select id="giro-vagas" class="pesq-select"><option value="0">Qualquer numero de vagas</option><option value="100">+100 vagas</option><option value="200">+200 vagas</option><option value="500">+500 vagas</option><option value="1000">+1000 vagas</option></select>' +
             '<input type="text" id="giro-uf" class="pesq-input" style="max-width:200px" placeholder="UF (opcional) ex: RJ">' +
-            '<button class="pesq-btn" onclick="rodarGiro()">Rodar giro</button>' +
+            '<button class="pesq-btn" onclick="rodarGiro()">Pesquisar todos</button>' +
           '</div>' +
         '</div>' +
         '<div id="pesq-resultado"></div>' +
@@ -4389,9 +4730,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
   function trocarModo(modo) {
     _modoAtivo = modo;
     document.getElementById('tab-raiox').classList.toggle('active', modo==='raiox');
-    document.getElementById('tab-giro').classList.toggle('active', modo==='giro');
+    document.getElementById('tab-todos').classList.toggle('active', modo==='todos');
     document.getElementById('modo-raiox').style.display = modo==='raiox' ? '' : 'none';
-    document.getElementById('modo-giro').style.display = modo==='giro' ? '' : 'none';
+    document.getElementById('modo-todos').style.display = modo==='todos' ? '' : 'none';
     document.getElementById('pesq-resultado').innerHTML = '';
   }
 
@@ -4473,9 +4814,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
     const vagas = document.getElementById('giro-vagas').value;
     const uf = (document.getElementById('giro-uf').value||'').trim();
     const box = document.getElementById('pesq-resultado');
-    box.innerHTML = '<div class="pesq-loading">Fazendo o giro de concursos com +'+vagas+' vagas'+(uf?' em '+esc(uf):'')+'... isso leva ~40 segundos</div>';
+    const vagasTxt = (parseInt(vagas)>0) ? ('com +'+vagas+' vagas') : 'do momento';
+    box.innerHTML = '<div class="pesq-loading">Pesquisando os concursos '+vagasTxt+(uf?' em '+esc(uf):'')+'... isso leva ~40 segundos</div>';
     const r = await POST('/api/giro', {min_vagas:parseInt(vagas), uf:uf});
-    if(!r.ok || !r.giro) { box.innerHTML = '<div class="pesq-erro">Nao consegui rodar o giro agora.</div>'; return; }
+    if(!r.ok || !r.giro) { box.innerHTML = '<div class="pesq-erro">Nao consegui pesquisar agora.</div>'; return; }
     renderGiro(r.giro);
   }
   function renderGiro(giro) {
@@ -4528,22 +4870,130 @@ HTML_INDEX = r"""<!DOCTYPE html>
   }
   async function salvarDoRelatorio(nome, banca) {
     const r = await POST('/api/concursos', {nome:nome, banca:banca, palavras_chave:nome, prioridade:'importante'});
-    if(r.ok) toast(r.ja_existia ? 'Ja estava nos seus concursos' : 'Salvo nos seus concursos');
-    else toast('Erro: '+(r.erro||''));
+    if(r.ok) {
+      const cid = r.concurso && r.concurso.id;
+      // v7.3: se temos um Raio-X aberto deste concurso, salva no card dele
+      if(cid && _ultimoRelatorio && (_ultimoRelatorio.concurso||'').toLowerCase().includes(nome.toLowerCase().substring(0,8))) {
+        await POST('/api/concursos/'+cid+'/salvar-raiox', {relatorio:_ultimoRelatorio});
+      }
+      toast(r.ja_existia ? 'Ja estava nos seus concursos' : 'Salvo nos seus concursos');
+    } else toast('Erro: '+(r.erro||''));
+  }
+
+  // ===== v7.3: FICHA DO CONCURSO =====
+  async function abrirFicha(concursoId, jaTentouPesquisar) {
+    const cont = document.getElementById('telas-container');
+    cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando ficha...</div>';
+    const r = await GET('/api/concursos/'+concursoId+'/ficha');
+    if(!r.ok) { cont.innerHTML = '<div class="tela active"><div class="pesq-erro">Nao consegui abrir a ficha.</div></div>'; return; }
+    const c = r.concurso || {};
+    let raiox = r.raiox;
+    const novidades = r.novidades || [];
+    const PRIO_COR = { urgente:'#c0392b', importante:'#BB904C', naourgente:'#2e9e5b' };
+    const cor = PRIO_COR[c.prioridade] || PRIO_COR.importante;
+
+    // v7.3.1: se nao tem Raio-X salvo, pesquisa automaticamente UMA vez e salva
+    if(!raiox && !jaTentouPesquisar && c.nome) {
+      cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">' +
+        '<div class="pesq-loading">Primeira vez abrindo "'+esc(c.nome)+'". Gerando o Raio-X na web... ~30 segundos</div></div>';
+      const pr = await POST('/api/pesquisar', {termo:c.nome, profundidade:'enxuto', salvar_em:concursoId});
+      // recarrega a ficha agora com o raio-x salvo (jaTentou=true pra nao repesquisar em loop)
+      return abrirFicha(concursoId, true);
+    }
+
+    // Bloco do raio-x salvo
+    let raioxHtml;
+    if(raiox) {
+      const tl = (raiox.linha_do_tempo||[]).filter(e=>e&&(e.evento||e.data));
+      let tlHtml = tl.map(e=>'<div class="tl-item"><div class="tl-dot"></div><div><div class="tl-data">'+esc(e.data||'')+'</div><div class="tl-ev">'+esc(e.evento||'')+'</div></div></div>').join('');
+      const prox = (raiox.proximas_etapas||[]).filter(p=>p&&p.trim());
+      const pq = (raiox.pontos_quentes||[]).filter(p=>p&&p.trim());
+      raioxHtml =
+        (raiox.fase_atual?'<div class="fase-atual"><div class="fl">Fase atual</div><div class="ft">'+esc(raiox.fase_atual)+'</div></div>':'') +
+        (tlHtml?'<div class="rel-secao"><div class="rel-label">Linha do tempo</div><div class="timeline">'+tlHtml+'</div></div>':'') +
+        (prox.length?'<div class="rel-secao"><div class="rel-label">Proximas etapas</div><ul class="rel-pontos">'+prox.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul></div>':'') +
+        (pq.length?'<div class="rel-secao"><div class="rel-label">Pontos quentes</div><ul class="rel-pontos">'+pq.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul></div>':'') +
+        (raiox.leitura_estrategica?'<div class="rel-secao"><div class="rel-label">Leitura estrategica</div><div class="rel-angulo">'+esc(raiox.leitura_estrategica)+'</div></div>':'') +
+        '<div style="font-size:11px;color:var(--cinza);margin-top:8px">Raio-X salvo em '+fmtData(r.raiox_data)+'</div>';
+    } else {
+      raioxHtml = '<div style="color:var(--cinza);font-size:13px;padding:14px 0">Nenhum Raio-X salvo ainda. Pesquise este concurso e clique em "Salvar nos meus concursos" para guardar o Raio-X aqui.</div>';
+    }
+
+    // Novidades agrupadas (todas deste concurso)
+    let novHtml = '';
+    for(const n of novidades) {
+      const dc = fmtData(n.data_coleta), df = fmtData(n.data_fonte || n.data_publicacao);
+      novHtml += '<div class="nov-item">' + seloHtml(n.tipo_novidade) +
+        '<div class="nov-corpo"><div class="nov-tit">'+esc(n.titulo)+'</div>' +
+        '<div class="nov-desc">'+esc((n.descricao||'').substring(0,160))+'</div>' +
+        '<div class="nov-datas">' + (dc?'<span>Coletado: <b>'+dc+'</b></span>':'') + (df?'<span>Publicado: <b>'+df+'</b></span>':'') + '</div>' +
+        '<div class="nov-acts">' +
+          (n.link?'<a class="mini fonte" href="'+esc(n.link)+'" target="_blank" rel="noopener">Abrir fonte</a>':'') +
+          '<button class="mini gerar" onclick="gerarConteudo('+n.id+',this)">&#9998; Gerar</button>' +
+        '</div></div></div>';
+    }
+    if(!novHtml) novHtml = '<div style="color:var(--cinza);font-size:13px;padding:14px 0">Nenhuma novidade encaixada neste concurso ainda.</div>';
+
+    cont.innerHTML = '<div class="tela active">' +
+      '<button class="mini" style="margin-bottom:18px" onclick="showTela(\'pesquisa\',document.querySelector(\'.mainnav button\'))">&lsaquo; Voltar</button>' +
+      '<div class="ficha-topo">' +
+        '<div class="ficha-bola" style="background:'+cor+'"></div>' +
+        '<div style="flex:1"><h2 class="serif" style="font-size:27px">'+esc(c.nome)+'</h2>' +
+        '<div style="font-size:13px;color:var(--cinza);margin-top:3px">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas &middot; '+novidades.length+' novidade(s)</div></div>' +
+        '<button class="pesq-btn" onclick="atualizarRaiox(\''+esc(c.nome).replace(/'/g,"\\'")+'\','+concursoId+')">Atualizar Raio-X</button>' +
+        '<button class="pesq-btn alt" onclick="enviarRadar('+concursoId+')">Enviar ao RADAR</button>' +
+      '</div>' +
+      '<div class="ficha-secoes">' +
+        '<div class="ficha-col"><h3 class="serif ficha-h">Raio-X</h3>'+raioxHtml+'</div>' +
+        '<div class="ficha-col"><h3 class="serif ficha-h">Novidades deste concurso</h3>'+novHtml+'</div>' +
+      '</div></div>';
+  }
+  async function atualizarRaiox(nome, concursoId) {
+    const box = document.querySelector('.ficha-col');
+    if(box) box.innerHTML = '<h3 class="serif ficha-h">Raio-X</h3><div class="pesq-loading">Atualizando Raio-X de "'+esc(nome)+'"...</div>';
+    const r = await POST('/api/pesquisar', {termo:nome, profundidade:'enxuto', salvar_em:concursoId});
+    if(r.ok) { toast('Raio-X atualizado'); abrirFicha(concursoId); }
+    else toast('Erro ao atualizar');
+  }
+  async function enviarRadar(concursoId) {
+    if(!confirm('Enviar a inteligencia deste concurso (Raio-X + novidades) para o RADAR do sistema comercial?\n\nOs dados juridicos e de honorarios continuam sendo preenchidos so no comercial.')) return;
+    toast('Enviando ao RADAR...', 6000);
+    const r = await POST('/api/concursos/'+concursoId+'/enviar-radar', {});
+    if(r.ok) toast('Inteligencia enviada ao RADAR comercial');
+    else toast('Falhou: '+(r.erro_detalhe||'erro'), 10000);
   }
 
   // --- feed de novidades ---
   let _novCache = [];
+  const SELO_INFO = {
+    jurisprudencia:    {txt:'Jurisprudencia',        cls:'jur'},
+    concorrentes:      {txt:'Concorrentes',          cls:'conc'},
+    edital_aberto:     {txt:'Edital aberto',         cls:'edital'},
+    concurso_previsto: {txt:'Concurso previsto',     cls:'previsto'},
+    concurso_andamento:{txt:'Concurso em andamento', cls:'andamento'},
+  };
+  function seloHtml(tipo) {
+    const info = SELO_INFO[tipo] || SELO_INFO.concurso_andamento;
+    return '<span class="selo '+info.cls+'">'+info.txt+'</span>';
+  }
+  function fmtData(s) {
+    if(!s) return '';
+    // ISO -> dd/mm/aaaa
+    const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if(m) return m[3]+'/'+m[2]+'/'+m[1];
+    return String(s).substring(0,10);
+  }
+
   async function carregarNovidades(filtro) {
     const [cData, novData] = await Promise.all([
       GET('/api/concursos'),
-      GET('/api/oportunidades?incluir_lidos=1&dias=30&limite=100')
+      GET('/api/oportunidades?incluir_lidos=1&dias=30&limite=120')
     ]);
     const monitorados = (cData.concursos||[]);
-    const idsMonit = new Set(monitorados.map(c=>c.id));
-    let itens = (novData.itens||[]);
-    window._novMonitIds = idsMonit;
-    _novCache = itens;
+    window._novMonitIds = new Set(monitorados.map(c=>c.id));
+    window._novMonitNomes = {};
+    monitorados.forEach(c=>{ window._novMonitNomes[c.id] = c.nome; });
+    _novCache = (novData.itens||[]);
     filtrarNov(filtro || 'tudo');
   }
   function filtrarNov(filtro, btn) {
@@ -4554,19 +5004,66 @@ HTML_INDEX = r"""<!DOCTYPE html>
     const lista = document.getElementById('nov-lista');
     if(!lista) return;
     if(!itens.length) { lista.innerHTML = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhuma novidade nesse filtro.</div>'; return; }
-    lista.innerHTML = itens.slice(0,60).map(n => {
-      const tag = n.concurso_id ? 'No seu radar' : 'Novo';
-      const tagCor = n.concurso_id ? 'var(--gold)' : 'var(--cinza)';
-      return '<div class="nov-item">' +
-        '<div class="nov-tag" style="color:'+tagCor+'">'+tag+'</div>' +
-        '<div class="nov-corpo"><div class="nov-tit">'+esc(n.titulo)+'</div>' +
-        '<div class="nov-desc">'+esc((n.descricao||'').substring(0,160))+'</div>' +
-        '<div class="nov-acts">' +
-          (n.link?'<a class="mini" href="'+esc(n.link)+'" target="_blank" rel="noopener">Ver fonte</a>':'') +
-          '<button class="mini gerar" onclick="gerarConteudo('+n.id+',this)">&#9998; Gerar</button>' +
-          '<button class="mini" onclick="excluirItem('+n.id+',this)">Excluir</button>' +
-        '</div></div></div>';
-    }).join('');
+
+    // Agrupa por concurso (item 8). Chave: concurso_id (monitorado) ou nome do concurso da noticia, ou 'Outras'
+    const grupos = {};
+    const ordem = [];
+    for(const n of itens) {
+      let chave, titulo, cid=null;
+      if(n.concurso_id && window._novMonitNomes[n.concurso_id]) {
+        chave = 'c'+n.concurso_id; titulo = window._novMonitNomes[n.concurso_id]; cid = n.concurso_id;
+      } else if((n.concurso||'').trim()) {
+        chave = 'n:'+n.concurso.trim().toLowerCase(); titulo = n.concurso.trim();
+      } else {
+        chave = 'outras'; titulo = 'Outras novidades';
+      }
+      if(!grupos[chave]) { grupos[chave] = {titulo, cid, itens:[]}; ordem.push(chave); }
+      grupos[chave].itens.push(n);
+    }
+
+    let html = '';
+    for(const chave of ordem) {
+      const g = grupos[chave];
+      const clicavel = g.cid ? 'onclick="abrirFicha('+g.cid+')" style="cursor:pointer"' : '';
+      const verFicha = g.cid ? '<span class="g-ver">Ver ficha &rsaquo;</span>' : '';
+      html += '<div class="grupo">' +
+        '<div class="grupo-head" '+clicavel+'><span class="gnome">'+esc(g.titulo)+'</span>' +
+        '<span class="gcount">'+g.itens.length+' novidade'+(g.itens.length>1?'s':'')+'</span>'+verFicha+'</div>';
+      for(const n of g.itens) {
+        const dc = fmtData(n.data_coleta), df = fmtData(n.data_fonte || n.data_publicacao);
+        const nomeConc = (n.concurso||'').trim() || g.titulo;
+        html += '<div class="nov-item">' + seloHtml(n.tipo_novidade) +
+          '<div class="nov-corpo">' +
+          (nomeConc && nomeConc!=='Outras novidades' ? '<div class="nov-conc">'+esc(nomeConc)+'</div>' : '') +
+          '<div class="nov-tit">'+esc(n.titulo)+'</div>' +
+          '<div class="nov-desc">'+esc((n.descricao||'').substring(0,160))+'</div>' +
+          '<div class="nov-datas">' +
+            (dc?'<span>Coletado: <b>'+dc+'</b></span>':'') +
+            (df?'<span>Publicado na fonte: <b>'+df+'</b></span>':'') +
+          '</div>' +
+          '<div class="nov-acts">' +
+            (n.link?'<a class="mini fonte" href="'+esc(n.link)+'" target="_blank" rel="noopener">Abrir fonte</a>':'') +
+            (!g.cid ? '<button class="mini trabalhar" onclick="trabalharNoticia('+n.id+',this)">+ Trabalhar este</button>' : '') +
+            '<button class="mini gerar" onclick="gerarConteudo('+n.id+',this)">&#9998; Gerar</button>' +
+            '<button class="mini" onclick="excluirItem('+n.id+',this)">Excluir</button>' +
+          '</div></div></div>';
+      }
+      html += '</div>';
+    }
+    lista.innerHTML = html;
+  }
+
+  // v7.3.1: trabalhar um concurso a partir de uma noticia (monitora + sincroniza marketing)
+  async function trabalharNoticia(itemId, btn) {
+    if(btn) { btn.disabled = true; btn.textContent = 'Adicionando...'; }
+    const r = await POST('/api/oportunidades/'+itemId+'/trabalhar', {});
+    if(r.ok) {
+      toast(r.ja_existia ? ('"'+r.nome+'" ja estava nos seus concursos') : ('Agora voce trabalha "'+r.nome+'" (enviado ao marketing tambem)'), 6000);
+      carregarNovidades('tudo');
+    } else {
+      toast('Erro: '+(r.erro||''), 5000);
+      if(btn) { btn.disabled = false; btn.textContent = '+ Trabalhar este'; }
+    }
   }
 
   // ===== TELA: CONCURSOS MONITORADOS (fichas vivas + sidebar temas) - legado, acessivel via gerenciar =====
@@ -4660,10 +5157,14 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
     let encHtml = '';
     for(const e of encaixes) {
+      const nomeConc = (e.concurso||'').trim();
       encHtml += '<div class="triagem-card" data-id="'+e.id+'">' +
-        '<div class="tc-main"><div class="tc-tit">'+esc(e.titulo)+'</div>' +
+        '<div class="tc-main">' +
+        (nomeConc ? '<div class="nov-conc">'+esc(nomeConc)+'</div>' : '') +
+        '<div class="tc-tit">'+esc(e.titulo)+'</div>' +
         '<div class="tc-sug">Parece ser de: <b>'+esc(e.sugestao_concurso)+'</b></div></div>' +
         '<div class="tc-acts">' +
+        (e.link?'<a class="btn-outro" href="'+esc(e.link)+'" target="_blank" rel="noopener" style="text-decoration:none">Abrir fonte</a>':'') +
         '<button class="btn-conf" onclick="confirmarEnc('+e.id+')">Confirmar</button>' +
         '<button class="btn-outro" onclick="abrirOutro('+e.id+')">Outro concurso</button>' +
         '<button class="btn-rej" onclick="excluirEnc('+e.id+')">Excluir</button>' +
@@ -4711,12 +5212,13 @@ HTML_INDEX = r"""<!DOCTYPE html>
         const ativa = (c.prioridade === p);
         seletor += '<button class="stage-dot" title="'+PRIO_LABEL[p]+'" style="background:'+PRIO_COR[p]+';width:14px;height:14px;'+(ativa?'box-shadow:0 0 0 2px var(--preto);':'opacity:0.35;')+'" onclick="definirPrio('+c.id+',\''+p+'\',this)"></button>';
       }
-      cards += '<div class="monit-card"><h4 class="serif">'+esc(c.nome)+'</h4>' +
+      cards += '<div class="monit-card"><h4 class="serif mc-nome" onclick="abrirFicha('+c.id+')" style="cursor:pointer">'+esc(c.nome)+'</h4>' +
         '<div class="mc-meta">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas</div>' +
         '<div>'+kws+'</div>' +
         '<div class="mc-foot"><span class="mc-count">'+c.noticias_count+' noticia(s)</span>' +
         '<span style="display:flex;gap:5px;align-items:center">'+seletor+'</span></div>' +
         '<div style="display:flex;gap:7px;margin-top:10px">' +
+        '<button class="mini" onclick="abrirFicha('+c.id+')">Ver ficha</button>' +
         '<button class="mini" onclick="abrirMesclar('+c.id+')">Mesclar</button>' +
         '<button class="mini" style="color:#b23b32;border-color:#b23b32" onclick="excluirConcurso('+c.id+',\''+esc(c.nome)+'\')">Excluir</button>' +
         '</div></div>';
