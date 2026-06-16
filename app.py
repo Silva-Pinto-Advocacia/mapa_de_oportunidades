@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.3.1-trabalhar"
+APP_VERSION = "v7.3.2-meus-concursos"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -500,6 +500,8 @@ def _ensure_v73_columns():
         ("oportunidades", "data_fonte", "TEXT"),
         ("concursos_monitorados", "raiox_json", "TEXT"),
         ("concursos_monitorados", "raiox_data", "TEXT"),
+        ("concursos_monitorados", "inscritos", "TEXT"),
+        ("concursos_monitorados", "link_concurso", "TEXT"),
     ]
     try:
         with db_conn() as conn:
@@ -1774,17 +1776,22 @@ CATEGORIAS_TRANSVERSAIS = {
 
 
 def _classificar_tipo_novidade(item):
-    """v7.3: classifica o TIPO de novidade pra exibir o selo no card.
+    """v7.3.2: classifica o TIPO de novidade pra exibir o selo no card.
 
-    Retorna um de:
-      'jurisprudencia'      -> decisao judicial, liminar, STF/STJ/TJ
-      'concorrentes'        -> outro escritorio/advogado captando, acao coletiva concorrente
-      'edital_aberto'       -> edital publicado, inscricoes abertas
-      'concurso_previsto'   -> autorizado/pedido/projecao, ainda sem edital
-      'concurso_andamento'  -> etapas em curso (gabarito, TAF, convocacao, resultado)
+    Tipos (do mais especifico ao mais generico):
+      'jurisprudencia'   -> decisao judicial, liminar, STF/STJ/TJ
+      'concorrentes'     -> outro escritorio/advogado captando
+      'nomeacao'         -> nomeacao/posse/decreto de excedentes/convocacao p/ posse
+      'convocacao'       -> convocacao para etapa (TAF, exame, psico, investigacao)
+      'gabarito'         -> gabarito/resultado de prova/nota de corte
+      'inscricoes_abertas' -> inscricoes acontecendo agora
+      'inscricoes_encerradas' -> inscricoes ja fecharam
+      'edital_aberto'    -> edital publicado (sem detalhe de inscricao)
+      'prova_em_breve'   -> prova objetiva marcada/proxima
+      'concurso_previsto'-> autorizado/pedido/projecao, ainda sem edital
+      'concurso_andamento' -> fallback generico (certame em curso)
     """
     cat = (item.get("categoria") or "").lower()
-    # Sinais por categoria de coleta
     if cat == "jurisprudencia":
         return "jurisprudencia"
     if cat == "concorrencia":
@@ -1794,33 +1801,62 @@ def _classificar_tipo_novidade(item):
     desc = (item.get("descricao") or "").lower()
     txt = f"{titulo} {desc}"
 
-    # Jurisprudencia por conteudo
-    if any(k in txt for k in ["liminar", "sentenca", "decisao judicial", "mandado de seguranca",
-                               "stf", "stj", "tj-", "tribunal", "justica determinou", "acao judicial",
-                               "juiz ", "desembargador", "acordao"]):
+    def tem(*termos):
+        return any(t in txt for t in termos)
+
+    # 1. Jurisprudencia
+    if tem("liminar", "sentenca", "decisao judicial", "mandado de seguranca", "stf", "stj",
+           "tj-", "tribunal", "justica determinou", "acao judicial", "desembargador", "acordao",
+           "decisao da justica", "judicializ"):
         return "jurisprudencia"
-    # Concorrentes
-    if any(k in txt for k in ["escritorio", "advocacia", "acao coletiva", "captacao",
-                               "advogado especialista", "oab"]):
+    # 2. Concorrentes
+    if tem("escritorio de advocacia", "acao coletiva", "advogado especialista",
+           "captacao de clientes", "banca de advocacia"):
         return "concorrentes"
-    # Edital aberto / inscricoes
-    if any(k in txt for k in ["edital publicado", "edital aberto", "inscricoes abertas",
-                               "inscricoes ate", "edital divulgado", "saiu o edital",
-                               "edital de abertura", "inscricoes prorrogadas"]):
+    # 3. Nomeacao / posse / decreto de excedentes (ANTES de gabarito!)
+    if tem("nomea", "nomeacao", "posse", "empossad", "excedente", "decreto", "convocados para posse",
+           "tomar posse", "ato de nomeacao", "nomeados"):
+        return "nomeacao"
+    # 4. Convocacao para etapa do certame
+    if tem("convoca", "convocacao", "convocados para", "chamamento"):
+        # convocacao geralmente e para uma proxima fase
+        return "convocacao"
+    if tem("taf", "teste de aptidao", "exame medico", "exame de saude", "inspecao de saude",
+           "psicotecnico", "avaliacao psicologica", "investigacao social", "sindicancia de vida",
+           "heteroidentificacao", "comissao de heteroidentificacao", "exame fisico"):
+        return "convocacao"
+    # 5. Gabarito / resultado de prova
+    if tem("gabarito", "resultado da prova", "resultado preliminar", "resultado definitivo",
+           "nota de corte", "resultado da objetiva", "notas preliminares", "resultado final da prova",
+           "divulgou o resultado", "divulgado o resultado"):
+        return "gabarito"
+    # 6. Prova objetiva em breve / marcada
+    if tem("prova marcada", "prova sera aplicada", "sera aplicada", "data da prova", "prova objetiva em",
+           "prova no dia", "aplicacao das provas", "provas serao aplicadas", "serao aplicadas",
+           "local de prova", "data de aplicacao", "prova objetiva sera"):
+        return "prova_em_breve"
+    # 7. Inscricoes encerradas
+    if tem("inscricoes encerradas", "inscricoes encerram", "ultimo dia de inscricao",
+           "inscricoes terminam", "encerram as inscricoes", "prazo de inscricao encerrado"):
+        return "inscricoes_encerradas"
+    # 8. Inscricoes abertas
+    if tem("inscricoes abertas", "inscricoes ate", "inscricoes prorrogadas", "inscricoes comecam",
+           "abertura das inscricoes", "inscricoes a partir", "periodo de inscricao"):
+        return "inscricoes_abertas"
+    # 9. Edital aberto (publicado, sem detalhe)
+    if tem("edital publicado", "edital aberto", "edital divulgado", "saiu o edital",
+           "edital de abertura", "publicou o edital", "edital disponivel"):
         return "edital_aberto"
-    # Concurso previsto / autorizado / projecao
-    if any(k in txt for k in ["autorizado", "autorizou", "previsto", "solicitou", "solicitacao",
-                               "pedido de", "deve abrir", "deve sair", "projecao", "articulado",
-                               "comissao formada", "banca definida", "em breve"]):
+    # 10. Concurso previsto / autorizado / projecao
+    if tem("autorizado", "autorizou", "previsto", "solicitou", "solicitacao", "pedido de",
+           "deve abrir", "deve sair", "projecao", "articulado", "comissao formada",
+           "banca definida", "banca contratada", "deve ser lancado", "em breve"):
         return "concurso_previsto"
-    # Andamento (gabarito, resultado, fases) - default pra elim/taf
-    if any(k in txt for k in ["gabarito", "resultado", "convocacao", "convocados", "taf",
-                               "teste de aptidao", "exame medico", "psicotecnico", "avaliacao psicologica",
-                               "investigacao social", "heteroidentificacao", "nota de corte",
-                               "eliminados", "aprovados", "nomeacao", "posse"]):
-        return "concurso_andamento"
-    if cat in ("elim_ativas", "taf_fases", "recurso_anulacao"):
-        return "concurso_andamento"
+    # Fallbacks por categoria de coleta
+    if cat in ("elim_ativas", "taf_fases"):
+        return "convocacao"
+    if cat == "recurso_anulacao":
+        return "gabarito"
     if cat == "radar_volume":
         return "edital_aberto"
     return "concurso_andamento"
@@ -2706,7 +2742,7 @@ def api_concursos_editar(concurso_id):
         data = request.get_json(force=True) or {}
         campos = []
         valores = []
-        for campo in ("nome", "banca", "palavras_chave", "vagas"):
+        for campo in ("nome", "banca", "palavras_chave", "vagas", "inscritos", "link_concurso"):
             if campo in data:
                 campos.append(f"{campo} = ?")
                 valores.append(str(data[campo]).strip())
@@ -2790,6 +2826,49 @@ def api_concursos_prioridade(concurso_id):
         if crow:
             _sync_concurso_marketing(_dict_from_row(crow), "upsert")
         return jsonify({"ok": True, "id": concurso_id, "prioridade": p})
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/<int:concurso_id>/editar", methods=["POST"])
+def api_concursos_editar_campos(concurso_id):
+    """v7.3.2: edita campos do concurso (nome, banca, vagas, inscritos, link_concurso).
+    So atualiza os campos que vierem no body. Sincroniza pro marketing se nome/banca/vagas mudarem.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        campos = {}
+        for k in ("nome", "banca", "vagas", "inscritos", "link_concurso"):
+            if k in data:
+                campos[k] = str(data.get(k) or "").strip()
+        if not campos:
+            return jsonify({"erro": "nada para editar"}), 400
+        if "nome" in campos and len(campos["nome"]) < 3:
+            return jsonify({"erro": "nome muito curto"}), 400
+        sets = ", ".join(f"{k} = ?" for k in campos)
+        vals = list(campos.values()) + [concurso_id]
+        with db_conn() as conn:
+            conn.execute(f"UPDATE concursos_monitorados SET {sets} WHERE id = ?", vals)
+            crow = conn.execute("SELECT * FROM concursos_monitorados WHERE id = ?", (concurso_id,)).fetchone()
+        if crow and any(k in campos for k in ("nome", "banca", "vagas")):
+            _sync_concurso_marketing(_dict_from_row(crow), "upsert")
+        return jsonify({"ok": True, "id": concurso_id, "concurso": _dict_from_row(crow) if crow else None})
+    except Exception as e:
+        log.error("api_concursos_editar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/oportunidades/<int:item_id>/renomear-concurso", methods=["POST"])
+def api_renomear_concurso_noticia(item_id):
+    """v7.3.2: edita o nome do concurso de uma NOTICIA (campo concurso da oportunidade)."""
+    try:
+        data = request.get_json(force=True) or {}
+        novo = str(data.get("concurso", "")).strip()
+        if not novo or len(novo) < 2:
+            return jsonify({"erro": "nome invalido"}), 400
+        with db_conn() as conn:
+            conn.execute("UPDATE oportunidades SET concurso = ? WHERE id = ?", (novo, item_id))
+        return jsonify({"ok": True, "id": item_id, "concurso": novo})
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
@@ -4017,6 +4096,68 @@ def api_giro():
     return jsonify({"ok": True, "giro": giro})
 
 
+def gerar_busca_ampla(api_key, pergunta):
+    """v7.3.2: busca ampla por pergunta livre.
+    Ex: 'todas as PMs com edital aberto', 'concursos com prova objetiva nos ultimos 90 dias'.
+    Devolve lista de concursos que atendem ao criterio, com fonte.
+    """
+    hoje = datetime.now(timezone.utc)
+    prompt = f"""Voce e o analista de inteligencia do escritorio Silva Pinto Advocacia (concursos publicos, foco em fases subjetivas).
+
+PERGUNTA DO USUARIO: "{pergunta}"
+
+Pesquise AGORA com web_search ({hoje.strftime('%d/%m/%Y')}) e responda essa pergunta listando os concursos que atendem ao criterio. Faca 5 a 10 buscas reais variando termos.
+
+{_ctx_bancas()} {_regras_tom()}
+
+== SAIDA: JSON puro, sem markdown ==
+{{
+  "pergunta": "{pergunta}",
+  "resultados": [
+    {{"nome": "orgao/concurso", "vagas": "ou vazio", "banca": "ou vazio", "uf": "UF", "situacao": "o que responde a pergunta (ex: edital aberto desde X, prova aplicada em Y)", "obs": "observacao estrategica ou vazio", "fonte": "URL real"}}
+  ],
+  "resumo": "2-3 frases respondendo a pergunta de forma direta",
+  "encontrou_dados": true
+}}
+
+So inclua o que encontrou DE VERDADE com fonte real. NUNCA invente."""
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=300.0, max_retries=2)
+        msg = client.messages.create(
+            model=MODEL_TIER1, max_tokens=8000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text_parts = []
+        for block in msg.content:
+            if hasattr(block, "text") and block.text:
+                text_parts.append(block.text)
+        data = parse_json_robusto("".join(text_parts).strip())
+        if data is None:
+            return {"encontrou_dados": False, "erro": "resposta nao interpretada", "pergunta": pergunta}
+        for c in data.get("resultados", []) or []:
+            f = c.get("fonte", "")
+            if f and not _dominio_permitido(f):
+                c["fonte"] = ""
+        return data
+    except Exception as e:
+        log.error("gerar_busca_ampla erro: %s", e)
+        return {"encontrou_dados": False, "erro": str(e)[:200], "pergunta": pergunta}
+
+
+@app.route("/api/busca-ampla", methods=["POST"])
+def api_busca_ampla():
+    """v7.3.2: pesquisa ampla por pergunta livre."""
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
+    data = request.get_json(force=True) or {}
+    pergunta = str(data.get("pergunta", "")).strip()
+    if not pergunta or len(pergunta) < 5:
+        return jsonify({"erro": "pergunta muito curta"}), 400
+    res = gerar_busca_ampla(ANTHROPIC_API_KEY, pergunta)
+    return jsonify({"ok": True, "resultado": res})
+
+
 def coletar_concurso_especifico(api_key, termo):
     """v7.0.1: coleta DIRIGIDA sobre um concurso especifico pedido pelo usuario.
 
@@ -4556,6 +4697,11 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .selo.edital { background:#e6f4ea; color:#276749; }
   .selo.previsto { background:#fef5e7; color:#975a16; }
   .selo.andamento { background:var(--gold-pale); color:var(--gold-dark); }
+  .selo.nomeacao { background:#e6f0e6; color:#1e6b3a; }
+  .selo.convocacao { background:#fdeede; color:#9a5b1a; }
+  .selo.gabarito { background:#e9e6f5; color:#4a3b8c; }
+  .selo.prova { background:#fef3e0; color:#8a5a12; }
+  .selo.encerradas { background:#efefef; color:#666; }
   .nov-corpo { flex:1; }
   .nov-tit { font-size:14.5px; font-weight:600; line-height:1.4; }
   .nov-desc { font-size:12.5px; color:var(--cinza); margin:4px 0 8px; }
@@ -4578,6 +4724,12 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .mini.trabalhar:hover { background:var(--gold-dark); }
   .mini.trabalhar:disabled { opacity:.6; cursor:default; }
   .mc-nome:hover { color:var(--gold-dark); text-decoration:underline; }
+  .mc-topo { display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:18px; }
+  .mc-ordem { display:flex; align-items:center; gap:8px; }
+  .mc-chev { color:var(--gold); margin-right:7px; font-size:11px; }
+  .monit-card.recolhido { padding-bottom:14px; }
+  .monit-card.recolhido .mc-nome { margin:0; }
+  .mc-acts { display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }
 
 </style>
 </head>
@@ -4601,7 +4753,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 <nav class="mainnav">
   <button class="active" onclick="showTela('pesquisa', this)">Pesquisa &amp; Novidades</button>
   <button onclick="showTela('inbox', this)">Caixa de entrada <span class="nav-badge">0</span></button>
-  <button onclick="showTela('gerenciar', this)">Concursos</button>
+  <button onclick="showTela('gerenciar', this)">Meus concursos</button>
 </nav>
 
 <!-- conte&#250;do das telas vem na parte 2 -->
@@ -4695,6 +4847,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '<div class="modo-tabs">' +
           '<button id="tab-raiox" class="modo-tab active" onclick="trocarModo(\'raiox\')">Raio-X de um concurso</button>' +
           '<button id="tab-todos" class="modo-tab" onclick="trocarModo(\'todos\')">Pesquisar todos</button>' +
+          '<button id="tab-ampla" class="modo-tab" onclick="trocarModo(\'ampla\')">Pesquisa ampla</button>' +
         '</div>' +
         '<div id="modo-raiox">' +
           '<div class="pesq-sub">Digite um concurso e receba a linha do tempo &mdash; o que ja aconteceu, em que fase esta agora, e o que vem a seguir.</div>' +
@@ -4709,6 +4862,13 @@ HTML_INDEX = r"""<!DOCTYPE html>
             '<select id="giro-vagas" class="pesq-select"><option value="0">Qualquer numero de vagas</option><option value="100">+100 vagas</option><option value="200">+200 vagas</option><option value="500">+500 vagas</option><option value="1000">+1000 vagas</option></select>' +
             '<input type="text" id="giro-uf" class="pesq-input" style="max-width:200px" placeholder="UF (opcional) ex: RJ">' +
             '<button class="pesq-btn" onclick="rodarGiro()">Pesquisar todos</button>' +
+          '</div>' +
+        '</div>' +
+        '<div id="modo-ampla" style="display:none">' +
+          '<div class="pesq-sub">Faca uma pergunta livre. Ex: "todas as policias militares com edital aberto", "concursos com prova objetiva nos ultimos 90 dias", "concursos de tribunais no Sudeste".</div>' +
+          '<div class="pesq-input-row">' +
+            '<input type="text" id="ampla-input" class="pesq-input" placeholder="Digite sua pergunta..." onkeydown="if(event.key===\'Enter\')rodarAmpla()">' +
+            '<button class="pesq-btn" onclick="rodarAmpla()">Perguntar</button>' +
           '</div>' +
         '</div>' +
         '<div id="pesq-resultado"></div>' +
@@ -4729,11 +4889,42 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   function trocarModo(modo) {
     _modoAtivo = modo;
-    document.getElementById('tab-raiox').classList.toggle('active', modo==='raiox');
-    document.getElementById('tab-todos').classList.toggle('active', modo==='todos');
-    document.getElementById('modo-raiox').style.display = modo==='raiox' ? '' : 'none';
-    document.getElementById('modo-todos').style.display = modo==='todos' ? '' : 'none';
+    ['raiox','todos','ampla'].forEach(m=>{
+      document.getElementById('tab-'+m).classList.toggle('active', modo===m);
+      document.getElementById('modo-'+m).style.display = modo===m ? '' : 'none';
+    });
     document.getElementById('pesq-resultado').innerHTML = '';
+  }
+
+  // --- MODO 3: PESQUISA AMPLA (pergunta livre) ---
+  async function rodarAmpla() {
+    const pergunta = (document.getElementById('ampla-input').value||'').trim();
+    if(pergunta.length < 5) { toast('Digite uma pergunta'); return; }
+    const box = document.getElementById('pesq-resultado');
+    box.innerHTML = '<div class="pesq-loading">Pesquisando: "'+esc(pergunta)+'"... ~40 segundos</div>';
+    const r = await POST('/api/busca-ampla', {pergunta:pergunta});
+    if(!r.ok || !r.resultado) { box.innerHTML = '<div class="pesq-erro">Nao consegui pesquisar agora.</div>'; return; }
+    renderAmpla(r.resultado);
+  }
+  function renderAmpla(res) {
+    const box = document.getElementById('pesq-resultado');
+    if(res.encontrou_dados === false) { box.innerHTML = '<div class="pesq-erro">Nao encontrei resultados para essa pergunta.</div>'; return; }
+    const items = (res.resultados||[]).filter(c=>c&&c.nome);
+    let cards = '';
+    for(const c of items) {
+      const meta = [c.vagas?esc(c.vagas)+' vagas':'', c.banca?'Banca '+esc(c.banca):'', c.uf?esc(c.uf):''].filter(x=>x).join(' &middot; ');
+      cards += '<div class="giro-card">' +
+        '<div class="giro-nome">'+esc(c.nome)+'</div>' +
+        (meta?'<div class="giro-meta">'+meta+'</div>':'') +
+        (c.situacao?'<div class="giro-obs">'+esc(c.situacao)+'</div>':'') +
+        '<div class="giro-acts">' +
+          (c.fonte?'<a class="mini fonte" href="'+esc(c.fonte)+'" target="_blank" rel="noopener">Abrir fonte</a>':'') +
+          '<button class="mini" onclick="salvarDoRelatorio(\''+esc(c.nome).replace(/\x27/g,"\\\x27")+'\',\''+esc(c.banca||'').replace(/\x27/g,"\\\x27")+'\')">Trabalhar este</button>' +
+        '</div></div>';
+    }
+    box.innerHTML = '<div class="giro-wrap">' +
+      (res.resumo?'<div class="rel-angulo" style="margin-bottom:16px">'+esc(res.resumo)+'</div>':'') +
+      cards + '</div>';
   }
 
   // --- MODO 1: RAIO-X (linha do tempo) ---
@@ -4798,7 +4989,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         (rel.leitura_estrategica?'<div class="rel-secao"><div class="rel-label">Leitura estrategica</div><div class="rel-angulo">'+esc(rel.leitura_estrategica)+'</div></div>':'') +
         fontesHtml +
         '<div class="rel-acts">' +
-          (detalhado?'':'<button class="mini" onclick="aprofundar(\''+esq()+'\')">Aprofundar</button>') +
+          '<button class="mini" onclick="pesquisarNovidadesConcurso(0,\''+esq()+'\')">Pesquisar novidades</button>' +
           '<button class="mini gerar" onclick="gerarDeRelatorio(\''+esc(rel.concurso||termo).replace(/'/g,"\\'")+'\')">&#9998; Gerar conteudo</button>' +
           '<button class="mini" onclick="salvarDoRelatorio(\''+esc(rel.concurso||termo).replace(/'/g,"\\'")+'\',\''+esc(rel.banca||'').replace(/'/g,"\\'")+'\')">Salvar nos meus concursos</button>' +
         '</div>' +
@@ -4966,11 +5157,17 @@ HTML_INDEX = r"""<!DOCTYPE html>
   // --- feed de novidades ---
   let _novCache = [];
   const SELO_INFO = {
-    jurisprudencia:    {txt:'Jurisprudencia',        cls:'jur'},
-    concorrentes:      {txt:'Concorrentes',          cls:'conc'},
-    edital_aberto:     {txt:'Edital aberto',         cls:'edital'},
-    concurso_previsto: {txt:'Concurso previsto',     cls:'previsto'},
-    concurso_andamento:{txt:'Concurso em andamento', cls:'andamento'},
+    jurisprudencia:       {txt:'Jurisprudencia',       cls:'jur'},
+    concorrentes:         {txt:'Concorrentes',         cls:'conc'},
+    nomeacao:             {txt:'Nomeacao',             cls:'nomeacao'},
+    convocacao:           {txt:'Convocacao',           cls:'convocacao'},
+    gabarito:             {txt:'Gabarito / Resultado', cls:'gabarito'},
+    prova_em_breve:       {txt:'Prova em breve',       cls:'prova'},
+    inscricoes_abertas:   {txt:'Inscricoes abertas',   cls:'edital'},
+    inscricoes_encerradas:{txt:'Inscricoes encerradas',cls:'encerradas'},
+    edital_aberto:        {txt:'Edital aberto',        cls:'edital'},
+    concurso_previsto:    {txt:'Concurso previsto',    cls:'previsto'},
+    concurso_andamento:   {txt:'Em andamento',         cls:'andamento'},
   };
   function seloHtml(tipo) {
     const info = SELO_INFO[tipo] || SELO_INFO.concurso_andamento;
@@ -5196,41 +5393,98 @@ HTML_INDEX = r"""<!DOCTYPE html>
   }
 
   // ===== TELA 3: GERENCIAR CONCURSOS =====
+  let _ordemConcursos = 'coleta';
+  let _recolhidos = {};
   async function renderTelaGerenciar() {
     const cont = document.getElementById('telas-container');
     cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando...</div>';
     const data = await GET('/api/concursos');
-    const concursos = data.concursos || [];
-    window._concursosCache = concursos;
-
+    window._concursosCache = data.concursos || [];
+    desenharMeusConcursos();
+  }
+  function ordenarConcursos(arr) {
+    const a = arr.slice();
+    const numVagas = c => { const n = parseInt(String(c.vagas||'').replace(/\D/g,'')); return isNaN(n)?-1:n; };
+    if(_ordemConcursos==='alfabetica') a.sort((x,y)=>(x.nome||'').localeCompare(y.nome||''));
+    else if(_ordemConcursos==='vagas_maior') a.sort((x,y)=>numVagas(y)-numVagas(x));
+    else if(_ordemConcursos==='vagas_menor') a.sort((x,y)=>numVagas(x)-numVagas(y));
+    else if(_ordemConcursos==='noticia') a.sort((x,y)=>String(y.ultima_noticia||'').localeCompare(String(x.ultima_noticia||'')));
+    else a.sort((x,y)=>(y.id||0)-(x.id||0)); // coleta (mais recente = maior id)
+    return a;
+  }
+  function desenharMeusConcursos() {
+    const cont = document.getElementById('telas-container');
+    const concursos = ordenarConcursos(window._concursosCache||[]);
     let cards = '';
     for(const c of concursos) {
-      const kws = (c.palavras_chave||'').split(',').filter(k=>k.trim()).map(k=>'<span class="kw">'+esc(k.trim())+'</span>').join('');
-      // v7.0.1: seletor de prioridade com as 3 bolinhas (escolha direta)
-      let seletor = '';
-      for(const p of PRIO_ORDEM) {
-        const ativa = (c.prioridade === p);
-        seletor += '<button class="stage-dot" title="'+PRIO_LABEL[p]+'" style="background:'+PRIO_COR[p]+';width:14px;height:14px;'+(ativa?'box-shadow:0 0 0 2px var(--preto);':'opacity:0.35;')+'" onclick="definirPrio('+c.id+',\''+p+'\',this)"></button>';
+      const recolhido = _recolhidos[c.id];
+      const linkBanca = [c.banca?'Banca '+esc(c.banca):'', c.vagas?esc(c.vagas)+' vagas':'', c.inscritos?esc(c.inscritos)+' inscritos':''].filter(x=>x).join(' &middot; ');
+      const linkBtn = c.link_concurso ? '<a class="mini" href="'+esc(c.link_concurso)+'" target="_blank" rel="noopener">Pagina do concurso</a>' : '';
+      let corpo = '';
+      if(!recolhido) {
+        corpo =
+          '<div class="mc-meta">'+(linkBanca||'Sem dados ainda')+'</div>' +
+          '<div class="mc-foot"><span class="mc-count">'+c.noticias_count+' noticia(s)</span></div>' +
+          '<div class="mc-acts">' +
+          '<button class="mini" onclick="event.stopPropagation();abrirFicha('+c.id+')">Ver ficha</button>' +
+          '<button class="mini gerar" onclick="event.stopPropagation();pesquisarNovidadesConcurso('+c.id+',\''+esc(c.nome).replace(/\x27/g,"\\\x27")+'\')">Pesquisar novidades</button>' +
+          '<button class="mini" onclick="event.stopPropagation();editarConcurso('+c.id+')">Editar</button>' +
+          linkBtn +
+          '<button class="mini" onclick="event.stopPropagation();abrirMesclar('+c.id+')">Mesclar</button>' +
+          '<button class="mini" style="color:#b23b32;border-color:#b23b32" onclick="event.stopPropagation();excluirConcurso('+c.id+',\''+esc(c.nome).replace(/\x27/g,"\\\x27")+'\')">Excluir</button>' +
+          '</div>';
       }
-      cards += '<div class="monit-card"><h4 class="serif mc-nome" onclick="abrirFicha('+c.id+')" style="cursor:pointer">'+esc(c.nome)+'</h4>' +
-        '<div class="mc-meta">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas</div>' +
-        '<div>'+kws+'</div>' +
-        '<div class="mc-foot"><span class="mc-count">'+c.noticias_count+' noticia(s)</span>' +
-        '<span style="display:flex;gap:5px;align-items:center">'+seletor+'</span></div>' +
-        '<div style="display:flex;gap:7px;margin-top:10px">' +
-        '<button class="mini" onclick="abrirFicha('+c.id+')">Ver ficha</button>' +
-        '<button class="mini" onclick="abrirMesclar('+c.id+')">Mesclar</button>' +
-        '<button class="mini" style="color:#b23b32;border-color:#b23b32" onclick="excluirConcurso('+c.id+',\''+esc(c.nome)+'\')">Excluir</button>' +
-        '</div></div>';
+      cards += '<div class="monit-card'+(recolhido?' recolhido':'')+'">' +
+        '<h4 class="serif mc-nome" onclick="toggleRecolher('+c.id+')" title="Clique para recolher/expandir">' +
+        '<span class="mc-chev">'+(recolhido?'&#9656;':'&#9662;')+'</span>'+esc(c.nome)+'</h4>' +
+        corpo + '</div>';
     }
-    if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso monitorado. Adicione o primeiro!</div>';
+    if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso ainda. Use "Pesquisar" ou "Trabalhar este" no feed de novidades.</div>';
 
     cont.innerHTML = '<div class="tela active">' +
-      '<div class="add-bar"><button class="add-btn" onclick="abrirModal()">+ Monitorar novo concurso</button>' +
-      '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar concursos do acervo</button>' +
-      '<button class="add-btn" style="background:var(--cinza)" onclick="limparDuplicados()">Limpar duplicados</button>' +
-      '<button class="add-btn" style="background:var(--preto);border:1px solid var(--gold)" onclick="sincronizarMarketing()">Sincronizar com marketing</button></div>' +
+      '<div class="mc-topo">' +
+        '<div class="add-bar" style="margin:0">' +
+          '<button class="add-btn" onclick="abrirModal()">+ Novo concurso</button>' +
+          '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar do acervo</button>' +
+          '<button class="add-btn" style="background:var(--cinza)" onclick="limparDuplicados()">Limpar duplicados</button>' +
+        '</div>' +
+        '<div class="mc-ordem"><span style="font-size:11px;color:var(--cinza);font-weight:700">Ordenar:</span>' +
+          '<select class="pesq-select" style="padding:8px 14px;font-size:12px" onchange="_ordemConcursos=this.value;desenharMeusConcursos()">' +
+            '<option value="coleta"'+(_ordemConcursos==='coleta'?' selected':'')+'>Data de coleta</option>' +
+            '<option value="noticia"'+(_ordemConcursos==='noticia'?' selected':'')+'>Data da noticia</option>' +
+            '<option value="alfabetica"'+(_ordemConcursos==='alfabetica'?' selected':'')+'>Ordem alfabetica</option>' +
+            '<option value="vagas_maior"'+(_ordemConcursos==='vagas_maior'?' selected':'')+'>Mais vagas</option>' +
+            '<option value="vagas_menor"'+(_ordemConcursos==='vagas_menor'?' selected':'')+'>Menos vagas</option>' +
+          '</select></div>' +
+      '</div>' +
       '<div class="monit-grid">'+cards+'</div></div>';
+  }
+  function toggleRecolher(cid) {
+    _recolhidos[cid] = !_recolhidos[cid];
+    desenharMeusConcursos();
+  }
+  async function pesquisarNovidadesConcurso(cid, nome) {
+    toast('Pesquisando novidades de "'+nome+'"... ~1 min em segundo plano', 7000);
+    const r = await POST('/api/coleta/concurso', {termo:nome});
+    if(r.ok) toast('Busca disparada. As novidades entram na ficha quando chegarem.', 6000);
+    else toast('Erro ao pesquisar', 4000);
+  }
+  async function editarConcurso(cid) {
+    const c = (window._concursosCache||[]).find(x=>x.id===cid);
+    if(!c) return;
+    const nome = prompt('Nome do concurso:', c.nome||'');
+    if(nome===null) return;
+    const banca = prompt('Banca:', c.banca||'');
+    if(banca===null) return;
+    const vagas = prompt('Numero de vagas:', c.vagas||'');
+    if(vagas===null) return;
+    const inscritos = prompt('Numero de inscritos:', c.inscritos||'');
+    if(inscritos===null) return;
+    const link = prompt('Link da pagina do concurso:', c.link_concurso||'');
+    if(link===null) return;
+    const r = await POST('/api/concursos/'+cid+'/editar', {nome:nome.trim(), banca:banca.trim(), vagas:vagas.trim(), inscritos:inscritos.trim(), link_concurso:link.trim()});
+    if(r.ok) { toast('Concurso atualizado'); renderTelaGerenciar(); }
+    else toast('Erro: '+(r.erro||''));
   }
 
   // ===== ACOES =====
