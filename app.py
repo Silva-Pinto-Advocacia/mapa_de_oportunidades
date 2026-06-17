@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.3.2-meus-concursos"
+APP_VERSION = "v7.3.4-selecao"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3034,16 +3034,25 @@ def api_concursos_limpar_duplicados():
 
 @app.route("/api/concursos/sincronizar-marketing", methods=["POST"])
 def api_concursos_sincronizar_marketing():
-    """v7.0.4: envia TODOS os concursos ativos pra pagina 'Concursos' do marketing,
-    de forma SINCRONA, e reporta o resultado REAL de cada envio.
+    """v7.0.4: envia concursos pra pagina 'Concursos' do marketing, de forma
+    SINCRONA, e reporta o resultado REAL de cada envio.
 
-    Assim o usuario sabe na hora se o receptor do marketing existe e respondeu,
-    em vez de um 'enviado' cego."""
+    v7.3.4: aceita 'ids' no body - se vier lista, envia SO esses; senao, todos.
+    """
     try:
+        body = request.get_json(silent=True) or {}
+        ids_filtro = body.get("ids")
         with db_conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM concursos_monitorados WHERE ativo = 1"
-            ).fetchall()
+            if ids_filtro:
+                placeholders = ",".join("?" for _ in ids_filtro)
+                rows = conn.execute(
+                    f"SELECT * FROM concursos_monitorados WHERE ativo = 1 AND id IN ({placeholders})",
+                    [int(x) for x in ids_filtro]
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM concursos_monitorados WHERE ativo = 1"
+                ).fetchall()
             concursos = [_dict_from_row(r) for r in rows]
 
         prio_map = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
@@ -4730,6 +4739,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .monit-card.recolhido { padding-bottom:14px; }
   .monit-card.recolhido .mc-nome { margin:0; }
   .mc-acts { display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }
+  .mc-head-row { display:flex; align-items:center; gap:10px; }
+  .mc-chk { width:17px; height:17px; accent-color:var(--gold); cursor:pointer; flex-shrink:0; }
+  .monit-card.selecionado { border-color:var(--gold); box-shadow:0 0 0 2px var(--gold-pale); }
 
 </style>
 </head>
@@ -5412,12 +5424,14 @@ HTML_INDEX = r"""<!DOCTYPE html>
     else a.sort((x,y)=>(y.id||0)-(x.id||0)); // coleta (mais recente = maior id)
     return a;
   }
+  let _selecionados = {};
   function desenharMeusConcursos() {
     const cont = document.getElementById('telas-container');
     const concursos = ordenarConcursos(window._concursosCache||[]);
     let cards = '';
     for(const c of concursos) {
       const recolhido = _recolhidos[c.id];
+      const marcado = _selecionados[c.id] ? 'checked' : '';
       const linkBanca = [c.banca?'Banca '+esc(c.banca):'', c.vagas?esc(c.vagas)+' vagas':'', c.inscritos?esc(c.inscritos)+' inscritos':''].filter(x=>x).join(' &middot; ');
       const linkBtn = c.link_concurso ? '<a class="mini" href="'+esc(c.link_concurso)+'" target="_blank" rel="noopener">Pagina do concurso</a>' : '';
       let corpo = '';
@@ -5434,12 +5448,22 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '<button class="mini" style="color:#b23b32;border-color:#b23b32" onclick="event.stopPropagation();excluirConcurso('+c.id+',\''+esc(c.nome).replace(/\x27/g,"\\\x27")+'\')">Excluir</button>' +
           '</div>';
       }
-      cards += '<div class="monit-card'+(recolhido?' recolhido':'')+'">' +
+      cards += '<div class="monit-card'+(recolhido?' recolhido':'')+(marcado?' selecionado':'')+'">' +
+        '<div class="mc-head-row">' +
+        '<input type="checkbox" class="mc-chk" '+marcado+' onclick="event.stopPropagation();toggleSelecao('+c.id+')" title="Selecionar para enviar ao marketing">' +
         '<h4 class="serif mc-nome" onclick="toggleRecolher('+c.id+')" title="Clique para recolher/expandir">' +
         '<span class="mc-chev">'+(recolhido?'&#9656;':'&#9662;')+'</span>'+esc(c.nome)+'</h4>' +
+        '</div>' +
         corpo + '</div>';
     }
     if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso ainda. Use "Pesquisar" ou "Trabalhar este" no feed de novidades.</div>';
+
+    const nSel = Object.values(_selecionados).filter(Boolean).length;
+    const barraEnvio = nSel > 0
+      ? '<button class="add-btn" style="background:var(--preto);border:1px solid var(--gold)" onclick="enviarSelecionados()">Enviar '+nSel+' selecionado'+(nSel>1?'s':'')+' ao marketing</button>' +
+        '<button class="add-btn" style="background:var(--cinza)" onclick="limparSelecao()">Limpar selecao</button>'
+      : '<button class="add-btn" style="background:var(--preto);border:1px solid var(--gold)" onclick="sincronizarMarketing()">Enviar todos ao marketing</button>' +
+        '<button class="add-btn" style="background:#fff;color:var(--preto);border:1px solid var(--line)" onclick="selecionarTodos()">Selecionar concursos</button>';
 
     cont.innerHTML = '<div class="tela active">' +
       '<div class="mc-topo">' +
@@ -5447,6 +5471,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '<button class="add-btn" onclick="abrirModal()">+ Novo concurso</button>' +
           '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar do acervo</button>' +
           '<button class="add-btn" style="background:var(--cinza)" onclick="limparDuplicados()">Limpar duplicados</button>' +
+          barraEnvio +
         '</div>' +
         '<div class="mc-ordem"><span style="font-size:11px;color:var(--cinza);font-weight:700">Ordenar:</span>' +
           '<select class="pesq-select" style="padding:8px 14px;font-size:12px" onchange="_ordemConcursos=this.value;desenharMeusConcursos()">' +
@@ -5458,6 +5483,28 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '</select></div>' +
       '</div>' +
       '<div class="monit-grid">'+cards+'</div></div>';
+  }
+  function toggleSelecao(cid) {
+    _selecionados[cid] = !_selecionados[cid];
+    desenharMeusConcursos();
+  }
+  function selecionarTodos() {
+    (window._concursosCache||[]).forEach(c=>{ _selecionados[c.id] = true; });
+    desenharMeusConcursos();
+  }
+  function limparSelecao() {
+    _selecionados = {};
+    desenharMeusConcursos();
+  }
+  async function enviarSelecionados() {
+    const ids = Object.keys(_selecionados).filter(k=>_selecionados[k]).map(Number);
+    if(!ids.length) { toast('Nenhum concurso selecionado'); return; }
+    if(!confirm('Enviar '+ids.length+' concurso(s) selecionado(s) para a pagina Concursos do marketing?')) return;
+    toast('Enviando '+ids.length+' concurso(s)... confirmando cada envio', 15000);
+    const r = await POST('/api/concursos/sincronizar-marketing', {ids:ids});
+    if(r.ok) { toast(r.confirmados+' de '+r.total+' CONFIRMADOS pelo marketing', 8000); limparSelecao(); }
+    else if(r.falhas !== undefined) toast('FALHOU: '+r.falhas+' de '+r.total+' nao aceitos. Motivo: '+(r.erro_detalhe||'desconhecido'), 15000);
+    else toast('Erro: '+(r.erro||''), 8000);
   }
   function toggleRecolher(cid) {
     _recolhidos[cid] = !_recolhidos[cid];
