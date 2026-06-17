@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.3.4-selecao"
+APP_VERSION = "v7.3.5-url-api"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,7 +63,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 # Mapeamento de etapas 1:1 -> urgente | importante | nao_urgente
 CONCURSOS_MKT_URL = os.environ.get(
     "CONCURSOS_MKT_URL",
-    "https://silvapinto-comercial.onrender.com/marketing/concursos/sincronizar-externo"
+    "https://silvapinto-comercial.onrender.com/api/concursos/sincronizar-externo"
 ).strip()
 
 # YouTube Data API (opcional). Se vazio, pula enrichment.
@@ -3088,7 +3088,7 @@ def api_concursos_sincronizar_marketing():
                 falhas += 1
                 if not primeiro_erro:
                     if he.code == 404:
-                        primeiro_erro = "404 - a rota /marketing/concursos/sincronizar-externo NAO EXISTE no sistema de marketing (o receptor ainda nao foi implementado la)"
+                        primeiro_erro = "404 - a rota /api/concursos/sincronizar-externo nao foi encontrada no sistema de marketing"
                     else:
                         try:
                             corpo = he.read().decode("utf-8", "ignore")[:200]
