@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.4.0-radar-completo"
+APP_VERSION = "v7.4.1-raiox-noticias"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -4203,7 +4203,7 @@ def api_busca_ampla():
     return jsonify({"ok": True, "resultado": res})
 
 
-def coletar_concurso_especifico(api_key, termo):
+def coletar_concurso_especifico(api_key, termo, concurso_id_alvo=None):
     """v7.0.1: coleta DIRIGIDA sobre um concurso especifico pedido pelo usuario.
 
     Mesma infra anti-fake da coleta normal: web_search real, link obrigatorio
@@ -4319,6 +4319,28 @@ Retorne SOMENTE JSON puro, sem markdown e sem texto fora do JSON:
         inseridos = salvar_itens(itens)
         log.info("[busca-dirigida] '%s': %d brutos, %d validos, %d inseridos",
                  termo, len(brutos), len(itens), len(inseridos))
+        # v7.4.1: triar os itens recem-coletados pra que encaixem no concurso monitorado
+        try:
+            if inseridos:
+                ids = [it["id"] for it in inseridos if isinstance(it, dict) and it.get("id")]
+                triar_itens(ids if ids else None)
+            else:
+                triar_itens()
+        except Exception as e:
+            log.warning("[busca-dirigida] triagem pos-coleta falhou: %s", e)
+        # v7.4.1: se foi pedido encaixe num concurso especifico, vincula os itens recem-vindos
+        if concurso_id_alvo and inseridos:
+            try:
+                with db_conn() as conn:
+                    for it in inseridos:
+                        iid = it.get("id") if isinstance(it, dict) else None
+                        if iid:
+                            conn.execute(
+                                "UPDATE oportunidades SET concurso_id=?, status_triagem='confirmado', sugestao_concurso=NULL WHERE id=?",
+                                (concurso_id_alvo, iid)
+                            )
+            except Exception as e:
+                log.warning("[busca-dirigida] encaixe no concurso %s falhou: %s", concurso_id_alvo, e)
         return len(inseridos)
     except Exception as e:
         log.error("[busca-dirigida] erro: %s", e)
@@ -4337,12 +4359,13 @@ def api_coleta_concurso():
         return jsonify({"erro": "ANTHROPIC_API_KEY nao configurada"}), 500
     data = request.get_json(force=True) or {}
     termo = str(data.get("termo", "")).strip()
+    concurso_id_alvo = data.get("concurso_id")
     if not termo or len(termo) < 3:
         return jsonify({"erro": "termo muito curto"}), 400
 
     def run():
         try:
-            coletar_concurso_especifico(ANTHROPIC_API_KEY, termo)
+            coletar_concurso_especifico(ANTHROPIC_API_KEY, termo, concurso_id_alvo)
         except Exception as e:
             log.error("coleta dirigida falhou: %s", e)
 
@@ -5212,10 +5235,17 @@ HTML_INDEX = r"""<!DOCTYPE html>
   }
   async function atualizarRaiox(nome, concursoId) {
     const box = document.querySelector('.ficha-col');
-    if(box) box.innerHTML = '<h3 class="serif ficha-h">Raio-X</h3><div class="pesq-loading">Atualizando Raio-X de "'+esc(nome)+'"...</div>';
+    if(box) box.innerHTML = '<h3 class="serif ficha-h">Raio-X</h3><div class="pesq-loading">Atualizando Raio-X e buscando noticias novas de "'+esc(nome)+'"...</div>';
+    // Dispara a coleta de noticias do concurso em paralelo (roda em segundo plano no servidor)
+    POST('/api/coleta/concurso', {termo:nome, concurso_id:concursoId});
+    // Refaz o Raio-X (sincrono) e salva no concurso
     const r = await POST('/api/pesquisar', {termo:nome, profundidade:'enxuto', salvar_em:concursoId});
-    if(r.ok) { toast('Raio-X atualizado'); abrirFicha(concursoId); }
-    else toast('Erro ao atualizar');
+    if(r.ok) {
+      toast('Raio-X atualizado. As noticias novas entram na ficha em ~1 min.', 7000);
+      abrirFicha(concursoId, true);
+    } else {
+      toast('Erro ao atualizar');
+    }
   }
   async function enviarRadar(concursoId) {
     if(!confirm('Enviar a inteligencia deste concurso (Raio-X + novidades) para o RADAR do sistema comercial?\n\nOs dados juridicos e de honorarios continuam sendo preenchidos so no comercial.')) return;
@@ -5571,7 +5601,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   }
   async function pesquisarNovidadesConcurso(cid, nome) {
     toast('Pesquisando novidades de "'+nome+'"... ~1 min em segundo plano', 7000);
-    const r = await POST('/api/coleta/concurso', {termo:nome});
+    const r = await POST('/api/coleta/concurso', {termo:nome, concurso_id:(cid||null)});
     if(r.ok) toast('Busca disparada. As novidades entram na ficha quando chegarem.', 6000);
     else toast('Erro ao pesquisar', 4000);
   }
