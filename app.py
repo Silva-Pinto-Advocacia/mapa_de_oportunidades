@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.3.5-url-api"
+APP_VERSION = "v7.4.0-radar-completo"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3797,8 +3797,16 @@ Diga em que FASE esta o dinheiro agora. Ex: se a objetiva acabou e vem TAF/medic
   "concurso": "nome",
   "banca": "banca ou vazio",
   "cargo": "cargo ou vazio",
-  "vagas": "numero ou vazio",
-  "salario": "salario ou vazio",
+  "nivel": "nivel de escolaridade (medio/superior/etc) ou vazio",
+  "vagas": "numero de vagas ou vazio",
+  "inscritos": "numero de inscritos ou vazio",
+  "salario": "remuneracao do cargo ou vazio",
+  "proxima_data": "data da proxima etapa/evento (DD/MM/AAAA) ou vazio",
+  "nota_minima_aprovacao": "nota minima para aprovacao, se houver, ou vazio",
+  "nota_minima_qualificado": "nota minima para qualificacao/classificacao, se houver, ou vazio",
+  "notas_corte_modalidade": [
+    {{"cargo_genero": "cargo ou cargo/genero", "ampla": "nota ou vazio", "ppp": "nota ou vazio", "pcd": "nota ou vazio", "indigena_quilombola": "nota ou vazio", "hipossuficiente": "nota ou vazio"}}
+  ],
   "linha_do_tempo": [
     {{"data": "DD/MM/AAAA ou mes/ano", "evento": "o que aconteceu", "status": "concluido"}}
   ],
@@ -3810,7 +3818,7 @@ Diga em que FASE esta o dinheiro agora. Ex: se a objetiva acabou e vem TAF/medic
   "encontrou_dados": true
 }}
 
-Ordene a linha_do_tempo da mais antiga para a mais recente. Se nao encontrar dados confiaveis, retorne encontrou_dados=false. NUNCA invente datas, vagas ou questoes."""
+Preencha notas_corte_modalidade SO se encontrar as notas de corte reais por modalidade (ampla concorrencia, PPP/negros, PcD, indigena/quilombola, hipossuficiente). Se nao houver, deixe a lista vazia. Ordene a linha_do_tempo da mais antiga para a mais recente. Se nao encontrar dados confiaveis, retorne encontrou_dados=false. NUNCA invente datas, vagas, notas ou questoes."""
 
     try:
         client = anthropic.Anthropic(api_key=api_key, timeout=240.0, max_retries=2)
@@ -4045,24 +4053,52 @@ def api_enviar_radar(concurso_id):
                 raiox = json.loads(concurso["raiox_json"])
             except Exception:
                 raiox = None
+        rx = raiox or {}
 
-        # Monta o destino: base do CONCURSOS_MKT_URL + rota de inteligencia
-        base = CONCURSOS_MKT_URL.rsplit("/marketing/", 1)[0] if "/marketing/" in CONCURSOS_MKT_URL else "https://silvapinto-comercial.onrender.com"
-        url_radar = base + "/radar/inteligencia-externa"
+        # Monta o destino: base do CONCURSOS_MKT_URL + rota de inteligencia do RADAR
+        if "/api/" in CONCURSOS_MKT_URL:
+            base = CONCURSOS_MKT_URL.rsplit("/api/", 1)[0]
+        elif "/marketing/" in CONCURSOS_MKT_URL:
+            base = CONCURSOS_MKT_URL.rsplit("/marketing/", 1)[0]
+        else:
+            base = "https://silvapinto-comercial.onrender.com"
+        url_radar = base + "/api/radar/inteligencia-externa"
 
         prio_map = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
+        # Helper: prefere o dado salvo no concurso; se vazio, usa o do raio-x
+        def campo(nome_concurso, nome_raiox):
+            v = (concurso.get(nome_concurso) or "").strip() if concurso.get(nome_concurso) else ""
+            return v or str(rx.get(nome_raiox, "") or "").strip()
+
         payload = {
             "nome": concurso.get("nome", ""),
-            "banca": concurso.get("banca", ""),
-            "vagas": concurso.get("vagas", ""),
-            "etapa": prio_map.get(concurso.get("prioridade", "importante"), "importante"),
-            "fase_atual": (raiox or {}).get("fase_atual", ""),
-            "linha_do_tempo": (raiox or {}).get("linha_do_tempo", []),
-            "proximas_etapas": (raiox or {}).get("proximas_etapas", []),
-            "leitura_estrategica": (raiox or {}).get("leitura_estrategica", ""),
-            "novidades": [{"titulo": n.get("titulo", ""), "link": n.get("link", ""),
-                           "tipo": n.get("tipo_novidade", "")} for n in novidades],
+            "acao": "upsert",
             "origem": "painel-oportunidades",
+            # Informacoes Gerais
+            "cargo": campo("cargo", "cargo") or rx.get("cargo", ""),
+            "banca": campo("banca", "banca"),
+            "nivel": rx.get("nivel", ""),
+            "vagas": campo("vagas", "vagas"),
+            "inscritos": campo("inscritos", "inscritos"),
+            "proxima_data": rx.get("proxima_data", ""),
+            "remuneracao": campo("salario", "salario") or rx.get("salario", ""),
+            "nota_minima_aprovacao": rx.get("nota_minima_aprovacao", ""),
+            "nota_minima_qualificado": rx.get("nota_minima_qualificado", ""),
+            "link_concurso": concurso.get("link_concurso", ""),
+            "etapa": prio_map.get(concurso.get("prioridade", "importante"), "importante"),
+            # Notas de corte por modalidade
+            "notas_corte_modalidade": rx.get("notas_corte_modalidade", []),
+            # Inteligencia / Raio-X
+            "fase_atual": rx.get("fase_atual", ""),
+            "linha_do_tempo": rx.get("linha_do_tempo", []),
+            "proximas_etapas": rx.get("proximas_etapas", []),
+            "pontos_quentes": rx.get("pontos_quentes", []),
+            "leitura_estrategica": rx.get("leitura_estrategica", ""),
+            "fontes": rx.get("fontes", []),
+            # Novidades coletadas
+            "novidades": [{"titulo": n.get("titulo", ""), "link": n.get("link", ""),
+                           "tipo": n.get("tipo_novidade", ""), "data": n.get("data_coleta", "")}
+                          for n in novidades],
         }
 
         try:
@@ -4077,7 +4113,7 @@ def api_enviar_radar(concurso_id):
                 corpo = resp.read().decode("utf-8", "ignore")[:200]
             return jsonify({"ok": ok, "destino": url_radar, "resposta": corpo})
         except urllib.error.HTTPError as he:
-            detalhe = ("404 - a rota /radar/inteligencia-externa ainda nao existe no sistema comercial"
+            detalhe = ("404 - a rota /api/radar/inteligencia-externa ainda nao existe no sistema comercial"
                        if he.code == 404 else f"HTTP {he.code}")
             return jsonify({"ok": False, "destino": url_radar, "erro_detalhe": detalhe}), 200
         except Exception as e:
@@ -4742,6 +4778,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .mc-head-row { display:flex; align-items:center; gap:10px; }
   .mc-chk { width:17px; height:17px; accent-color:var(--gold); cursor:pointer; flex-shrink:0; }
   .monit-card.selecionado { border-color:var(--gold); box-shadow:0 0 0 2px var(--gold-pale); }
+  .nc-tabela { width:100%; border-collapse:collapse; font-size:12.5px; margin-top:4px; }
+  .nc-tabela th { background:var(--gold-pale); color:var(--gold-dark); font-weight:700; text-align:left; padding:7px 10px; font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
+  .nc-tabela td { padding:7px 10px; border-bottom:1px solid var(--line); color:var(--preto); }
+  .nc-tabela tr:last-child td { border-bottom:none; }
 
 </style>
 </head>
@@ -5112,10 +5152,29 @@ HTML_INDEX = r"""<!DOCTYPE html>
       const prox = (raiox.proximas_etapas||[]).filter(p=>p&&p.trim());
       const pq = (raiox.pontos_quentes||[]).filter(p=>p&&p.trim());
       raioxHtml =
+        // Informacoes Gerais que vao pro RADAR
+        (function(){
+          const campos = [
+            ['Cargo', raiox.cargo], ['Banca', raiox.banca||c.banca], ['Nivel', raiox.nivel],
+            ['Vagas', raiox.vagas||c.vagas], ['Inscritos', raiox.inscritos||c.inscritos],
+            ['Proxima data', raiox.proxima_data], ['Remuneracao', raiox.salario],
+            ['Nota min. aprovacao', raiox.nota_minima_aprovacao], ['Nota min. qualificado', raiox.nota_minima_qualificado]
+          ].filter(x=>x[1] && String(x[1]).trim());
+          if(!campos.length) return '';
+          return '<div class="rel-grid" style="margin-bottom:16px">'+campos.map(x=>'<div class="rel-item"><div class="rel-k">'+x[0]+'</div><div class="rel-v">'+esc(x[1])+'</div></div>').join('')+'</div>';
+        })() +
         (raiox.fase_atual?'<div class="fase-atual"><div class="fl">Fase atual</div><div class="ft">'+esc(raiox.fase_atual)+'</div></div>':'') +
         (tlHtml?'<div class="rel-secao"><div class="rel-label">Linha do tempo</div><div class="timeline">'+tlHtml+'</div></div>':'') +
         (prox.length?'<div class="rel-secao"><div class="rel-label">Proximas etapas</div><ul class="rel-pontos">'+prox.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul></div>':'') +
         (pq.length?'<div class="rel-secao"><div class="rel-label">Pontos quentes</div><ul class="rel-pontos">'+pq.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul></div>':'') +
+        // Notas de corte por modalidade
+        (function(){
+          const nc = (raiox.notas_corte_modalidade||[]).filter(x=>x&&x.cargo_genero);
+          if(!nc.length) return '';
+          let linhas = nc.map(x=>'<tr><td>'+esc(x.cargo_genero||'')+'</td><td>'+esc(x.ampla||'-')+'</td><td>'+esc(x.ppp||'-')+'</td><td>'+esc(x.pcd||'-')+'</td><td>'+esc(x.indigena_quilombola||'-')+'</td><td>'+esc(x.hipossuficiente||'-')+'</td></tr>').join('');
+          return '<div class="rel-secao"><div class="rel-label">Notas de corte por modalidade</div>' +
+            '<div style="overflow-x:auto"><table class="nc-tabela"><thead><tr><th>Cargo</th><th>Ampla</th><th>PPP</th><th>PcD</th><th>Ind./Quil.</th><th>Hipossuf.</th></tr></thead><tbody>'+linhas+'</tbody></table></div></div>';
+        })() +
         (raiox.leitura_estrategica?'<div class="rel-secao"><div class="rel-label">Leitura estrategica</div><div class="rel-angulo">'+esc(raiox.leitura_estrategica)+'</div></div>':'') +
         '<div style="font-size:11px;color:var(--cinza);margin-top:8px">Raio-X salvo em '+fmtData(r.raiox_data)+'</div>';
     } else {
