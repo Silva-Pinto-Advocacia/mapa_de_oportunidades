@@ -4072,6 +4072,7 @@ def api_enviar_radar(concurso_id):
 
         payload = {
             "nome": concurso.get("nome", ""),
+            "id_painel": concurso_id,
             "acao": "upsert",
             "origem": "painel-oportunidades",
             # Informacoes Gerais
