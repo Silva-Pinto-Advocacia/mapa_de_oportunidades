@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v8.0.0-onda1-omnibox"
+APP_VERSION = "v8.1.1-onda2-trilha"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -520,6 +520,36 @@ def _ensure_v73_columns():
                         log.warning("Falha ao adicionar %s.%s: %s", tabela, nome, e)
     except Exception as e:
         log.warning("_ensure_v73_columns erro: %s", e)
+
+
+def _ensure_v8_columns():
+    """v8 (Onda 2): timestamps da trilha de estado em concursos_monitorados.
+      radar_enviado_em   -> ultima vez que a inteligencia foi ACEITA pelo RADAR comercial
+      marketing_sync_em  -> ultima sync confirmada com a pagina Concursos do marketing
+      pipeline_criado_em -> ultima vez que uma noticia deste concurso gerou conteudo no pipeline
+    NULL = etapa ainda nao aconteceu (estado 'off' na trilha)."""
+    migracoes = [
+        ("concursos_monitorados", "radar_enviado_em", "TEXT"),
+        ("concursos_monitorados", "marketing_sync_em", "TEXT"),
+        ("concursos_monitorados", "pipeline_criado_em", "TEXT"),
+    ]
+    try:
+        with db_conn() as conn:
+            for tabela, nome, tipo in migracoes:
+                try:
+                    conn.execute(f"SELECT {nome} FROM {tabela} LIMIT 1")
+                    continue
+                except Exception:
+                    pass
+                try:
+                    conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {nome} {tipo}")
+                    log.info("DB v8: coluna %s.%s adicionada", tabela, nome)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "duplicate" not in msg and "exist" not in msg:
+                        log.warning("Falha ao adicionar %s.%s: %s", tabela, nome, e)
+    except Exception as e:
+        log.warning("_ensure_v8_columns erro: %s", e)
 
 
 class TursoConnWrapper:
@@ -1293,6 +1323,8 @@ def _sync_concurso_marketing(concurso, acao="upsert"):
     if not payload["nome"]:
         return
 
+    _cid = concurso.get("id")
+
     def _send():
         try:
             req = urllib.request.Request(
@@ -1306,6 +1338,15 @@ def _sync_concurso_marketing(concurso, acao="upsert"):
                     log.warning("sync-mkt: status %d para '%s'", resp.status, payload["nome"])
                 else:
                     log.info("sync-mkt: %s '%s' -> %s", acao, payload["nome"], payload["etapa"])
+                    if acao == "upsert" and _cid:
+                        try:
+                            with db_conn() as conn:
+                                conn.execute(
+                                    "UPDATE concursos_monitorados SET marketing_sync_em = ? WHERE id = ?",
+                                    (datetime.now(timezone.utc).isoformat(), _cid),
+                                )
+                        except Exception as e_ts:
+                            log.warning("sync-mkt: confirmado mas falhou gravar timestamp: %s", e_ts)
         except Exception as e:
             log.warning("sync-mkt: falha para '%s' (%s) - painel segue normal", payload["nome"], e)
 
@@ -2708,10 +2749,11 @@ def api_concursos_criar():
         if prioridade not in PRIORIDADES_VALIDAS:
             prioridade = "importante"
         vagas = str(data.get("vagas", "")).strip()
+        forcar = bool(data.get("forcar"))
         agora = datetime.now(timezone.utc).isoformat()
 
         with db_conn() as conn:
-            existente = _concurso_existente_por_nome(conn, nome)
+            existente = None if forcar else _concurso_existente_por_nome(conn, nome)
             if existente:
                 log.info("v7: criacao bloqueada - '%s' ja existe como '%s' (id %s)",
                          nome, existente.get("nome"), existente.get("id"))
@@ -4112,6 +4154,15 @@ def api_enviar_radar(concurso_id):
             with urllib.request.urlopen(req, timeout=25) as resp:
                 ok = resp.status < 300
                 corpo = resp.read().decode("utf-8", "ignore")[:200]
+            if ok:
+                try:
+                    with db_conn() as conn:
+                        conn.execute(
+                            "UPDATE concursos_monitorados SET radar_enviado_em = ? WHERE id = ?",
+                            (datetime.now(timezone.utc).isoformat(), concurso_id),
+                        )
+                except Exception as e_ts:
+                    log.warning("enviar-radar: aceito mas falhou gravar timestamp: %s", e_ts)
             return jsonify({"ok": ok, "destino": url_radar, "resposta": corpo})
         except urllib.error.HTTPError as he:
             detalhe = ("404 - a rota /api/radar/inteligencia-externa ainda nao existe no sistema comercial"
@@ -4121,6 +4172,23 @@ def api_enviar_radar(concurso_id):
             return jsonify({"ok": False, "destino": url_radar, "erro_detalhe": str(e)[:200]}), 200
     except Exception as e:
         log.error("api_enviar_radar erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/concursos/<int:concurso_id>/marcar-pipeline", methods=["POST"])
+def api_marcar_pipeline(concurso_id):
+    """v8 (Onda 2): registra que uma noticia deste concurso virou conteudo no
+    pipeline de marketing. Chamado pelo front apos envio bem-sucedido (trilha)."""
+    try:
+        agora = datetime.now(timezone.utc).isoformat()
+        with db_conn() as conn:
+            conn.execute(
+                "UPDATE concursos_monitorados SET pipeline_criado_em = ? WHERE id = ?",
+                (agora, concurso_id),
+            )
+        return jsonify({"ok": True, "pipeline_criado_em": agora})
+    except Exception as e:
+        log.error("api_marcar_pipeline erro: %s", e)
         return jsonify({"erro": str(e)}), 500
 
 
@@ -4444,6 +4512,7 @@ _ensure_metricas_column()
 _ensure_selecionado_column()
 _ensure_triagem_columns()
 _ensure_v73_columns()
+_ensure_v8_columns()
 
 
 # Logo PNG transparente embutido (gerado a partir da logo Silva Pinto)
@@ -4728,6 +4797,28 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .nov-desc { font-size: 12.5px; color: var(--cinza); margin: 3px 0 8px; line-height: 1.45; }
   .nov-acts { display: flex; gap: 7px; flex-wrap: wrap; }
 
+  /* ===== v8 (Onda 2): trilha de estado + menus ===== */
+  .mc-bola { width:13px; height:13px; border-radius:50%; flex-shrink:0; cursor:pointer; border:2px solid #fff; box-shadow:0 0 0 1px var(--line); }
+  .mc-trilha { display:flex; gap:6px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+  .tr-item { font-size:10px; font-weight:800; padding:4px 9px; border-radius:12px; border:1px solid var(--line); color:var(--cinza); background:#fff; white-space:nowrap; }
+  .tr-item.on { background:#e8f3ea; color:#2e7d43; border-color:#bfdec7; }
+  .tr-item.off { cursor:pointer; }
+  .tr-item.off:hover { border-color:var(--gold); color:var(--gold-dark); }
+  .tr-item.neutro { opacity:.65; }
+  .mc-menu-wrap { position:relative; margin-left:auto; }
+  .mc-menu-btn { border:1px solid var(--line); background:#fff; border-radius:8px; padding:3px 10px; font-size:16px; cursor:pointer; line-height:1.2; color:var(--cinza); }
+  .mc-menu-btn:hover { border-color:var(--gold); color:var(--gold-dark); }
+  .mc-menu { display:none; position:absolute; right:0; top:calc(100% + 6px); background:#fff; border:1px solid var(--line); border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,.10); z-index:40; min-width:210px; overflow:hidden; }
+  .mc-menu.show { display:block; }
+  .mc-menu div, .mc-menu a { display:block; padding:10px 14px; font-size:12.5px; color:var(--preto); cursor:pointer; text-decoration:none; }
+  .mc-menu div:hover, .mc-menu a:hover { background:var(--gold-pale); }
+  .mc-menu .perigo { color:#b23b32; }
+  .mc-manut-wrap { position:relative; }
+  .mc-manut { display:none; position:absolute; left:0; top:calc(100% + 6px); background:#fff; border:1px solid var(--line); border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,.10); z-index:40; min-width:230px; overflow:hidden; }
+  .mc-manut.show { display:block; }
+  .mc-manut div { padding:10px 14px; font-size:12.5px; cursor:pointer; }
+  .mc-manut div:hover { background:var(--gold-pale); }
+
   /* ===== v7.2: modos, timeline, giro ===== */
   .modo-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
   .modo-tab { flex: 1; padding: 12px; border: 1.5px solid var(--line); background: #fff; border-radius: 10px; font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 14px; color: var(--cinza); cursor: pointer; transition: all 0.15s; }
@@ -4803,7 +4894,6 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .mc-nome:hover { color:var(--gold-dark); text-decoration:underline; }
   .mc-topo { display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:18px; }
   .mc-ordem { display:flex; align-items:center; gap:8px; }
-  .mc-chev { color:var(--gold); margin-right:7px; font-size:11px; }
   .monit-card.recolhido { padding-bottom:14px; }
   .monit-card.recolhido .mc-nome { margin:0; }
   .mc-acts { display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }
@@ -5159,16 +5249,30 @@ HTML_INDEX = r"""<!DOCTYPE html>
       toast(r.ok ? 'Enviado ao pipeline de conteudo' : 'Erro ao enviar');
     } catch(e) { toast('Erro: '+e.message); }
   }
-  async function salvarDoRelatorio(nome, banca) {
-    const r = await POST('/api/concursos', {nome:nome, banca:banca, palavras_chave:nome, prioridade:'importante'});
-    if(r.ok) {
-      const cid = r.concurso && r.concurso.id;
-      // v7.3: se temos um Raio-X aberto deste concurso, salva no card dele
-      if(cid && _ultimoRelatorio && (_ultimoRelatorio.concurso||'').toLowerCase().includes(nome.toLowerCase().substring(0,8))) {
-        await POST('/api/concursos/'+cid+'/salvar-raiox', {relatorio:_ultimoRelatorio});
-      }
-      toast(r.ja_existia ? 'Ja estava nos seus concursos' : 'Agora voce acompanha este concurso');
-    } else toast('Erro: '+(r.erro||''));
+  async function salvarDoRelatorio(nome, banca, forcado) {
+    const body = {nome:nome, banca:banca, palavras_chave:nome, prioridade:'importante'};
+    if(forcado) body.forcar = true;
+    const r = await POST('/api/concursos', body);
+    if(!r.ok) { toast('Erro: '+(r.erro||'')); return; }
+    const cid = r.concurso && r.concurso.id;
+    // v7.3: se temos um Raio-X aberto deste concurso, salva no card dele
+    if(cid && _ultimoRelatorio && (_ultimoRelatorio.concurso||'').toLowerCase().includes(nome.toLowerCase().substring(0,8))) {
+      await POST('/api/concursos/'+cid+'/salvar-raiox', {relatorio:_ultimoRelatorio});
+    }
+    if(!r.ja_existia) { toast('Agora voce acompanha "'+((r.concurso&&r.concurso.nome)||nome)+'"'); return; }
+    // v8.1.1: duplicata detectada - mostra QUAL e da caminho
+    const nomeExist = (r.concurso && r.concurso.nome) || '';
+    const eq = normTxt(nomeExist).replace(/[\s-]/g,'') === normTxt(nome).replace(/[\s-]/g,'');
+    if(eq || !cid) {
+      toast('"'+(nomeExist||nome)+'" ja esta nos seus concursos - abrindo a ficha', 5000);
+      if(cid) abrirFicha(cid);
+      return;
+    }
+    if(confirm('O painel reconheceu "'+nome+'" como "'+nomeExist+'", que voce ja acompanha.\n\nOK = abrir a ficha de "'+nomeExist+'"\nCancelar = decidir se cria separado')) {
+      abrirFicha(cid);
+    } else if(confirm('Criar "'+nome+'" como um concurso SEPARADO de "'+nomeExist+'"?')) {
+      salvarDoRelatorio(nome, banca, true);
+    }
   }
 
   // ===== v7.3: FICHA DO CONCURSO =====
@@ -5251,7 +5355,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '<div style="flex:1"><h2 class="serif" style="font-size:27px">'+esc(c.nome)+'</h2>' +
         '<div style="font-size:13px;color:var(--cinza);margin-top:3px">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas &middot; '+novidades.length+' novidade(s)</div></div>' +
         '<button class="pesq-btn" onclick="atualizarRaiox(\''+esc(c.nome).replace(/'/g,"\\'")+'\','+concursoId+')">Atualizar Raio-X</button>' +
-        '<button class="pesq-btn alt" onclick="enviarRadar('+concursoId+')">Enviar ao RADAR</button>' +
+        (c.radar_enviado_em
+          ? '<button class="pesq-btn alt" onclick="enviarRadar('+concursoId+')" title="Enviado em '+fmtData(c.radar_enviado_em)+'">&#10003; No Radar &middot; reenviar</button>'
+          : '<button class="pesq-btn alt" onclick="enviarRadar('+concursoId+')">Enviar ao RADAR</button>') +
       '</div>' +
       '<div class="ficha-secoes">' +
         '<div class="ficha-col"><h3 class="serif ficha-h">Raio-X</h3>'+raioxHtml+'</div>' +
@@ -5276,7 +5382,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(!confirm('Enviar a inteligencia deste concurso (Raio-X + novidades) para o RADAR do sistema comercial?\n\nOs dados juridicos e de honorarios continuam sendo preenchidos so no comercial.')) return;
     toast('Enviando ao RADAR...', 6000);
     const r = await POST('/api/concursos/'+concursoId+'/enviar-radar', {});
-    if(r.ok) toast('Inteligencia enviada ao RADAR comercial');
+    if(r.ok) { toast('Inteligencia enviada ao RADAR comercial'); abrirFicha(concursoId, true); }
     else toast('Falhou: '+(r.erro_detalhe||'erro'), 10000);
   }
 
@@ -5569,7 +5675,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   // ===== TELA 3: GERENCIAR CONCURSOS =====
   let _ordemConcursos = 'coleta';
-  let _recolhidos = {};
+  let _modoSelecao = false;
   async function renderTelaGerenciar() {
     const cont = document.getElementById('telas-container');
     cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando...</div>';
@@ -5588,53 +5694,74 @@ HTML_INDEX = r"""<!DOCTYPE html>
     return a;
   }
   let _selecionados = {};
+  function _trilhaItem(on, rotulo, icone, title, clique) {
+    var cls = on ? 'tr-item on' : (clique ? 'tr-item off' : 'tr-item neutro');
+    var oc = (!on && clique) ? ' onclick="event.stopPropagation();'+clique+'"' : '';
+    return '<span class="'+cls+'" title="'+title+'"'+oc+'>'+icone+' '+rotulo+(on?' &#10003;':'')+'</span>';
+  }
   function desenharMeusConcursos() {
     const cont = document.getElementById('telas-container');
     const concursos = ordenarConcursos(window._concursosCache||[]);
     let cards = '';
     for(const c of concursos) {
-      const recolhido = _recolhidos[c.id];
       const marcado = _selecionados[c.id] ? 'checked' : '';
-      const linkBanca = [c.banca?'Banca '+esc(c.banca):'', c.vagas?esc(c.vagas)+' vagas':'', c.inscritos?esc(c.inscritos)+' inscritos':''].filter(x=>x).join(' &middot; ');
-      const linkBtn = c.link_concurso ? '<a class="mini" href="'+esc(c.link_concurso)+'" target="_blank" rel="noopener">Pagina do concurso</a>' : '';
-      let corpo = '';
-      if(!recolhido) {
-        corpo =
-          '<div class="mc-meta">'+(linkBanca||'Sem dados ainda')+'</div>' +
-          '<div class="mc-foot"><span class="mc-count">'+c.noticias_count+' noticia(s)</span></div>' +
-          '<div class="mc-acts">' +
-          '<button class="mini" onclick="event.stopPropagation();abrirFicha('+c.id+')">Ver ficha</button>' +
-          '<button class="mini gerar" onclick="event.stopPropagation();pesquisarNovidadesConcurso('+c.id+',\''+esc(c.nome).replace(/\x27/g,"\\\x27")+'\')">Pesquisar novidades</button>' +
-          '<button class="mini" onclick="event.stopPropagation();editarConcurso('+c.id+')">Editar</button>' +
-          linkBtn +
-          '<button class="mini" onclick="event.stopPropagation();abrirMesclar('+c.id+')">Mesclar</button>' +
-          '<button class="mini" style="color:#b23b32;border-color:#b23b32" onclick="event.stopPropagation();excluirConcurso('+c.id+',\''+esc(c.nome).replace(/\x27/g,"\\\x27")+'\')">Excluir</button>' +
-          '</div>';
-      }
-      cards += '<div class="monit-card'+(recolhido?' recolhido':'')+(marcado?' selecionado':'')+'">' +
+      const meta = [c.banca?'Banca '+esc(c.banca):'', c.vagas?esc(c.vagas)+' vagas':'', c.inscritos?esc(c.inscritos)+' inscritos':'', (c.noticias_count||0)+' noticia(s)'].filter(x=>x).join(' &middot; ');
+      const prio = c.prioridade||'importante';
+      const proxPrio = PRIO_ORDEM[(PRIO_ORDEM.indexOf(prio)+1) % PRIO_ORDEM.length];
+      const nomeJs = esc(c.nome).replace(/\x27/g,"\\\x27");
+      const tRadar = _trilhaItem(!!c.radar_enviado_em, 'Radar', '&#128225;',
+        c.radar_enviado_em ? 'No RADAR comercial desde '+fmtData(c.radar_enviado_em)+' (reenvio no menu)' : 'Clique para enviar a inteligencia ao RADAR comercial',
+        'enviarRadarCard('+c.id+')');
+      const tMkt = _trilhaItem(!!c.marketing_sync_em, 'Mkt', '&#128227;',
+        c.marketing_sync_em ? 'Sincronizado com o marketing em '+fmtData(c.marketing_sync_em)+' (re-sync no menu)' : 'Clique para sincronizar com a pagina Concursos do marketing',
+        'resyncMktCard('+c.id+')');
+      const tPipe = _trilhaItem(!!c.pipeline_criado_em, 'Pipeline', '&#127919;',
+        c.pipeline_criado_em ? 'Conteudo gerado em '+fmtData(c.pipeline_criado_em) : 'Gere conteudo a partir de uma noticia deste concurso para acender',
+        null);
+      let menu = '<div onclick="fecharMenusCard();pesquisarNovidadesConcurso('+c.id+',\''+nomeJs+'\')">Pesquisar novidades</div>' +
+        '<div onclick="fecharMenusCard();editarConcurso('+c.id+')">Editar</div>' +
+        (c.link_concurso?'<a href="'+esc(c.link_concurso)+'" target="_blank" rel="noopener">Pagina do concurso</a>':'') +
+        '<div onclick="fecharMenusCard();abrirMesclar('+c.id+')">Mesclar com...</div>' +
+        (c.radar_enviado_em?'<div onclick="fecharMenusCard();enviarRadarCard('+c.id+')">Reenviar ao RADAR</div>':'') +
+        (c.marketing_sync_em?'<div onclick="fecharMenusCard();resyncMktCard('+c.id+')">Re-sync marketing</div>':'') +
+        '<div class="perigo" onclick="fecharMenusCard();excluirConcurso('+c.id+',\''+nomeJs+'\')">Excluir</div>';
+      cards += '<div class="monit-card'+(marcado?' selecionado':'')+'">' +
         '<div class="mc-head-row">' +
-        '<input type="checkbox" class="mc-chk" '+marcado+' onclick="event.stopPropagation();toggleSelecao('+c.id+')" title="Selecionar para enviar ao marketing">' +
-        '<h4 class="serif mc-nome" onclick="toggleRecolher('+c.id+')" title="Clique para recolher/expandir">' +
-        '<span class="mc-chev">'+(recolhido?'&#9656;':'&#9662;')+'</span>'+esc(c.nome)+'</h4>' +
+        (_modoSelecao?'<input type="checkbox" class="mc-chk" '+marcado+' onclick="event.stopPropagation();toggleSelecao('+c.id+')">':'') +
+        '<span class="mc-bola" style="background:'+(PRIO_COR[prio]||PRIO_COR.importante)+'" title="Prioridade: '+(PRIO_LABEL[prio]||prio)+' &middot; clique para mudar" onclick="event.stopPropagation();definirPrio('+c.id+',\''+proxPrio+'\')"></span>' +
+        '<h4 class="serif mc-nome" onclick="abrirFicha('+c.id+')" title="Abrir ficha">'+esc(c.nome)+'</h4>' +
+        '<div class="mc-menu-wrap"><button class="mc-menu-btn" onclick="event.stopPropagation();toggleMenuCard('+c.id+')" title="Mais acoes">&#8943;</button>' +
+        '<div class="mc-menu" id="mcm-'+c.id+'">'+menu+'</div></div>' +
         '</div>' +
-        corpo + '</div>';
+        '<div class="mc-meta">'+(meta||'Sem dados ainda')+'</div>' +
+        '<div class="mc-trilha">'+tRadar+tMkt+tPipe+
+        '<button class="mini" style="margin-left:auto" onclick="abrirFicha('+c.id+')">Ver ficha</button></div>' +
+        '</div>';
     }
     if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso ainda. Use a busca no topo ou "+ Acompanhar" no feed de noticias.</div>';
 
     const nSel = Object.values(_selecionados).filter(Boolean).length;
-    const barraEnvio = nSel > 0
-      ? '<button class="add-btn" style="background:var(--preto);border:1px solid var(--gold)" onclick="enviarSelecionados()">Enviar '+nSel+' selecionado'+(nSel>1?'s':'')+' ao marketing</button>' +
-        '<button class="add-btn" style="background:var(--cinza)" onclick="limparSelecao()">Limpar selecao</button>'
-      : '<button class="add-btn" style="background:var(--preto);border:1px solid var(--gold)" onclick="sincronizarMarketing()">Enviar todos ao marketing</button>' +
-        '<button class="add-btn" style="background:#fff;color:var(--preto);border:1px solid var(--line)" onclick="selecionarTodos()">Selecionar concursos</button>';
+    let barra;
+    if(_modoSelecao) {
+      barra = '<button class="add-btn" style="background:var(--preto);border:1px solid var(--gold)" onclick="enviarSelecionados()">Enviar '+nSel+' ao marketing</button>' +
+        '<button class="add-btn" style="background:#fff;color:var(--preto);border:1px solid var(--line)" onclick="selecionarTodos()">Selecionar todos</button>' +
+        '<button class="add-btn" style="background:var(--cinza)" onclick="sairModoSelecao()">Cancelar</button>';
+    } else {
+      barra = '<div class="mc-manut-wrap">' +
+        '<button class="add-btn" style="background:#fff;color:var(--preto);border:1px solid var(--line)" onclick="event.stopPropagation();toggleManut()">&#9881; Manutencao &#9662;</button>' +
+        '<div class="mc-manut" id="mc-manut">' +
+          '<div onclick="fecharMenusCard();importarDoRadar()">Importar do acervo</div>' +
+          '<div onclick="fecharMenusCard();limparDuplicados()">Limpar duplicados</div>' +
+          '<div onclick="fecharMenusCard();sincronizarMarketing()">Re-sync geral com marketing</div>' +
+          '<div onclick="entrarModoSelecao()">Selecionar concursos...</div>' +
+        '</div></div>';
+    }
 
     cont.innerHTML = '<div class="tela active">' +
       '<div class="mc-topo">' +
         '<div class="add-bar" style="margin:0">' +
-          '<button class="add-btn" onclick="abrirModal()">+ Novo concurso</button>' +
-          '<button class="add-btn" style="background:var(--gold)" onclick="importarDoRadar()">Importar do acervo</button>' +
-          '<button class="add-btn" style="background:var(--cinza)" onclick="limparDuplicados()">Limpar duplicados</button>' +
-          barraEnvio +
+          '<button class="add-btn" onclick="abrirModal()">+ Acompanhar novo</button>' +
+          barra +
         '</div>' +
         '<div class="mc-ordem"><span style="font-size:11px;color:var(--cinza);font-weight:700">Ordenar:</span>' +
           '<select class="pesq-select" style="padding:8px 14px;font-size:12px" onchange="_ordemConcursos=this.value;desenharMeusConcursos()">' +
@@ -5647,6 +5774,41 @@ HTML_INDEX = r"""<!DOCTYPE html>
       '</div>' +
       '<div class="monit-grid">'+cards+'</div></div>';
   }
+  async function enviarRadarCard(cid) {
+    const c = (window._concursosCache||[]).find(x=>x.id===cid);
+    const nome = c ? c.nome : 'este concurso';
+    if(!confirm('Enviar a inteligencia de "'+nome+'" (Raio-X + novidades) ao RADAR do sistema comercial?')) return;
+    toast('Enviando ao RADAR...', 6000);
+    const r = await POST('/api/concursos/'+cid+'/enviar-radar', {});
+    if(r.ok) { toast('Inteligencia no RADAR comercial'); renderTelaGerenciar(); }
+    else toast('Falhou: '+(r.erro_detalhe||'erro'), 10000);
+  }
+  async function resyncMktCard(cid) {
+    toast('Sincronizando com o marketing...', 8000);
+    const r = await POST('/api/concursos/sincronizar-marketing', {ids:[cid]});
+    if(r.ok) { toast('Concurso confirmado pelo marketing'); renderTelaGerenciar(); }
+    else toast('Falhou: '+(r.erro_detalhe||r.erro||'erro'), 8000);
+  }
+  function toggleMenuCard(cid) {
+    const alvo = document.getElementById('mcm-'+cid);
+    const estava = alvo && alvo.classList.contains('show');
+    fecharMenusCard();
+    if(alvo && !estava) alvo.classList.add('show');
+  }
+  function fecharMenusCard() {
+    document.querySelectorAll('.mc-menu.show, .mc-manut.show').forEach(m=>m.classList.remove('show'));
+  }
+  function toggleManut() {
+    const m = document.getElementById('mc-manut');
+    const estava = m && m.classList.contains('show');
+    fecharMenusCard();
+    if(m && !estava) m.classList.add('show');
+  }
+  function entrarModoSelecao() { fecharMenusCard(); _modoSelecao = true; _selecionados = {}; desenharMeusConcursos(); }
+  function sairModoSelecao() { _modoSelecao = false; _selecionados = {}; desenharMeusConcursos(); }
+  document.addEventListener('click', function(e) {
+    if(!e.target.closest('.mc-menu-wrap') && !e.target.closest('.mc-manut-wrap')) fecharMenusCard();
+  });
   function toggleSelecao(cid) {
     _selecionados[cid] = !_selecionados[cid];
     desenharMeusConcursos();
@@ -5665,13 +5827,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(!confirm('Enviar '+ids.length+' concurso(s) selecionado(s) para a pagina Concursos do marketing?')) return;
     toast('Enviando '+ids.length+' concurso(s)... confirmando cada envio', 15000);
     const r = await POST('/api/concursos/sincronizar-marketing', {ids:ids});
-    if(r.ok) { toast(r.confirmados+' de '+r.total+' CONFIRMADOS pelo marketing', 8000); limparSelecao(); }
+    if(r.ok) { toast(r.confirmados+' de '+r.total+' CONFIRMADOS pelo marketing', 8000); renderTelaGerenciar(); _modoSelecao=false; _selecionados={}; }
     else if(r.falhas !== undefined) toast('FALHOU: '+r.falhas+' de '+r.total+' nao aceitos. Motivo: '+(r.erro_detalhe||'desconhecido'), 15000);
     else toast('Erro: '+(r.erro||''), 8000);
-  }
-  function toggleRecolher(cid) {
-    _recolhidos[cid] = !_recolhidos[cid];
-    desenharMeusConcursos();
   }
   async function pesquisarNovidadesConcurso(cid, nome) {
     toast('Pesquisando novidades de "'+nome+'"... ~1 min em segundo plano', 7000);
@@ -5734,6 +5892,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
       const r = await fetch(PIPELINE_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       if(r.ok) {
         await POST('/api/oportunidades/'+itemId+'/marcar_selecionado');
+        if(item && item.concurso_id) POST('/api/concursos/'+item.concurso_id+'/marcar-pipeline', {});
         btn.className='mini feito'; btn.innerHTML='&#10003; No pipeline'; toast('Enviado ao pipeline');
       } else { btn.textContent='Erro'; setTimeout(()=>{btn.className='mini gerar';btn.innerHTML='&#9998; Gerar conteudo';btn.disabled=false},3000); }
     } catch(e) { btn.textContent='Erro'; toast('Erro: '+e.message); setTimeout(()=>{btn.className='mini gerar';btn.innerHTML='&#9998; Gerar conteudo';btn.disabled=false},3000); }
