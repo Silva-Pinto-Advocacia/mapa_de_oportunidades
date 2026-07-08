@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v7.4.1-raiox-noticias"
+APP_VERSION = "v8.0.0-onda1-omnibox"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -4713,6 +4713,14 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .chip-f { font-size: 11.5px; font-weight: 700; padding: 7px 14px; border-radius: 20px; border: 1.5px solid var(--line); background: #fff; color: var(--cinza); cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.12s; }
   .chip-f:hover { border-color: var(--gold); }
   .chip-f.active { background: var(--preto); color: #fff; border-color: var(--preto); }
+  /* ===== v8 (Onda 1): omnibox + feed foco/mercado + score ===== */
+  .chip-sep { width:1px; height:20px; background:var(--line); margin:0 4px; align-self:center; }
+  .chips-flags { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+  .chips-flags .chip-f { font-size:10.5px; padding:6px 12px; }
+  #busca-resultado { margin-bottom:28px; }
+  .res-topo { display:flex; justify-content:flex-end; margin-bottom:12px; }
+  .grupo.g-hot { border-left:3px solid var(--urgente); }
+  .grupo.g-warm { border-left:3px solid var(--importante); }
   .nov-item { display: flex; gap: 14px; padding: 14px 0; border-bottom: 1px solid #ece8de; }
   .nov-tag { font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; padding-top: 3px; min-width: 80px; }
   .nov-corpo { flex: 1; }
@@ -4820,14 +4828,14 @@ HTML_INDEX = r"""<!DOCTYPE html>
   <div class="search-wrap">
     <div class="search-box">
       <span class="icon">&#128269;</span>
-      <input type="text" placeholder="Coletar noticias de um concurso especifico &#8212; ex: PC-SP 2026" onkeydown="if(event.key==='Enter'){document.querySelector('.mainnav button').click();setTimeout(()=>{var i=document.getElementById('pesq-input');if(i){i.value=this.value;pesquisar();}},120);this.value='';}">
+      <input type="text" id="omnibox" placeholder="Concurso, pergunta livre, ou Enter vazio p/ o giro geral &#8212; ex: PMERJ 2026" onkeydown="if(event.key==='Enter'){rotearBusca(this.value);this.value='';this.blur();}">
       <span class="hint">enter busca</span>
     </div>
   </div>
 </header>
 
 <nav class="mainnav">
-  <button class="active" onclick="showTela('pesquisa', this)">Pesquisa &amp; Novidades</button>
+  <button class="active" onclick="showTela('pesquisa', this)">Not&iacute;cias</button>
   <button onclick="showTela('inbox', this)">Caixa de entrada <span class="nav-badge">0</span></button>
   <button onclick="showTela('gerenciar', this)">Meus concursos</button>
 </nav>
@@ -4868,7 +4876,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 
 <script>
-  // ===== v7: API-CONNECTED JS =====
+  // ===== v8 (Onda 1): OMNIBOX + FEED FOCO/MERCADO + SCORE DE URGENCIA =====
   // Constantes de integracao com sistema de marketing
   const PIPELINE_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/pipeline/criar-externo';
   // TODO: preencher quando tiver a rota do endpoint de concursos do marketing
@@ -4912,79 +4920,102 @@ HTML_INDEX = r"""<!DOCTYPE html>
     else if(qual==='gerenciar') renderTelaGerenciar();
   }
 
-  // ===== TELA PRINCIPAL: PESQUISA & NOVIDADES =====
+  // ===== TELA PRINCIPAL: NOTICIAS (v8 - Onda 1) =====
   let _ultimoRelatorio = null;
-  let _modoAtivo = 'raiox';
   async function renderTelaPesquisa() {
     const cont = document.getElementById('telas-container');
+    const flagChips = Object.keys(FLAG_LABEL).map(f =>
+      '<button class="chip-f" data-g="flag" data-f="'+f+'" onclick="setFlag(\''+f+'\',this)">'+FLAG_LABEL[f]+'</button>'
+    ).join('');
     cont.innerHTML =
       '<div class="tela active">' +
-      '<div class="pesq-box">' +
-        '<div class="modo-tabs">' +
-          '<button id="tab-raiox" class="modo-tab active" onclick="trocarModo(\'raiox\')">Raio-X de um concurso</button>' +
-          '<button id="tab-todos" class="modo-tab" onclick="trocarModo(\'todos\')">Pesquisar todos</button>' +
-          '<button id="tab-ampla" class="modo-tab" onclick="trocarModo(\'ampla\')">Pesquisa ampla</button>' +
-        '</div>' +
-        '<div id="modo-raiox">' +
-          '<div class="pesq-sub">Digite um concurso e receba a linha do tempo &mdash; o que ja aconteceu, em que fase esta agora, e o que vem a seguir.</div>' +
-          '<div class="pesq-input-row">' +
-            '<input type="text" id="pesq-input" class="pesq-input" placeholder="Ex: PC-RS, PPMG, PMERJ 2026..." onkeydown="if(event.key===\'Enter\')pesquisar()">' +
-            '<button class="pesq-btn" onclick="pesquisar()">Pesquisar</button>' +
-          '</div>' +
-        '</div>' +
-        '<div id="modo-todos" style="display:none">' +
-          '<div class="pesq-sub">Varredura ampla dos concursos do Brasil, agrupados por estagio: abertos, no gatilho e radar. Nao precisa digitar nada &mdash; e o panorama do momento.</div>' +
-          '<div class="pesq-input-row">' +
-            '<select id="giro-vagas" class="pesq-select"><option value="0">Qualquer numero de vagas</option><option value="100">+100 vagas</option><option value="200">+200 vagas</option><option value="500">+500 vagas</option><option value="1000">+1000 vagas</option></select>' +
-            '<input type="text" id="giro-uf" class="pesq-input" style="max-width:200px" placeholder="UF (opcional) ex: RJ">' +
-            '<button class="pesq-btn" onclick="rodarGiro()">Pesquisar todos</button>' +
-          '</div>' +
-        '</div>' +
-        '<div id="modo-ampla" style="display:none">' +
-          '<div class="pesq-sub">Faca uma pergunta livre. Ex: "todas as policias militares com edital aberto", "concursos com prova objetiva nos ultimos 90 dias", "concursos de tribunais no Sudeste".</div>' +
-          '<div class="pesq-input-row">' +
-            '<input type="text" id="ampla-input" class="pesq-input" placeholder="Digite sua pergunta..." onkeydown="if(event.key===\'Enter\')rodarAmpla()">' +
-            '<button class="pesq-btn" onclick="rodarAmpla()">Perguntar</button>' +
-          '</div>' +
-        '</div>' +
-        '<div id="pesq-resultado"></div>' +
-      '</div>' +
+      '<div id="busca-resultado" class="pesq-box" style="display:none"></div>' +
       '<div class="nov-header">' +
-        '<h2 class="serif" style="font-size:22px;color:var(--preto)">Novidades coletadas</h2>' +
+        '<h2 class="serif" style="font-size:22px;color:var(--preto)">Not&iacute;cias</h2>' +
         '<div class="nov-filtros">' +
-          '<button class="chip-f active" data-f="tudo" onclick="filtrarNov(\'tudo\',this)">Tudo</button>' +
-          '<button class="chip-f" data-f="trabalho" onclick="filtrarNov(\'trabalho\',this)">Concursos que trabalho</button>' +
-          '<button class="chip-f" data-f="novos" onclick="filtrarNov(\'novos\',this)">Concursos novos</button>' +
+          '<button class="chip-f'+(_feedModo==='foco'?' active':'')+'" data-g="modo" data-f="foco" onclick="setModo(\'foco\',this)">Foco</button>' +
+          '<button class="chip-f'+(_feedModo==='mercado'?' active':'')+'" data-g="modo" data-f="mercado" onclick="setModo(\'mercado\',this)">Mercado</button>' +
+          '<span class="chip-sep"></span>' +
           '<button class="add-btn" style="padding:7px 14px;font-size:11px" onclick="coletarTudo()">&#8635; Coletar agora</button>' +
         '</div>' +
       '</div>' +
+      '<div class="chips-flags">' + flagChips + '</div>' +
       '<div id="nov-lista" style="margin-top:16px"><div style="color:var(--cinza);padding:30px;text-align:center">Carregando novidades...</div></div>' +
       '</div>';
-    carregarNovidades('tudo');
+    if(_feedFlag) { const b=document.querySelector('.chip-f[data-g="flag"][data-f="'+_feedFlag+'"]'); if(b) b.classList.add('active'); }
+    carregarNovidades();
   }
 
-  function trocarModo(modo) {
-    _modoAtivo = modo;
-    ['raiox','todos','ampla'].forEach(m=>{
-      document.getElementById('tab-'+m).classList.toggle('active', modo===m);
-      document.getElementById('modo-'+m).style.display = modo===m ? '' : 'none';
-    });
-    document.getElementById('pesq-resultado').innerHTML = '';
+  // ---- container unico de resultado de busca ----
+  function boxResultado() {
+    const box = document.getElementById('busca-resultado');
+    if(box) {
+      box.style.display = '';
+      try { box.scrollIntoView({behavior:'smooth', block:'start'}); } catch(e) {}
+    }
+    return box;
+  }
+  function fecharResultado() {
+    const box = document.getElementById('busca-resultado');
+    if(box) { box.style.display = 'none'; box.innerHTML = ''; }
+  }
+  function barVoltar() {
+    return '<div class="res-topo"><button class="mini" onclick="fecharResultado()">&larr; Fechar e voltar ao feed</button></div>';
   }
 
-  // --- MODO 3: PESQUISA AMPLA (pergunta livre) ---
-  async function rodarAmpla() {
-    const pergunta = (document.getElementById('ampla-input').value||'').trim();
+  // ===== v8: OMNIBOX - roteador de intencao =====
+  function navBtn(i) { return document.querySelectorAll('.mainnav button')[i]; }
+  function normTxt(s) {
+    return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+      .replace(/[^a-zA-Z0-9\s]/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
+  }
+  function matchConcurso(q) {
+    const nq = normTxt(q);
+    if(nq.length < 3) return null;
+    let best = null, bestLen = 0;
+    for(const c of (window._concursosCache||[])) {
+      const cands = [c.nome].concat(String(c.palavras_chave||'').split(','));
+      for(const cand of cands) {
+        const nc = normTxt(cand);
+        if(nc.length < 3) continue;
+        if(nc === nq || nc.indexOf(nq) >= 0 || nq.indexOf(nc) >= 0) {
+          if(nc.length > bestLen) { best = c; bestLen = nc.length; }
+        }
+      }
+    }
+    return best;
+  }
+  const RX_PERGUNTA = /^(quais|qual|como|quando|onde|quem|por que|porque|o que|quanto|quantos|quantas|existe|existem|tem |ha |liste |lista |me mostre|mostre)/;
+  async function rotearBusca(q) {
+    q = (q||'').trim();
+    if(!window._concursosCache || !window._concursosCache.length) {
+      const d = await GET('/api/concursos');
+      window._concursosCache = (d.concursos||[]);
+    }
+    if(!q) { irParaNoticias(); rodarGiro(); return; }
+    const alvo = matchConcurso(q);
+    if(alvo) { toast('Abrindo ficha: '+alvo.nome); abrirFicha(alvo.id); return; }
+    const ehPergunta = q.indexOf('?') >= 0 || RX_PERGUNTA.test(q.toLowerCase()) || q.split(/\s+/).length > 6;
+    irParaNoticias();
+    if(ehPergunta) rodarAmpla(q); else pesquisar(q);
+  }
+  function irParaNoticias() {
+    if(telAtual !== 'pesquisa' || !document.getElementById('busca-resultado')) showTela('pesquisa', navBtn(0));
+  }
+
+  // --- PESQUISA AMPLA (pergunta livre) ---
+  async function rodarAmpla(pergunta) {
+    pergunta = (pergunta||'').trim();
     if(pergunta.length < 5) { toast('Digite uma pergunta'); return; }
-    const box = document.getElementById('pesq-resultado');
-    box.innerHTML = '<div class="pesq-loading">Pesquisando: "'+esc(pergunta)+'"... ~40 segundos</div>';
+    const box = boxResultado();
+    box.innerHTML = barVoltar() + '<div class="pesq-loading">Pesquisando: "'+esc(pergunta)+'"... ~40 segundos</div>';
     const r = await POST('/api/busca-ampla', {pergunta:pergunta});
-    if(!r.ok || !r.resultado) { box.innerHTML = '<div class="pesq-erro">Nao consegui pesquisar agora.</div>'; return; }
+    if(!r.ok || !r.resultado) { box.innerHTML = barVoltar() + '<div class="pesq-erro">Nao consegui pesquisar agora.</div>'; return; }
     renderAmpla(r.resultado);
   }
   function renderAmpla(res) {
-    const box = document.getElementById('pesq-resultado');
-    if(res.encontrou_dados === false) { box.innerHTML = '<div class="pesq-erro">Nao encontrei resultados para essa pergunta.</div>'; return; }
+    const box = boxResultado();
+    if(res.encontrou_dados === false) { box.innerHTML = barVoltar() + '<div class="pesq-erro">Nao encontrei resultados para essa pergunta.</div>'; return; }
     const items = (res.resultados||[]).filter(c=>c&&c.nome);
     let cards = '';
     for(const c of items) {
@@ -4995,35 +5026,35 @@ HTML_INDEX = r"""<!DOCTYPE html>
         (c.situacao?'<div class="giro-obs">'+esc(c.situacao)+'</div>':'') +
         '<div class="giro-acts">' +
           (c.fonte?'<a class="mini fonte" href="'+esc(c.fonte)+'" target="_blank" rel="noopener">Abrir fonte</a>':'') +
-          '<button class="mini" onclick="salvarDoRelatorio(\''+esc(c.nome).replace(/\x27/g,"\\\x27")+'\',\''+esc(c.banca||'').replace(/\x27/g,"\\\x27")+'\')">Trabalhar este</button>' +
+          '<button class="mini" onclick="salvarDoRelatorio(\''+esc(c.nome).replace(/\x27/g,"\\\x27")+'\',\''+esc(c.banca||'').replace(/\x27/g,"\\\x27")+'\')">+ Acompanhar</button>' +
         '</div></div>';
     }
-    box.innerHTML = '<div class="giro-wrap">' +
+    box.innerHTML = barVoltar() + '<div class="giro-wrap">' +
       (res.resumo?'<div class="rel-angulo" style="margin-bottom:16px">'+esc(res.resumo)+'</div>':'') +
       cards + '</div>';
   }
 
-  // --- MODO 1: RAIO-X (linha do tempo) ---
-  async function pesquisar() {
-    const termo = (document.getElementById('pesq-input').value||'').trim();
+  // --- RAIO-X (linha do tempo) ---
+  async function pesquisar(termo) {
+    termo = (termo||'').trim();
     if(termo.length < 3) { toast('Digite o nome do concurso'); return; }
-    const box = document.getElementById('pesq-resultado');
-    box.innerHTML = '<div class="pesq-loading">Levantando o andamento de "'+esc(termo)+'" na web... ~30 segundos</div>';
+    const box = boxResultado();
+    box.innerHTML = barVoltar() + '<div class="pesq-loading">Levantando o andamento de "'+esc(termo)+'" na web... ~30 segundos</div>';
     const r = await POST('/api/pesquisar', {termo:termo, profundidade:'enxuto'});
-    if(!r.ok || !r.relatorio) { box.innerHTML = '<div class="pesq-erro">Nao consegui pesquisar agora. Tente de novo.</div>'; return; }
+    if(!r.ok || !r.relatorio) { box.innerHTML = barVoltar() + '<div class="pesq-erro">Nao consegui pesquisar agora. Tente de novo.</div>'; return; }
     _ultimoRelatorio = r.relatorio;
     renderRelatorio(r.relatorio, termo, false);
   }
   async function aprofundar(termo) {
-    const box = document.getElementById('pesq-resultado');
-    box.innerHTML = '<div class="pesq-loading">Aprofundando "'+esc(termo)+'"...</div>';
+    const box = boxResultado();
+    box.innerHTML = barVoltar() + '<div class="pesq-loading">Aprofundando "'+esc(termo)+'"...</div>';
     const r = await POST('/api/pesquisar', {termo:termo, profundidade:'detalhado'});
     if(r.ok && r.relatorio) { _ultimoRelatorio = r.relatorio; renderRelatorio(r.relatorio, termo, true); }
   }
   function renderRelatorio(rel, termo, detalhado) {
-    const box = document.getElementById('pesq-resultado');
+    const box = boxResultado();
     if(rel.encontrou_dados === false) {
-      box.innerHTML = '<div class="pesq-erro">Nao encontrei dados recentes confiaveis sobre "'+esc(termo)+'". Tente um nome mais especifico (inclua o ano).</div>';
+      box.innerHTML = barVoltar() + '<div class="pesq-erro">Nao encontrei dados recentes confiaveis sobre "'+esc(termo)+'". Tente um nome mais especifico (inclua o ano).</div>';
       return;
     }
     const esq = (s)=>esc(termo).replace(/'/g,"\\'");
@@ -5045,7 +5076,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     const fontes = (rel.fontes||[]).filter(f=>f);
     const fontesHtml = fontes.length ? '<div class="rel-fontes">Fontes: '+fontes.map((f,i)=>'<a href="'+esc(f)+'" target="_blank" rel="noopener">['+(i+1)+']</a>').join(' ')+'</div>' : '';
 
-    box.innerHTML =
+    box.innerHTML = barVoltar() +
       '<div class="rel-card">' +
         '<div class="rel-head"><h3 class="serif">'+esc(rel.concurso||termo)+'</h3>' +
           (rel.banca?'<span class="rel-banca">Banca '+esc(rel.banca)+'</span>':'')+'</div>' +
@@ -5054,20 +5085,16 @@ HTML_INDEX = r"""<!DOCTYPE html>
           relLinha('Vagas', rel.vagas) +
           relLinha('Salario', rel.salario) +
         '</div>' +
-        // FASE ATUAL em destaque
         (rel.fase_atual?'<div class="fase-atual"><div class="fase-label">Fase atual</div>'+esc(rel.fase_atual)+'</div>':'') +
-        // LINHA DO TEMPO
         (tlHtml?'<div class="rel-secao"><div class="rel-label">Linha do tempo</div><div class="timeline">'+tlHtml+'</div></div>':'') +
-        // PROXIMAS ETAPAS
         '<div class="rel-secao"><div class="rel-label">Proximas etapas</div><ul class="rel-pontos prox">'+proxHtml+'</ul></div>' +
         pqHtml +
-        // LEITURA ESTRATEGICA
         (rel.leitura_estrategica?'<div class="rel-secao"><div class="rel-label">Leitura estrategica</div><div class="rel-angulo">'+esc(rel.leitura_estrategica)+'</div></div>':'') +
         fontesHtml +
         '<div class="rel-acts">' +
           '<button class="mini" onclick="pesquisarNovidadesConcurso(0,\''+esq()+'\')">Pesquisar novidades</button>' +
           '<button class="mini gerar" onclick="gerarDeRelatorio(\''+esc(rel.concurso||termo).replace(/'/g,"\\'")+'\')">&#9998; Gerar conteudo</button>' +
-          '<button class="mini" onclick="salvarDoRelatorio(\''+esc(rel.concurso||termo).replace(/'/g,"\\'")+'\',\''+esc(rel.banca||'').replace(/'/g,"\\'")+'\')">Salvar nos meus concursos</button>' +
+          '<button class="mini" onclick="salvarDoRelatorio(\''+esc(rel.concurso||termo).replace(/'/g,"\\'")+'\',\''+esc(rel.banca||'').replace(/'/g,"\\'")+'\')">+ Acompanhar</button>' +
         '</div>' +
       '</div>';
   }
@@ -5076,21 +5103,18 @@ HTML_INDEX = r"""<!DOCTYPE html>
     return '<div class="rel-item"><div class="rel-k">'+label+'</div><div class="rel-v">'+esc(val)+'</div></div>';
   }
 
-  // --- MODO 2: GIRO DE NOVIDADES ---
+  // --- GIRO GERAL (Enter vazio no omnibox) ---
   async function rodarGiro() {
-    const vagas = document.getElementById('giro-vagas').value;
-    const uf = (document.getElementById('giro-uf').value||'').trim();
-    const box = document.getElementById('pesq-resultado');
-    const vagasTxt = (parseInt(vagas)>0) ? ('com +'+vagas+' vagas') : 'do momento';
-    box.innerHTML = '<div class="pesq-loading">Pesquisando os concursos '+vagasTxt+(uf?' em '+esc(uf):'')+'... isso leva ~40 segundos</div>';
-    const r = await POST('/api/giro', {min_vagas:parseInt(vagas), uf:uf});
-    if(!r.ok || !r.giro) { box.innerHTML = '<div class="pesq-erro">Nao consegui pesquisar agora.</div>'; return; }
+    const box = boxResultado();
+    box.innerHTML = barVoltar() + '<div class="pesq-loading">Rodando o giro geral dos concursos do Brasil... ~40 segundos</div>';
+    const r = await POST('/api/giro', {min_vagas:0, uf:''});
+    if(!r.ok || !r.giro) { box.innerHTML = barVoltar() + '<div class="pesq-erro">Nao consegui pesquisar agora.</div>'; return; }
     renderGiro(r.giro);
   }
   function renderGiro(giro) {
-    const box = document.getElementById('pesq-resultado');
+    const box = boxResultado();
     if(giro.encontrou_dados === false) {
-      box.innerHTML = '<div class="pesq-erro">Nao encontrei concursos com esse volume agora. Tente baixar o minimo de vagas.</div>';
+      box.innerHTML = barVoltar() + '<div class="pesq-erro">Nao encontrei concursos agora. Tente de novo em instantes.</div>';
       return;
     }
     const grupo = (titulo, cor, lista) => {
@@ -5106,12 +5130,12 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '<div class="giro-acts">' +
             (c.fonte?'<a class="mini" href="'+esc(c.fonte)+'" target="_blank" rel="noopener">Ver fonte</a>':'') +
             '<button class="mini gerar" onclick="gerarDeGiro(\''+esc(c.nome).replace(/'/g,"\\'")+'\',\''+esc(c.obs||'').replace(/'/g,"\\'")+'\')">&#9998; Gerar</button>' +
-            '<button class="mini" onclick="salvarDoRelatorio(\''+esc(c.nome).replace(/'/g,"\\'")+'\',\''+esc(c.banca||'').replace(/'/g,"\\'")+'\')">Salvar</button>' +
+            '<button class="mini" onclick="salvarDoRelatorio(\''+esc(c.nome).replace(/'/g,"\\'")+'\',\''+esc(c.banca||'').replace(/'/g,"\\'")+'\')">+ Acompanhar</button>' +
           '</div></div>';
       }
       return h + '</div>';
     };
-    box.innerHTML =
+    box.innerHTML = barVoltar() +
       '<div class="giro-wrap">' +
         '<div class="giro-data">Giro de ' + esc(giro.data||'hoje') + '</div>' +
         grupo('Editais abertos', 'var(--naourgente)', giro.abertos) +
@@ -5143,7 +5167,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
       if(cid && _ultimoRelatorio && (_ultimoRelatorio.concurso||'').toLowerCase().includes(nome.toLowerCase().substring(0,8))) {
         await POST('/api/concursos/'+cid+'/salvar-raiox', {relatorio:_ultimoRelatorio});
       }
-      toast(r.ja_existia ? 'Ja estava nos seus concursos' : 'Salvo nos seus concursos');
+      toast(r.ja_existia ? 'Ja estava nos seus concursos' : 'Agora voce acompanha este concurso');
     } else toast('Erro: '+(r.erro||''));
   }
 
@@ -5283,32 +5307,77 @@ HTML_INDEX = r"""<!DOCTYPE html>
     return String(s).substring(0,10);
   }
 
-  async function carregarNovidades(filtro) {
+  // ===== v8: FEED FOCO/MERCADO + SCORE DE URGENCIA =====
+  let _feedModo = 'foco';
+  let _feedFlag = '';
+  const FLAG_LABEL = { QUENTE:'Elimina&ccedil;&otilde;es', FASE:'Fases', RECURSO:'Recursos', VOLUME:'Editais', JURISPRUDENCIA:'Juris', VIRAL:'Viral', CONCORRENCIA:'Concorr&ecirc;ncia' };
+  const FLAG_TIER = { QUENTE:1, FASE:1, RECURSO:1, VOLUME:2, JURISPRUDENCIA:2, VIRAL:3, CONCORRENCIA:3 };
+  const PRIO_PESO = { urgente:3, importante:2, naourgente:1 };
+  const TIER_PESO = { 1:3, 2:2, 3:1 };
+
+  // score = prioridade do concurso x tier da categoria x recencia (decai em 30 dias)
+  function scoreItem(n) {
+    let prio = 1;
+    if(n.concurso_id && window._novMonitPrio && window._novMonitPrio[n.concurso_id]) {
+      prio = PRIO_PESO[window._novMonitPrio[n.concurso_id]] || 1;
+    }
+    const t = n.tier || FLAG_TIER[n.flag] || 3;
+    const tier = TIER_PESO[t] || 1;
+    let rec = 0.3;
+    if(n.data_coleta) {
+      const idade = (Date.now() - new Date(n.data_coleta).getTime()) / 86400000;
+      if(!isNaN(idade)) rec = Math.max(0.3, 1 - (idade/30));
+    }
+    return prio * tier * rec;
+  }
+
+  async function carregarNovidades(modo) {
+    if(modo) _feedModo = modo;
     const [cData, novData] = await Promise.all([
       GET('/api/concursos'),
-      GET('/api/oportunidades?incluir_lidos=1&dias=30&limite=120')
+      GET('/api/oportunidades?incluir_lidos=1&dias=30&limite=200')
     ]);
     const monitorados = (cData.concursos||[]);
+    window._concursosCache = monitorados;
     window._novMonitIds = new Set(monitorados.map(c=>c.id));
     window._novMonitNomes = {};
-    monitorados.forEach(c=>{ window._novMonitNomes[c.id] = c.nome; });
+    window._novMonitPrio = {};
+    monitorados.forEach(c=>{ window._novMonitNomes[c.id] = c.nome; window._novMonitPrio[c.id] = c.prioridade || 'importante'; });
     _novCache = (novData.itens||[]);
-    filtrarNov(filtro || 'tudo');
+    desenharFeed();
   }
-  function filtrarNov(filtro, btn) {
-    if(btn) { document.querySelectorAll('.chip-f').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); }
-    let itens = _novCache.slice();
-    if(filtro==='trabalho') itens = itens.filter(i=>i.concurso_id && window._novMonitIds.has(i.concurso_id));
-    else if(filtro==='novos') itens = itens.filter(i=>!i.concurso_id);
+
+  function setModo(m, btn) {
+    _feedModo = m;
+    document.querySelectorAll('.chip-f[data-g="modo"]').forEach(b=>b.classList.toggle('active', b===btn));
+    desenharFeed();
+  }
+  function setFlag(f, btn) {
+    _feedFlag = (_feedFlag === f) ? '' : f;
+    document.querySelectorAll('.chip-f[data-g="flag"]').forEach(b=>b.classList.toggle('active', b.dataset.f===_feedFlag));
+    desenharFeed();
+  }
+
+  function desenharFeed() {
     const lista = document.getElementById('nov-lista');
     if(!lista) return;
-    if(!itens.length) { lista.innerHTML = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhuma novidade nesse filtro.</div>'; return; }
+    let itens = _novCache.slice();
+    if(_feedModo === 'foco') itens = itens.filter(i=>i.concurso_id && window._novMonitIds.has(i.concurso_id));
+    if(_feedFlag) itens = itens.filter(i=>(i.flag||'') === _feedFlag);
+    if(!itens.length) {
+      const msg = (_feedModo === 'foco')
+        ? 'Nenhuma novidade dos seus concursos' + (_feedFlag ? ' nesse filtro' : '') + '. Veja o modo Mercado ou rode uma coleta.'
+        : 'Nenhuma novidade nesse filtro.';
+      lista.innerHTML = '<div style="color:var(--cinza);padding:30px;text-align:center">'+msg+'</div>';
+      return;
+    }
+    itens.forEach(n=>{ n._score = scoreItem(n); });
 
-    // Agrupa por concurso (item 8). Chave: concurso_id (monitorado) ou nome do concurso da noticia, ou 'Outras'
+    // Agrupa por concurso; grupos e itens ordenados por score de urgencia
     const grupos = {};
     const ordem = [];
     for(const n of itens) {
-      let chave, titulo, cid=null;
+      let chave, titulo, cid = null;
       if(n.concurso_id && window._novMonitNomes[n.concurso_id]) {
         chave = 'c'+n.concurso_id; titulo = window._novMonitNomes[n.concurso_id]; cid = n.concurso_id;
       } else if((n.concurso||'').trim()) {
@@ -5316,16 +5385,20 @@ HTML_INDEX = r"""<!DOCTYPE html>
       } else {
         chave = 'outras'; titulo = 'Outras novidades';
       }
-      if(!grupos[chave]) { grupos[chave] = {titulo, cid, itens:[]}; ordem.push(chave); }
+      if(!grupos[chave]) { grupos[chave] = {titulo, cid, itens:[], max:0}; ordem.push(chave); }
       grupos[chave].itens.push(n);
+      if(n._score > grupos[chave].max) grupos[chave].max = n._score;
     }
+    ordem.sort((a,b)=>grupos[b].max - grupos[a].max);
 
     let html = '';
     for(const chave of ordem) {
       const g = grupos[chave];
+      g.itens.sort((a,b)=>b._score - a._score);
+      const urg = g.max >= 6 ? ' g-hot' : (g.max >= 3 ? ' g-warm' : '');
       const clicavel = g.cid ? 'onclick="abrirFicha('+g.cid+')" style="cursor:pointer"' : '';
       const verFicha = g.cid ? '<span class="g-ver">Ver ficha &rsaquo;</span>' : '';
-      html += '<div class="grupo">' +
+      html += '<div class="grupo'+urg+'">' +
         '<div class="grupo-head" '+clicavel+'><span class="gnome">'+esc(g.titulo)+'</span>' +
         '<span class="gcount">'+g.itens.length+' novidade'+(g.itens.length>1?'s':'')+'</span>'+verFicha+'</div>';
       for(const n of g.itens) {
@@ -5342,7 +5415,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '</div>' +
           '<div class="nov-acts">' +
             (n.link?'<a class="mini fonte" href="'+esc(n.link)+'" target="_blank" rel="noopener">Abrir fonte</a>':'') +
-            (!g.cid ? '<button class="mini trabalhar" onclick="trabalharNoticia('+n.id+',this)">+ Trabalhar este</button>' : '') +
+            (!g.cid ? '<button class="mini trabalhar" onclick="trabalharNoticia('+n.id+',this)">+ Acompanhar</button>' : '') +
             '<button class="mini gerar" onclick="gerarConteudo('+n.id+',this)">&#9998; Gerar</button>' +
             '<button class="mini" onclick="excluirItem('+n.id+',this)">Excluir</button>' +
           '</div></div></div>';
@@ -5357,11 +5430,11 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(btn) { btn.disabled = true; btn.textContent = 'Adicionando...'; }
     const r = await POST('/api/oportunidades/'+itemId+'/trabalhar', {});
     if(r.ok) {
-      toast(r.ja_existia ? ('"'+r.nome+'" ja estava nos seus concursos') : ('Agora voce trabalha "'+r.nome+'" (enviado ao marketing tambem)'), 6000);
-      carregarNovidades('tudo');
+      toast(r.ja_existia ? ('"'+r.nome+'" ja estava nos seus concursos') : ('Agora voce acompanha "'+r.nome+'" (enviado ao marketing tambem)'), 6000);
+      carregarNovidades();
     } else {
       toast('Erro: '+(r.erro||''), 5000);
-      if(btn) { btn.disabled = false; btn.textContent = '+ Trabalhar este'; }
+      if(btn) { btn.disabled = false; btn.textContent = '+ Acompanhar'; }
     }
   }
 
@@ -5546,7 +5619,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '</div>' +
         corpo + '</div>';
     }
-    if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso ainda. Use "Pesquisar" ou "Trabalhar este" no feed de novidades.</div>';
+    if(!cards) cards = '<div style="color:var(--cinza);padding:30px;text-align:center">Nenhum concurso ainda. Use a busca no topo ou "+ Acompanhar" no feed de noticias.</div>';
 
     const nSel = Object.values(_selecionados).filter(Boolean).length;
     const barraEnvio = nSel > 0
