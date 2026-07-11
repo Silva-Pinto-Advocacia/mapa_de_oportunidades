@@ -24,7 +24,7 @@ from flask import Flask, request, jsonify, Response
 import anthropic
 
 # Config
-APP_VERSION = "v8.1.1-onda2-trilha"
+APP_VERSION = "v8.2.0-onda3-triagem"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -550,6 +550,30 @@ def _ensure_v8_columns():
                         log.warning("Falha ao adicionar %s.%s: %s", tabela, nome, e)
     except Exception as e:
         log.warning("_ensure_v8_columns erro: %s", e)
+
+
+def _ensure_v82_schema():
+    """v8.2 (Onda 3): tabela de registro dos auto-encaixes (reversiveis).
+
+    Cada vez que a triagem encaixa uma noticia num concurso SOZINHA
+    (confianca alta, ou media com candidato unico), fica um registro aqui.
+    O usuario pode desfazer pelo chip 'A confirmar' da tela Noticias.
+    """
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS auto_encaixes ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "oportunidade_id INTEGER, "
+                "concurso_id INTEGER, "
+                "concurso_nome TEXT, "
+                "titulo TEXT, "
+                "confianca TEXT, "
+                "data_encaixe TEXT, "
+                "desfeito INTEGER DEFAULT 0)"
+            )
+    except Exception as e:
+        log.warning("_ensure_v82_schema erro: %s", e)
 
 
 class TursoConnWrapper:
@@ -1981,9 +2005,10 @@ def _achar_concurso_similar(nome, concursos):
 def _triar_item_por_palavras(item, concursos_monitorados):
     """Tenta encaixar um item num concurso monitorado SO por palavras-chave (sem IA).
 
-    Retorna (concurso_id, confianca) onde confianca in ('alta','media',None).
+    Retorna (concurso_id, confianca) com confianca in ('alta','media','ambigua',None).
     - alta: palavra-chave especifica do concurso bateu como frase no texto
-    - media: os tokens identificadores do nome batem como PALAVRAS INTEIRAS
+    - media: os tokens do nome batem como PALAVRAS INTEIRAS num UNICO concurso
+    - ambigua (v8.2): 2+ concursos casaram por nome -> precisa confirmacao humana
     - None: nao encaixou
 
     Regras anti-falso-positivo (corrige bug PM RR casando com tudo):
@@ -2002,8 +2027,7 @@ def _triar_item_por_palavras(item, concursos_monitorados):
     alvo_tokens = set(alvo_norm.split())
     alvo_ufs = alvo_tokens & _UFS_BR
 
-    melhor_id = None
-    melhor_conf = None
+    matches_media = []
     for c in concursos_monitorados:
         nome_norm = _normalizar_nome_concurso(c.get("nome", ""))
         toks = _tokens_uteis(nome_norm)
@@ -2036,15 +2060,36 @@ def _triar_item_por_palavras(item, concursos_monitorados):
             # tenta tambem a versao compactada do nome ('pm rj' -> 'pmrj' no texto)
             compact = "".join(toks)
             if len(compact) >= 4 and compact in alvo_tokens:
-                melhor_id = c["id"]
-                melhor_conf = "media"
+                if c["id"] not in matches_media:
+                    matches_media.append(c["id"])
             continue
         # todos os tokens casaram - exige distintividade
         tem_distintivo = any(len(t) >= 5 for t in toks)
         if tem_distintivo or len(toks) >= 2:
-            melhor_id = c["id"]
-            melhor_conf = "media"
-    return (melhor_id, melhor_conf)
+            if c["id"] not in matches_media:
+                matches_media.append(c["id"])
+
+    # v8.2: 'media' so vale quando ha UM UNICO candidato.
+    # 2+ candidatos = ambiguo -> vai pra fila de confirmacao humana.
+    if not matches_media:
+        return (None, None)
+    if len(matches_media) == 1:
+        return (matches_media[0], "media")
+    return (matches_media[0], "ambigua")
+
+
+def _registrar_auto_encaixe(conn, item, concurso_id, concurso_nome, confianca, agora):
+    """v8.2: grava o registro reversivel de um auto-encaixe (pro Desfazer da UI)."""
+    try:
+        conn.execute(
+            "INSERT INTO auto_encaixes "
+            "(oportunidade_id, concurso_id, concurso_nome, titulo, confianca, data_encaixe, desfeito) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            (item["id"], concurso_id, concurso_nome or "",
+             (item.get("titulo") or "")[:300], confianca, agora)
+        )
+    except Exception as e:
+        log.warning("_registrar_auto_encaixe erro: %s", e)
 
 
 def triar_itens(item_ids=None):
@@ -2054,13 +2099,14 @@ def triar_itens(item_ids=None):
       - Se a categoria e transversal (jurisprudencia/concorrencia/sentimento):
           marca status='transversal' + tipo_transversal
       - Senao, tenta encaixar num concurso monitorado por palavras-chave:
-          * match alta confianca -> status='confirmado', concurso_id setado (auto-encaixe)
-          * match media confianca -> status='pendente' + sugestao_concurso (vai pra fila)
+          * match alta OU media-unica -> status='confirmado' + registro em auto_encaixes
+          * match ambiguo (2+ candidatos) ou variacao fuzzy -> fila com sugestao
           * sem match -> status='sem_concurso' + registra em sugestoes_concurso
 
-    NOTA: por decisao do usuario, encaixes vao pra fila de confirmacao (status pendente
-    com sugestao). Apenas matches de altissima confianca por palavra-chave exata sao
-    auto-confirmados. Retorna estatisticas.
+    NOTA (v8.2 - Onda 3): a coleta agora AUTO-ENCAIXA os casos confiaveis (kw exata
+    e nome inteiro casando num unico concurso, com guarda de UF + distintividade),
+    deixando registro reversivel em auto_encaixes (Desfazer no chip 'A confirmar').
+    So os casos AMBIGUOS continuam indo pra fila. Retorna estatisticas.
     """
     agora = datetime.now(timezone.utc).isoformat()
     stats = {"transversal": 0, "auto_confirmado": 0, "sugerido": 0, "sem_concurso": 0}
@@ -2106,14 +2152,19 @@ def triar_itens(item_ids=None):
 
             # 2. Tenta encaixar por palavras-chave
             cid, conf = _triar_item_por_palavras(item, concursos)
-            if cid and conf == "alta":
+            if cid and conf in ("alta", "media"):
+                # v8.2 (Onda 3): auto-encaixe com registro reversivel.
+                # alta = palavra-chave exata; media = nome inteiro casou num
+                # UNICO concurso (guarda de UF + distintividade ja aplicadas).
+                nome_conc = next((c["nome"] for c in concursos if c["id"] == cid), "")
                 conn.execute(
                     "UPDATE oportunidades SET status_triagem='confirmado', concurso_id=?, sugestao_concurso=NULL WHERE id=?",
                     (cid, iid)
                 )
+                _registrar_auto_encaixe(conn, item, cid, nome_conc, conf, agora)
                 stats["auto_confirmado"] += 1
-            elif cid and conf == "media":
-                # Vai pra fila de confirmacao com sugestao
+            elif cid and conf == "ambigua":
+                # 2+ concursos candidatos -> fila de confirmacao com sugestao
                 nome_sug = next((c["nome"] for c in concursos if c["id"] == cid), "")
                 conn.execute(
                     "UPDATE oportunidades SET status_triagem='pendente', sugestao_concurso=? WHERE id=?",
@@ -2356,6 +2407,15 @@ def executar_coleta(api_key, categorias_a_rodar, tipo_run="manual"):
         todos_itens_novos.sort(key=lambda x: -int(x.get("relevancia", 5) or 5))
         notificar_discord(todos_itens_novos)
 
+    # v8.2 (Onda 3): zeladoria automatica na coleta noturna (tier23) e na
+    # completa manual. Roda depois de tudo salvo/notificado; nunca derruba
+    # a coleta (o tier1, mais frequente, fica leve de proposito).
+    if tipo_run in ("tier23", "completo"):
+        try:
+            _zeladoria(origem=tipo_run)
+        except Exception as e:
+            log.warning("zeladoria pos-coleta falhou: %s", e)
+
     return {
         "tipo_run": tipo_run,
         "sucesso": sucesso,
@@ -2364,6 +2424,33 @@ def executar_coleta(api_key, categorias_a_rodar, tipo_run="manual"):
         "duracao_segundos": round(duracao, 1),
         "erros": erros,
     }
+
+
+def _zeladoria(origem="cron"):
+    """v8.2 (Onda 3): faxina automatica pos-coleta noturna.
+
+    1. Triagem dos pendentes (varre o que ficou sem encaixe)
+    2. Mescla de concursos duplicados
+    3. Dedupe retroativa de noticias
+
+    NUNCA propaga excecao: a coleta ja terminou e o resultado dela nao
+    pode ser perdido por causa de faxina.
+    """
+    resultado = {"origem": origem}
+    try:
+        resultado["triagem"] = triar_itens()
+    except Exception as e:
+        log.warning("zeladoria/triagem falhou: %s", e)
+    try:
+        resultado["duplicados"] = _limpar_duplicados_core()
+    except Exception as e:
+        log.warning("zeladoria/limpar-duplicados falhou: %s", e)
+    try:
+        resultado["dedupe"] = _dedupe_retroativa_core()
+    except Exception as e:
+        log.warning("zeladoria/dedupe falhou: %s", e)
+    log.info("v8.2 zeladoria (%s): %s", origem, resultado)
+    return resultado
 
 
 def categorias_por_tier(*tiers):
@@ -2996,9 +3083,8 @@ def api_concursos_mesclar():
         return jsonify({"erro": str(e)}), 500
 
 
-@app.route("/api/concursos/limpar-duplicados", methods=["POST"])
-def api_concursos_limpar_duplicados():
-    """v7.0.2: detecta e mescla automaticamente concursos duplicados.
+def _limpar_duplicados_core():
+    """v7.0.2: detecta e mescla automaticamente concursos duplicados (nucleo).
 
     Agrupa os concursos ativos por nome identico/similar. Em cada grupo,
     mantem o de menor id (o mais antigo, que prevalece) e mescla os demais
@@ -3066,12 +3152,21 @@ def api_concursos_limpar_duplicados():
 
         log.info("v7: limpar-duplicados -> %d grupos, %d duplicatas removidas, %d noticias movidas",
                  grupos_mesclados, duplicatas_removidas, noticias_movidas)
-        return jsonify({"ok": True, "grupos_mesclados": grupos_mesclados,
-                        "duplicatas_removidas": duplicatas_removidas,
-                        "noticias_movidas": noticias_movidas})
+        return {"grupos_mesclados": grupos_mesclados,
+                "duplicatas_removidas": duplicatas_removidas,
+                "noticias_movidas": noticias_movidas}
     except Exception as e:
-        log.error("api_concursos_limpar_duplicados erro: %s", e)
-        return jsonify({"erro": str(e)}), 500
+        log.error("_limpar_duplicados_core erro: %s", e)
+        return {"erro": str(e)}
+
+
+@app.route("/api/concursos/limpar-duplicados", methods=["POST"])
+def api_concursos_limpar_duplicados():
+    """v7.0.2: rota da Manutencao - delega pro nucleo reutilizavel."""
+    stats = _limpar_duplicados_core()
+    if "erro" in stats:
+        return jsonify(stats), 500
+    return jsonify({"ok": True, **stats})
 
 
 @app.route("/api/concursos/sincronizar-marketing", methods=["POST"])
@@ -3378,6 +3473,51 @@ def api_triagem_retroativa():
         return jsonify({"erro": str(e)}), 500
 
 
+@app.route("/api/auto-encaixes", methods=["GET"])
+def api_auto_encaixes():
+    """v8.2: lista os auto-encaixes recentes (nao desfeitos) pro painel 'A confirmar'."""
+    try:
+        dias = int(request.args.get("dias", 7) or 7)
+        limite = min(int(request.args.get("limit", 60) or 60), 200)
+        corte = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, oportunidade_id, concurso_id, concurso_nome, titulo, confianca, data_encaixe "
+                "FROM auto_encaixes WHERE desfeito = 0 AND data_encaixe >= ? "
+                "ORDER BY data_encaixe DESC LIMIT ?",
+                (corte, limite)
+            ).fetchall()
+            itens = [_dict_from_row(r) for r in rows]
+        return jsonify({"ok": True, "itens": itens, "total": len(itens)})
+    except Exception as e:
+        log.error("api_auto_encaixes erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/auto-encaixes/<int:ae_id>/desfazer", methods=["POST"])
+def api_auto_encaixe_desfazer(ae_id):
+    """v8.2: desfaz um auto-encaixe - a noticia volta pra fila com a sugestao anotada."""
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT id, oportunidade_id, concurso_nome FROM auto_encaixes "
+                "WHERE id = ? AND desfeito = 0",
+                (ae_id,)
+            ).fetchone()
+            if not row:
+                return jsonify({"erro": "auto-encaixe nao encontrado (ou ja desfeito)"}), 404
+            d = _dict_from_row(row)
+            conn.execute(
+                "UPDATE oportunidades SET status_triagem='pendente', concurso_id=NULL, sugestao_concurso=? WHERE id=?",
+                (d.get("concurso_nome") or "", d["oportunidade_id"])
+            )
+            conn.execute("UPDATE auto_encaixes SET desfeito = 1 WHERE id = ?", (ae_id,))
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.error("api_auto_encaixe_desfazer erro: %s", e)
+        return jsonify({"erro": str(e)}), 500
+
+
 @app.route("/api/concursos/importar-do-radar", methods=["POST"])
 def api_importar_do_radar():
     """Importa concursos automaticamente a partir dos itens JA COLETADOS no banco.
@@ -3575,9 +3715,8 @@ def api_limpar_exemplos():
     return jsonify({"ok": True, "removidos": c})
 
 
-@app.route("/api/dedupe", methods=["POST"])
-def api_dedupe():
-    """Roda dedupe retroativa no banco inteiro.
+def _dedupe_retroativa_core():
+    """Roda dedupe retroativa no banco inteiro (nucleo reutilizavel).
 
     Estrategia:
     1. Recalcula hash_unico de TODOS os registros com a logica atual de hash_for_dedup
@@ -3649,13 +3788,18 @@ def api_dedupe():
     log.info("=== DEDUPE concluido: %d -> %d (deletados %d, hashes atualizados %d) ===",
              total_antes, total_apos, len(ids_para_deletar), atualizados)
 
-    return jsonify({
-        "ok": True,
+    return {
         "total_antes": total_antes,
         "total_apos": total_apos,
         "duplicados_deletados": len(ids_para_deletar),
         "hashes_atualizados": atualizados,
-    })
+    }
+
+
+@app.route("/api/dedupe", methods=["POST"])
+def api_dedupe():
+    """Botao Manutencao: roda a dedupe retroativa e devolve as estatisticas."""
+    return jsonify({"ok": True, **_dedupe_retroativa_core()})
 
 
 @app.route("/api/status")
@@ -4513,6 +4657,7 @@ _ensure_selecionado_column()
 _ensure_triagem_columns()
 _ensure_v73_columns()
 _ensure_v8_columns()
+_ensure_v82_schema()
 
 
 # Logo PNG transparente embutido (gerado a partir da logo Silva Pinto)
@@ -4678,7 +4823,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .sk.tendencia { color: var(--preto); }
   .si-title { font-size: 12.5px; font-weight: 600; color: var(--grafite); margin: 3px 0 7px; }
 
-  /* ===== Caixa de entrada (triagem) ===== */
+  /* ===== Triagem inline (A confirmar) ===== */
   .inbox-grupo { margin-bottom: 28px; }
   .inbox-grupo > h3 { font-family: 'Cormorant Garamond'; font-size: 18px; color: var(--navy); margin-bottom: 4px; display: flex; align-items: center; gap: 9px; }
   .inbox-grupo > .gsub { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
@@ -4782,6 +4927,8 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .chip-f { font-size: 11.5px; font-weight: 700; padding: 7px 14px; border-radius: 20px; border: 1.5px solid var(--line); background: #fff; color: var(--cinza); cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.12s; }
   .chip-f:hover { border-color: var(--gold); }
   .chip-f.active { background: var(--preto); color: #fff; border-color: var(--preto); }
+  .chip-triagem { border-color: var(--gold); color: var(--gold-dark); }
+  .chip-triagem.active { background: var(--gold-dark); border-color: var(--gold-dark); color: #fff; }
   /* ===== v8 (Onda 1): omnibox + feed foco/mercado + score ===== */
   .chip-sep { width:1px; height:20px; background:var(--line); margin:0 4px; align-self:center; }
   .chips-flags { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
@@ -4926,7 +5073,6 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
 <nav class="mainnav">
   <button class="active" onclick="showTela('pesquisa', this)">Not&iacute;cias</button>
-  <button onclick="showTela('inbox', this)">Caixa de entrada <span class="nav-badge">0</span></button>
   <button onclick="showTela('gerenciar', this)">Meus concursos</button>
 </nav>
 
@@ -4936,7 +5082,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 <div class="modal-bg" id="modal-add">
   <div class="modal">
     <h3 class="serif">Monitorar novo concurso</h3>
-    <div class="msub">A coleta vai encaixar noticias neste concurso automaticamente (voce confirma na caixa de entrada).</div>
+    <div class="msub">A coleta vai encaixar noticias neste concurso automaticamente (casos ambiguos aparecem no chip A confirmar, na tela Noticias).</div>
     <label>Nome do concurso</label>
     <input type="text" placeholder="ex: PMERJ 2026 - Soldado" id="add-nome">
     <label>Banca</label>
@@ -5006,12 +5152,12 @@ HTML_INDEX = r"""<!DOCTYPE html>
     document.querySelectorAll('.mainnav button').forEach(b=>b.classList.remove('active'));
     if(btn) btn.classList.add('active');
     if(qual==='pesquisa') renderTelaPesquisa();
-    else if(qual==='inbox') renderTelaInbox();
     else if(qual==='gerenciar') renderTelaGerenciar();
   }
 
-  // ===== TELA PRINCIPAL: NOTICIAS (v8 - Onda 1) =====
+  // ===== TELA PRINCIPAL: NOTICIAS (v8 - Onda 1 / Onda 3) =====
   let _ultimoRelatorio = null;
+  let _modoTriagem = false;
   async function renderTelaPesquisa() {
     const cont = document.getElementById('telas-container');
     const flagChips = Object.keys(FLAG_LABEL).map(f =>
@@ -5026,6 +5172,8 @@ HTML_INDEX = r"""<!DOCTYPE html>
           '<button class="chip-f'+(_feedModo==='foco'?' active':'')+'" data-g="modo" data-f="foco" onclick="setModo(\'foco\',this)">Foco</button>' +
           '<button class="chip-f'+(_feedModo==='mercado'?' active':'')+'" data-g="modo" data-f="mercado" onclick="setModo(\'mercado\',this)">Mercado</button>' +
           '<span class="chip-sep"></span>' +
+          '<button class="chip-f chip-triagem'+(_modoTriagem?' active':'')+'" id="chip-triagem" onclick="toggleTriagem(this)">A confirmar (<span id="chip-triagem-n">&#8230;</span>)</button>' +
+          '<span class="chip-sep"></span>' +
           '<button class="add-btn" style="padding:7px 14px;font-size:11px" onclick="coletarTudo()">&#8635; Coletar agora</button>' +
         '</div>' +
       '</div>' +
@@ -5033,7 +5181,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
       '<div id="nov-lista" style="margin-top:16px"><div style="color:var(--cinza);padding:30px;text-align:center">Carregando novidades...</div></div>' +
       '</div>';
     if(_feedFlag) { const b=document.querySelector('.chip-f[data-g="flag"][data-f="'+_feedFlag+'"]'); if(b) b.classList.add('active'); }
-    carregarNovidades();
+    atualizarChipTriagem();
+    if(_modoTriagem) renderTriagemInline();
+    else carregarNovidades();
   }
 
   // ---- container unico de resultado de busca ----
@@ -5625,13 +5775,30 @@ HTML_INDEX = r"""<!DOCTYPE html>
       temasHtml+'</aside></div></div>';
   }
 
-  // ===== TELA 2: CAIXA DE ENTRADA =====
-  async function renderTelaInbox() {
-    const cont = document.getElementById('telas-container');
-    cont.innerHTML = '<div class="tela active" style="text-align:center;padding:60px;color:var(--cinza)">Carregando...</div>';
+  // ===== TRIAGEM INLINE: chip "A confirmar" (v8.2 - Onda 3) =====
+  async function atualizarChipTriagem() {
+    try {
+      const data = await GET('/api/inbox');
+      const n = ((data.encaixes||[]).length + (data.novos||[]).length);
+      const el = document.getElementById('chip-triagem-n');
+      if(el) el.textContent = n;
+    } catch(e) {}
+  }
+  function toggleTriagem(btn) {
+    _modoTriagem = !_modoTriagem;
+    if(btn) btn.classList.toggle('active', _modoTriagem);
+    if(_modoTriagem) renderTriagemInline();
+    else carregarNovidades();
+  }
+  async function renderTriagemInline() {
+    const cont = document.getElementById('nov-lista');
+    if(!cont) return;
+    cont.innerHTML = '<div style="color:var(--cinza);padding:30px;text-align:center">Carregando triagem...</div>';
     const data = await GET('/api/inbox');
+    const auto = await GET('/api/auto-encaixes');
     const encaixes = data.encaixes || [];
     const novos = data.novos || [];
+    const autos = (auto && auto.itens) || [];
 
     let encHtml = '';
     for(const e of encaixes) {
@@ -5660,17 +5827,33 @@ HTML_INDEX = r"""<!DOCTYPE html>
     }
     if(!novHtml) novHtml = '<div style="color:var(--cinza);font-size:13px">Nenhuma sugestao de concurso novo.</div>';
 
-    // Atualiza badge de contagem na nav
-    const badge = document.querySelector('.mainnav .nav-badge');
-    if(badge) badge.textContent = (encaixes.length + novos.length);
+    let autoHtml = '';
+    for(const a of autos) {
+      autoHtml += '<div class="triagem-card" data-id="ae-'+a.id+'">' +
+        '<div class="tc-main">' +
+        '<div class="nov-conc">'+esc(a.concurso_nome||'')+'</div>' +
+        '<div class="tc-tit">'+esc(a.titulo||'')+'</div>' +
+        '<div class="tc-sug">Auto-encaixado por '+(a.confianca==='alta'?'palavra-chave':'nome do concurso')+'</div></div>' +
+        '<div class="tc-acts"><button class="btn-outro" onclick="desfazerAutoEnc('+a.id+')">Desfazer</button></div></div>';
+    }
+    if(!autoHtml) autoHtml = '<div style="color:var(--cinza);font-size:13px">Nenhum auto-encaixe nos ultimos 7 dias.</div>';
 
-    cont.innerHTML = '<div class="tela active">' +
+    const chip = document.getElementById('chip-triagem-n');
+    if(chip) chip.textContent = (encaixes.length + novos.length);
+
+    cont.innerHTML =
       '<div class="inbox-grupo"><h3 class="serif">Encaixes a confirmar <span class="nav-badge">'+encaixes.length+'</span></h3>' +
-      '<div class="gsub">Noticias que parecem ser de concursos monitorados. Confirme para entrarem na ficha.</div>'+encHtml+'</div>' +
+      '<div class="gsub">Casos ambiguos: a coleta nao teve certeza sozinha. Confirme para entrarem na ficha.</div>'+encHtml+'</div>' +
       '<div class="inbox-grupo"><h3 class="serif">Concursos novos sugeridos <span class="nav-badge cinza">'+novos.length+'</span></h3>' +
       '<div class="gsub">Concursos que apareceram varias vezes. Vale acompanhar?</div>'+novHtml+'</div>' +
-      '<div style="margin-top:20px"><button class="add-btn" onclick="rodarTriagemRetroativa()">Rodar triagem retroativa (acervo antigo)</button></div>' +
-      '</div>';
+      '<div class="inbox-grupo"><h3 class="serif">Auto-encaixes recentes <span class="nav-badge cinza">'+autos.length+'</span></h3>' +
+      '<div class="gsub">Encaixados sozinhos pela coleta nos ultimos 7 dias. Errou? Desfazer devolve pra fila.</div>'+autoHtml+'</div>' +
+      '<div style="margin-top:20px"><button class="add-btn" onclick="rodarTriagemRetroativa()">Rodar triagem retroativa (acervo antigo)</button></div>';
+  }
+  async function desfazerAutoEnc(aeId) {
+    const r = await POST('/api/auto-encaixes/'+aeId+'/desfazer');
+    if(r.ok) { toast('Desfeito - a noticia voltou pra fila'); renderTriagemInline(); }
+    else toast('Erro: '+(r.erro||''));
   }
 
   // ===== TELA 3: GERENCIAR CONCURSOS =====
@@ -5953,7 +6136,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     const r = await POST('/api/triagem/retroativa');
     if(r.stats) toast('Triagem: '+r.stats.auto_confirmado+' encaixados, '+r.stats.transversal+' transversais, '+r.stats.sugerido+' sugeridos',8000);
     else toast('Concluido');
-    renderTelaInbox();
+    renderTriagemInline();
   }
 
   async function excluirConcurso(cid, nome) {
@@ -6084,9 +6267,6 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   // ===== INIT =====
   async function init() {
-    const inbox = await GET('/api/inbox');
-    const badge = document.querySelector('.mainnav .nav-badge');
-    if(badge && inbox) badge.textContent = (inbox.total||0);
     renderTelaPesquisa();
   }
   init();
