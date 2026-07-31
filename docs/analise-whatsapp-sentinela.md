@@ -283,6 +283,135 @@ faria por último, com o modo manual já rodando em produção e provado.
 
 ---
 
+## 4-C. O plano de virada: Bia só para contatos novos
+
+O desenho combinado é por **coorte**, não por lista:
+
+1. O número oficial do escritório vai para a API oficial; a allowlist sai.
+2. A Bia atende **só quem chamar a partir da data de virada**.
+3. Se o contato for de cliente antigo, a Bia não entra.
+4. Se entrar mesmo assim, o contato vai para o Jurídico e a Bia desliga ali.
+5. A Bia para assim que um atendente humano interagir.
+
+Isto é melhor que abrir a allowlist: troca uma lista que alguém mantém à mão
+por uma regra que o sistema aplica sozinho. Abaixo, o que o código sustenta e
+o que não sustenta.
+
+### Regra 2 (cliente antigo não recebe Bia) — já existe, pronta
+
+`_cliente_cruzado(numero)` cruza o telefone com a tabela `cliente` e traz
+contratos, processos e último andamento. É exatamente o teste necessário, já
+escrito e com cache de 60 s.
+
+**Limite conhecido:** casa pelos **últimos 8 dígitos** do telefone cadastrado.
+Cliente antigo que escrever de outro aparelho — número novo, celular do cônjuge
+— passa como contato novo. Não há como fechar isso, e é justamente por isso que
+a regra 4 existe como rede.
+
+### Regra 4 (Jurídico desliga a Bia) — fácil, e é recuperação, não prevenção
+
+`sp_setor` e a rota `/setor` já existem. Basta a elegibilidade do laço excluir
+`setor='Jurídico'`.
+
+Vale nomear o que ela é: quando alguém percebe que a Bia falou com um cliente
+antigo, **ela já falou pelo menos uma vez**. A regra 4 conserta; quem previne é
+a regra 3. Com o limite dos 8 dígitos acima, contar quantas vezes a regra 4 for
+acionada é o melhor termômetro de quão furada está a regra 3.
+
+### Regra 1 (contato novo a partir da data) — funciona, mas não pela coluna óbvia
+
+O caminho intuitivo é `ad_contato.primeiro_contato_em >= data_da_virada`.
+**Não use essa coluna.** Ela não quer dizer "quando a pessoa nos escreveu pela
+primeira vez" — quer dizer "quando a linha foi criada". Prova no próprio
+código, em `_registrar_saida`:
+
+```python
+execute("INSERT INTO ad_contato (wa_id, primeiro_contato_em, ultimo_contato_em, origem)
+         VALUES (?,?,?,'sentinela')", (para, _agora(), _agora()))
+```
+
+Um contato criado por uma mensagem que **nós** enviamos ganha
+`primeiro_contato_em = agora`. O mesmo vale para o que entrou pela ponte e pela
+importação do Atende Direito, em bloco, muito depois das conversas reais.
+
+O critério seguro é sobre as mensagens, não sobre o contato:
+
+> É novo quem **não tem nenhuma mensagem recebida anterior à data de virada**.
+
+Isso é robusto ao histórico importado, porque a importação preserva o carimbo
+real de cada mensagem.
+
+**Uma corrida a vigiar:** se um cliente antigo escrever antes de a ponte ter
+trazido o histórico dele, ele parece novo por alguns minutos. Duas defesas — a
+regra 3 (cadastro) pega a maioria, e desligar a ponte só **depois** de uma
+importação completa fecha o resto.
+
+### Regra 5 (atendente humano desliga a Bia) — esta não funciona hoje
+
+É a que mais importa e é a única que o código não sustenta.
+
+`_registrar_saida` grava toda mensagem de saída do mesmo jeito:
+
+```python
+"INSERT OR IGNORE INTO ad_mensagem (conversa_id, wa_message_id, direcao, tipo,
+ conteudo, recebido_em, status) VALUES (?,?,'saida','text',?,?,'enviada')"
+```
+
+Não há autor. **O sistema não distingue uma mensagem que a Bia mandou de uma
+que a Maria mandou** — `_enviar_wa(para, texto)` nem recebe quem está enviando.
+
+O que existe hoje é mais fraco e é outra coisa:
+
+```python
+if not hist or hist[-1]["quem"] != "lead":
+    continue
+```
+
+A Bia não fala enquanto a vez é nossa. Se um atendente responder, ela se cala —
+**até o cliente escrever de novo.** Aí ela responde por cima de quem tinha
+assumido. Não é "a Bia parou": é "a Bia esperou a vez".
+
+O mecanismo pensado para isso é o `PAUSADOS`, e ele tem dois defeitos: exige
+que alguém clique "Assumir" (a regra combinada é automática, sem clique) e vive
+em memória (§4.1), então some no deploy seguinte.
+
+**A correção é pequena e precisa:**
+
+1. Uma coluna `enviado_por` em `ad_mensagem`.
+2. `_enviar_wa` passa a receber o autor. As rotas já sabem quem é — 
+   `_usuario_logado(request)` existe e funciona; o laço automático passa `'bia'`.
+3. Elegibilidade: conversa que tenha **qualquer saída com `enviado_por <> 'bia'`**
+   está fora da Bia, para sempre.
+
+Essa mesma coluna resolve o §4.1 de brinde (a pausa vira dado, não memória) e é
+o que faz a métrica por atendente virar verdade — hoje ela credita à equipe o
+que a Bia respondeu.
+
+### O que o plano não cobre, e eu levantaria
+
+**A Bia passa a ser a primeira impressão do escritório.** Hoje ela fala com 3
+números de teste; depois da virada, fala com todo mundo que chega no número
+oficial, antes de qualquer humano.
+
+Some isso ao §4.10 — sem retry, e com `break` silencioso no meio dos balões — e
+o cenário é concreto: uma oscilação da Meta faz o **primeiro contato de um lead
+novo com o escritório** ser meia frase, sem ninguém saber. Em teste é um
+aborrecimento; na virada é a porta de entrada.
+
+Antes de ligar, eu faria o mínimo do §4.10: registrar a falha em algum lugar
+que alguém olhe.
+
+**E o laço vira o gargalo.** Ele é uma thread só, sequencial, com `sleep(1.4)`
+entre balões e uma chamada de IA por conversa. Dez contatos novos ao mesmo
+tempo viram fila: o décimo espera o nono. Além disso, hoje ele relê o histórico
+de cada número a cada 8 segundos — com a allowlist são 3; com o fluxo real do
+escritório, é consulta demais no Turso para nada.
+
+Antes de escalar: o laço deve olhar só conversas com mensagem nova desde a
+última passada, em vez de reler todas.
+
+---
+
 ## 5. O que eu faria, em ordem
 
 | # | O quê | Por quê agora |
