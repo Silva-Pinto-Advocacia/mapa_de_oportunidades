@@ -1,5 +1,12 @@
 # O sistema de WhatsApp da Jusmart: onde ele está e o que falta para ser o nosso Atende Direito
 
+> **Este não é o sistema principal.** O nosso Atende Direito é o
+> `/sentinela/wa`, no `silvapinto-comercial` — analisado em
+> [`analise-whatsapp-sentinela.md`](analise-whatsapp-sentinela.md). Este
+> documento trata da Jusmart, a versão multi-tenant extraída dele, que hoje
+> ainda é só espelho. Vale como mapa do que precisa ser portado quando a
+> migração acontecer.
+
 Análise do código em `Silva-Pinto-Advocacia/Jusmart`, commit `14d4d14`
 (PR #56, *Modo espectador*). Tudo abaixo foi conferido no código — quando
 digo "não existe", quer dizer que a busca no repositório inteiro não achou.
