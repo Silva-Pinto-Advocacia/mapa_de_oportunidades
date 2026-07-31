@@ -196,6 +196,93 @@ horizonte, isso vira dívida rápido.
 
 ---
 
+## 4-B. O que só aparece quando o portão sai
+
+Os achados acima são de correção: existem hoje e valem mesmo em teste. Os três
+abaixo estão dormentes porque a allowlist segura o volume — e acordam junto com
+a virada.
+
+### 4.9 Sete rotas `async` fazem I/O bloqueante — e o servidor é um processo só
+
+`/enviar`, `/enviar-midia`, `/enviar-upload`, `/decisao/enviar`,
+`/andamento/enviar`, `/nutricao/enviar` e `/transcrever` são todas
+`async def`, e todas chamam `urllib.request.urlopen` direto. Não há um
+`run_in_executor` nem um `to_thread` no arquivo inteiro.
+
+Em FastAPI, rota `async` roda **no event loop**. Chamada bloqueante ali trava
+o processo — e com `uvicorn` sem `--workers`, o processo é o sistema.
+
+Os tempos-limite dizem o tamanho do problema:
+
+| Rota | Timeout | O que trava junto |
+|---|---|---|
+| `/enviar` | 30 s | tudo |
+| `/enviar-upload` (até 25 MB) | 120 s | tudo |
+| `/transcrever` | ~60 s | tudo |
+
+Uma atendente subindo um PDF de 20 MB pode congelar o painel inteiro por dois
+minutos: ninguém carrega página, nenhum outro envio sai, e **o webhook da Meta
+não é atendido** — que ela lê como falha e responde reentregando.
+
+Com 3 números de teste isso quase nunca acontece. Com o escritório inteiro
+atendendo, acontece todo dia.
+
+Correção: trocar `async def` por `def` nessas rotas. O FastAPI passa a rodá-las
+num threadpool e o event loop fica livre. É uma palavra por rota.
+
+### 4.10 Nenhum envio tem retry — e não há fila
+
+Busca por `retry`, `backoff`, `retentar` no arquivo: **zero ocorrências.**
+
+Hoje, se a chamada ao Graph falhar, a rota devolve `502` e a mensagem
+simplesmente não foi. Em modo manual isso é tolerável: a atendente vê o erro na
+tela e clica de novo.
+
+Mas o laço automático engole a falha:
+
+```python
+for balao in _split_baloes(txt):
+    try:
+        _enviar_wa(n, balao)
+    except Exception:
+        break
+```
+
+Um `break` silencioso. Se o segundo balão de três falhar, **o cliente recebe
+uma resposta pela metade e ninguém fica sabendo** — nem a atendente, nem o log.
+Numa oscilação de rede da Meta, isso vira conversa truncada em série.
+
+Enquanto for manual, dá para viver sem fila. Automático em produção, não: o
+mínimo é registrar a falha em algum lugar que alguém olhe.
+
+### 4.11 A allowlist não é só a trava — é a lista de trabalho da Bia
+
+Este é o mais fácil de não enxergar:
+
+```python
+def _loop_auto():
+    ...
+    for n in sorted(_allowlist()):
+```
+
+O laço automático **percorre a allowlist**. Ela não é uma trava colocada por
+cima de um sistema que funcionaria sem ela — é a fonte de quais conversas a Bia
+acompanha.
+
+Consequência prática: apagar `SENTINELA_ALLOWLIST` não libera a Bia para todos.
+**Desliga a Bia**, e o modo automático deixa de existir em silêncio.
+
+Para valer em produção, o laço tem de passar a percorrer as conversas ativas —
+e aí o desenho encosta no limite: a cada 8 segundos, para cada conversa, uma
+consulta de histórico e possivelmente uma chamada de IA. Com 3 números é
+barato; com 300 conversas abertas é um laço que não fecha o ciclo antes do
+próximo começar.
+
+Isto não é um ajuste — é a única parte que precisa ser repensada, e é o que eu
+faria por último, com o modo manual já rodando em produção e provado.
+
+---
+
 ## 5. O que eu faria, em ordem
 
 | # | O quê | Por quê agora |
@@ -205,9 +292,25 @@ horizonte, isso vira dívida rápido.
 | 3 | **Webhook do Sentinela: público + HMAC, juntos** | Destrava os echoes (conversa inteira) e aposenta a ponte. Os dois na mesma mudança, nunca só o primeiro. |
 | 4 | **Persistir mídia no R2** | O bucket já existe. Cada dia que passa são áudios de 30 dias atrás sumindo. |
 | 5 | **Anotar a dependência de worker único** | Um comentário no `render.yaml` e no `_loop_auto`. Custa dois minutos e evita um incidente. |
-| 6 | **Ampliar a allowlist por etapas** | Com 1–4 feitos, dá para crescer o número de clientes reais sem susto. |
+| 6 | **Tirar o `async` das 7 rotas de I/O** (§4.9) | Uma palavra por rota. Sem isso, o primeiro upload grande congela o painel do escritório inteiro. |
+| 7 | **Registrar falha de envio** (§4.10) | O `break` silencioso do laço automático entrega resposta pela metade sem ninguém saber. |
+| 8 | **Ampliar a allowlist por etapas, em modo manual** | Com 1–7 feitos, dá para crescer com clientes reais sem susto. |
+| 9 | **Repensar o laço automático** (§4.11) | Só depois do manual provado em produção. É reprojeto, não ajuste. |
 
 O item 3 é o que muda o produto: hoje o sistema enxerga metade da conversa.
+Os itens 6 e 7 são baratos e são o que separa "funciona no teste" de "aguenta
+o escritório".
+
+### O veredito, direto
+
+**Com as três correções da §4.1–4.3, dá para rodar em modo manual, ampliando a
+allowlist aos poucos — desde que 6 e 7 entrem junto.** São mudanças pequenas, e
+sem elas o primeiro upload grande de um dia movimentado derruba o painel para
+todo mundo.
+
+**Não dá para ligar o modo automático para a base inteira**, e não por falta de
+cuidado: `SENTINELA_AUTO` com a allowlist aberta simplesmente não faz o que
+parece (§4.11). Isso é a fase seguinte, com o manual já provado.
 
 ---
 
