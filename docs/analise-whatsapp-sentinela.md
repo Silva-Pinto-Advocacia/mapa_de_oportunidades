@@ -1,5 +1,74 @@
 # `/sentinela/wa` — o nosso Atende Direito: onde ele está hoje
 
+---
+
+## 0. Estado em `ccbf16e` (revisão de 31/07)
+
+Três commits depois da análise original. **Resolvido:**
+
+| Achado | Como ficou |
+|---|---|
+| §4.1 `PAUSADOS` em memória | `sp_pausado` + `_pausados_carregar()` no boot + `_esta_pausado()` lendo do banco. Resolvido, e de um jeito que ainda sobrevive a multi-worker. |
+| §4.3 webhook sem HMAC | `_assinatura_valida()` com `compare_digest`. **Ver ressalva abaixo.** |
+| §4.4 mídia não persistida | R2 com SigV4 escrito à mão, `sp_midia`, gravação em thread de fundo, `/midia` busca no R2 antes da Meta, e `/midia-status?testar=1` para conferir. |
+| §4.6 dois workers duplicariam | `_sou_o_dono_do_loop()` com lease de 90 s em `sp_config`. Resolvido. |
+| — (não estava na lista) | **Opt-out.** `sp_optout`, reconhecimento de "pare/sair/não quero mais", e `_post_graph` levantando `OptOutError` antes de enviar. Não levantei isso e devia ter: é o que evita denúncia na Meta, e denúncia derruba o número. |
+| — (não estava na lista) | **Trava dupla no automático**: `SENTINELA_AUTO` **e** `SENTINELA_AUTO_CONFIRMO`. Impede ligar sem querer. |
+
+**Duas ressalvas no que foi feito:**
+
+- `_assinatura_valida()` devolve `True` quando não há segredo configurado. É
+  *fail-open*: sem `WHATSAPP_APP_SECRET` no Render, a conferência não acontece
+  e ninguém percebe. Como a rota vai virar pública, a variável tem de estar lá
+  **antes**.
+- O R2 só guarda mídia que **alguém abriu no inbox** — a gravação pendura na
+  rota `/midia`. Áudio que ninguém clicou não é baixado, não vai para o R2, e
+  some da Meta em ~30 dias do mesmo jeito.
+
+### Continua em aberto — e três disto bloqueiam o teste com leads reais
+
+| # | O quê | Efeito amanhã |
+|---|---|---|
+| §4.11 | **O laço ainda percorre `_allowlist()`** | **Bloqueador.** Ver abaixo. |
+| Regra 5 | Saída sem autor (`_enviar_wa(para, texto)`) | A Bia volta a responder por cima do humano na mensagem seguinte do cliente. |
+| §4.2 | `/sentinela/wa/webhook` continua fora de `PUBLIC_PATHS` | **O opt-out automático nunca roda.** Ver abaixo. |
+| §4.9 | 6 rotas de envio ainda `async` com `urllib` bloqueante | Um upload grande congela o painel inteiro. |
+| §4.10 | Zero retry; `break` silencioso intacto (linha 2498) | Resposta pela metade, sem registro. |
+| §4.5 | `plan: free`, `uvicorn` sem `--workers` | O laço hiberna com o serviço. |
+
+**O bloqueador, em uma frase:** nada da regra de contato novo existe — busca
+por *virada*, *corte*, *elegível* no arquivo devolve zero. O laço continua em
+`for n in sorted(_allowlist())`. Então, amanhã: **esvaziar a allowlist não
+libera a Bia para os leads novos, desliga a Bia**; e mantê-la faz a Bia
+responder só os números de teste. Nos dois casos o teste com lead real não
+acontece. E as sete rotas de envio ainda recusam quem está fora da lista, então
+nem o envio manual passa.
+
+**O segundo, que é traiçoeiro:** o opt-out foi implementado dentro do
+`wh_receber` de `/sentinela/wa/webhook` — a rota que a Meta **não alcança**
+(§4.2). Quem recebe de verdade é `/atendimento/webhook`, que não tem essa
+lógica. Ou seja: hoje o "pare de mandar" do cliente só é registrado se um
+atendente clicar no botão. Automático, não funciona. Isso e o §4.2 se resolvem
+na mesma mudança.
+
+### O que dá para fazer amanhã
+
+**Opção A — teste em modo sugestão (recomendada).** A Bia escreve, o humano lê
+e envia. Exercita o prompt, a Bia, o inbox e a operação com lead real, e nada
+sai sem alguém clicar. Precisa de duas coisas só:
+
+1. Tirar (ou ampliar) o portão da allowlist nas rotas de envio.
+2. `WHATSAPP_APP_SECRET` no Render, por causa do fail-open.
+
+Não depende do laço, nem do autor na saída, nem do webhook. Dá para amanhã.
+
+**Opção B — automático para contatos novos.** Precisa do laço reescrito
+(§4.11), do autor na saída (Regra 5) e do webhook público com HMAC (§4.2/§4.3),
+porque sem este último o opt-out automático não existe — e no automático é ele
+que segura a denúncia na Meta. Não é para amanhã.
+
+---
+
 Análise de `Silva-Pinto-Advocacia/silvapinto-comercial`, commit `4fcc2f7`.
 O sistema vive quase todo em `app/routes/sentinela_ops.py` (3.805 linhas).
 
