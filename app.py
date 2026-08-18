@@ -567,6 +567,10 @@ def _ensure_v8_columns():
         ("concursos_monitorados", "radar_enviado_em", "TEXT"),
         ("concursos_monitorados", "marketing_sync_em", "TEXT"),
         ("concursos_monitorados", "pipeline_criado_em", "TEXT"),
+        # id do registro correspondente no radar_concurso do comercial,
+        # devolvido pelo inteligencia-externa - permite linkar a FICHA CANONICA
+        # ({base}/concursos/{id}) direto daqui
+        ("concursos_monitorados", "radar_concurso_id", "INTEGER"),
     ]
     try:
         with db_conn() as conn:
@@ -4326,14 +4330,28 @@ def api_enviar_radar(concurso_id):
             )
             with urllib.request.urlopen(req, timeout=25) as resp:
                 ok = resp.status < 300
-                corpo = resp.read().decode("utf-8", "ignore")[:200]
+                corpo_full = resp.read().decode("utf-8", "ignore")
+                corpo = corpo_full[:200]
             if ok:
+                # o comercial devolve o id do registro em radar_concurso -
+                # guardamos para linkar a ficha canonica de la
+                radar_id = None
+                try:
+                    radar_id = (json.loads(corpo_full) or {}).get("id")
+                except Exception:
+                    pass
                 try:
                     with db_conn() as conn:
-                        conn.execute(
-                            "UPDATE concursos_monitorados SET radar_enviado_em = ? WHERE id = ?",
-                            (datetime.now(timezone.utc).isoformat(), concurso_id),
-                        )
+                        if radar_id:
+                            conn.execute(
+                                "UPDATE concursos_monitorados SET radar_enviado_em = ?, radar_concurso_id = ? WHERE id = ?",
+                                (datetime.now(timezone.utc).isoformat(), radar_id, concurso_id),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE concursos_monitorados SET radar_enviado_em = ? WHERE id = ?",
+                                (datetime.now(timezone.utc).isoformat(), concurso_id),
+                            )
                 except Exception as e_ts:
                     log.warning("enviar-radar: aceito mas falhou gravar timestamp: %s", e_ts)
             return jsonify({"ok": ok, "destino": url_radar, "resposta": corpo})
@@ -5576,6 +5594,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
         (c.radar_enviado_em
           ? '<button class="pesq-btn alt" onclick="enviarRadar('+concursoId+')" title="Enviado em '+fmtData(c.radar_enviado_em)+'">&#10003; No Radar &middot; reenviar</button>'
           : '<button class="pesq-btn alt" onclick="enviarRadar('+concursoId+')">Enviar ao RADAR</button>') +
+        (c.radar_concurso_id
+          ? '<a class="pesq-btn alt" style="text-decoration:none" href="__COMERCIAL_BASE__/concursos/'+c.radar_concurso_id+'" target="_blank" rel="noopener" title="Abrir a ficha canonica no sistema comercial">Ficha no comercial &#8599;</a>'
+          : '') +
       '</div>' +
       '<div class="ficha-secoes">' +
         '<div class="ficha-col"><h3 class="serif ficha-h">Raio-X</h3>'+raioxHtml+'</div>' +
