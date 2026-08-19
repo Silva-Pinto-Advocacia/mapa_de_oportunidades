@@ -5205,7 +5205,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
   // (POST /api/pipeline/enviar) - a ponte pro comercial e server-side.
 
   const PRIO_COR = { urgente: 'var(--urgente, #c0392b)', importante: 'var(--importante, #b07010)', naourgente: 'var(--naourgente, #2d7a4f)' };
-  const PRIO_LABEL = { urgente: 'Urgente', importante: 'Importante', naourgente: 'Nao urgente' };
+  // Vocabulario unificado com o pipeline do comercial: la a prioridade do card
+  // e alta/media/baixa (classe de servico) - aqui nao pode ser outro trio com
+  // outros nomes. As chaves internas ficam por compatibilidade de banco.
+  const PRIO_LABEL = { urgente: 'Prioridade alta', importante: 'Prioridade media', naourgente: 'Prioridade baixa' };
   const PRIO_ORDEM = ['urgente','importante','naourgente'];
   const TAG_CSS = { gabarito:'t-gabarito', recurso:'t-recurso', fase:'t-fase', nomeacao:'t-nomeacao', inscricao:'t-inscricao', busca:'t-recurso' };
 
@@ -5837,7 +5840,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '<div class="ficha-tit"><h3 class="serif">'+esc(c.nome)+'</h3>' +
         '<div class="meta">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas &middot; '+c.noticias.length+' noticia(s)</div></div>' +
         (novas > 0 ? '<span class="novelty"><span class="dot"></span> '+novas+' novas</span>' : '') +
-        '<button class="stage-dot" title="'+PRIO_LABEL[c.prioridade]+'" style="background:'+cor+'" onclick="event.stopPropagation();ciclarPrio('+c.id+',this)"></button>' +
+        '<button class="stage-dot" title="'+PRIO_LABEL[c.prioridade]+' &middot; clique para mudar" data-prio="'+esc(c.prioridade||'importante')+'" style="background:'+cor+'" onclick="event.stopPropagation();ciclarPrio('+c.id+',this)"></button>' +
         '</div><div class="ficha-body">'+nots+'</div></div>';
     }
 
@@ -5854,9 +5857,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(!temasHtml) temasHtml = '<div style="color:var(--cinza);font-size:12px;padding:14px 0">Nenhum tema transversal recente.</div>';
 
     cont.innerHTML = '<div class="tela active">' +
-      '<div class="legenda"><span><span class="sq" style="background:var(--urgente)"></span>Urgente</span>' +
-      '<span><span class="sq" style="background:var(--importante)"></span>Importante</span>' +
-      '<span><span class="sq" style="background:var(--naourgente)"></span>Nao urgente</span>' +
+      '<div class="legenda"><span><span class="sq" style="background:var(--urgente)"></span>Prioridade alta</span>' +
+      '<span><span class="sq" style="background:var(--importante)"></span>Prioridade media</span>' +
+      '<span><span class="sq" style="background:var(--naourgente)"></span>Prioridade baixa</span>' +
       '<button class="add-btn" style="margin-left:auto;padding:8px 16px;font-size:11px" onclick="coletarTudo()">&#8635; Coletar agora</button></div>' +
       '<div class="split"><div class="split-main">'+fichasHtml+'</div>' +
       '<aside class="side"><h4 class="serif">Temas do momento</h4>' +
@@ -5931,6 +5934,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(chip) chip.textContent = (encaixes.length + novos.length);
 
     cont.innerHTML =
+      '<div style="margin-bottom:14px"><input class="pesq-input" style="width:100%;box-sizing:border-box;padding:11px 16px;font-size:14px" type="search" placeholder="Buscar na caixa de entrada (titulo, concurso, sugestao)..." oninput="filtrarTriagem(this.value)" autocomplete="off"></div>' +
       '<div class="inbox-grupo"><h3 class="serif">Encaixes a confirmar <span class="nav-badge">'+encaixes.length+'</span></h3>' +
       '<div class="gsub">Casos ambiguos: a coleta nao teve certeza sozinha. Confirme para entrarem na ficha.</div>'+encHtml+'</div>' +
       '<div class="inbox-grupo"><h3 class="serif">Concursos novos sugeridos <span class="nav-badge cinza">'+novos.length+'</span></h3>' +
@@ -5938,6 +5942,15 @@ HTML_INDEX = r"""<!DOCTYPE html>
       '<div class="inbox-grupo"><h3 class="serif">Auto-encaixes recentes <span class="nav-badge cinza">'+autos.length+'</span></h3>' +
       '<div class="gsub">Encaixados sozinhos pela coleta nos ultimos 7 dias. Errou? Desfazer devolve pra fila.</div>'+autoHtml+'</div>' +
       '<div style="margin-top:20px"><button class="add-btn" onclick="rodarTriagemRetroativa()">Rodar triagem retroativa (acervo antigo)</button></div>';
+  }
+  // Busca da caixa de entrada: recorte instantaneo sobre os tres grupos,
+  // sem sair do modo triagem (uma decisao de cada vez, mas achavel).
+  function filtrarTriagem(q) {
+    const nq = String(q||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
+    document.querySelectorAll('.triagem-card').forEach(function(card){
+      const txt = (card.textContent||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+      card.style.display = (!nq || txt.indexOf(nq) >= 0) ? '' : 'none';
+    });
   }
   async function desfazerAutoEnc(aeId) {
     const r = await POST('/api/auto-encaixes/'+aeId+'/desfazer');
@@ -6034,6 +6047,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '<div class="add-bar" style="margin:0">' +
           '<button class="add-btn" onclick="abrirModal()">+ Acompanhar novo</button>' +
           barra +
+          '<a class="add-btn" style="background:#fff;color:var(--preto);border:1px solid var(--gold);text-decoration:none" href="__COMERCIAL_BASE__/radar#lente=intel" target="_blank" rel="noopener" title="O pipeline de certames e um so e mora no comercial - aqui e a lente de inteligencia">&#129517; Pipeline unificado &#8599;</a>' +
         '</div>' +
         '<div class="mc-ordem"><span style="font-size:11px;color:var(--cinza);font-weight:700">Ordenar:</span>' +
           '<select class="pesq-select" style="padding:8px 14px;font-size:12px" onchange="_ordemConcursos=this.value;desenharMeusConcursos()">' +
@@ -6131,16 +6145,16 @@ HTML_INDEX = r"""<!DOCTYPE html>
   function toggleFicha(head) { head.closest('.ficha').classList.toggle('aberta'); }
 
   async function ciclarPrio(cid, btn) {
-    const cur = PRIO_ORDEM.find(p=>PRIO_COR[p]===btn.style.background.includes(PRIO_COR[p])) || 'importante';
-    // Detecta prioridade atual pelo titulo
-    const curTitle = (btn.title||'').toLowerCase();
-    let idx = PRIO_ORDEM.findIndex(p=>curTitle.includes(p));
+    // A prioridade atual vive num data-attribute do botao (os rotulos agora
+    // sao "Prioridade alta/media/baixa" e nao contem mais a chave interna).
+    let idx = PRIO_ORDEM.indexOf(btn.dataset.prio || '');
     if(idx<0) idx = 1;
     const nova = PRIO_ORDEM[(idx+1)%PRIO_ORDEM.length];
     const r = await POST('/api/concursos/'+cid+'/prioridade', {prioridade:nova});
     if(r.ok) {
       btn.style.background = PRIO_COR[nova];
       btn.title = PRIO_LABEL[nova];
+      btn.dataset.prio = nova;
       const head = btn.closest('.ficha-head');
       if(head) { PRIO_ORDEM.forEach(p=>head.classList.remove(p)); head.classList.add(nova); }
       toast('Prioridade: '+PRIO_LABEL[nova]);
@@ -6293,7 +6307,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   // v7.0.4: sync completo SINCRONO - reporta resultado real de cada envio
   async function sincronizarMarketing() {
-    if(!confirm('Enviar todos os concursos monitorados para a pagina Concursos do sistema de marketing?\n\nCada concurso vira/atualiza um card na etapa da sua cor (Urgente / Importante / Nao Urgente).')) return;
+    if(!confirm('Enviar todos os concursos monitorados para o pipeline unificado do comercial?\n\nCada concurso vira/atualiza um card com a prioridade da sua cor (alta / media / baixa).')) return;
     toast('Sincronizando... aguarde, estou confirmando cada envio', 15000);
     const r = await POST('/api/concursos/sincronizar-marketing');
     if(r.ok) {
