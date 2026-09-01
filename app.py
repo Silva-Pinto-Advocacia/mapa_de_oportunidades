@@ -61,10 +61,45 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 # v7.0.3: sincronizacao com a pagina 'Concursos' do sistema de marketing.
 # O painel envia upserts/remocoes pra manter os dois espelhados.
 # Mapeamento de etapas 1:1 -> urgente | importante | nao_urgente
+_COMERCIAL_BASE_PADRAO = "https://silvapinto-comercial.onrender.com"
+
 CONCURSOS_MKT_URL = os.environ.get(
     "CONCURSOS_MKT_URL",
-    "https://silvapinto-comercial.onrender.com/api/concursos/sincronizar-externo"
+    _COMERCIAL_BASE_PADRAO + "/api/concursos/sincronizar-externo"
 ).strip()
+
+
+def _comercial_base():
+    """UMA base pro sistema comercial, derivada de CONCURSOS_MKT_URL.
+
+    Corta a URL em /api/ ou /marketing/ pra achar a raiz; se nao reconhecer,
+    usa o dominio padrao do Render. Toda rota do comercial parte daqui.
+    """
+    u = CONCURSOS_MKT_URL
+    if "/api/" in u:
+        return u.rsplit("/api/", 1)[0]
+    if "/marketing/" in u:
+        return u.rsplit("/marketing/", 1)[0]
+    return _COMERCIAL_BASE_PADRAO
+
+
+# Rotas do comercial - todas derivadas da MESMA base (ponte unica)
+URL_SINCRONIZAR_MKT = _comercial_base() + "/api/concursos/sincronizar-externo"
+URL_RADAR_MKT = _comercial_base() + "/api/radar/inteligencia-externa"
+URL_PIPELINE_MKT = _comercial_base() + "/marketing/pipeline/criar-externo"
+
+# Mapeamento canonico prioridade (painel) -> etapa (comercial)
+PRIO_ETAPA = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
+
+
+def _headers_comercial():
+    """Headers dos POSTs pro comercial. Inclui X-Radar-Token se RADAR_TOKEN
+    estiver configurado no ambiente (lido a cada chamada)."""
+    h = {"Content-Type": "application/json"}
+    tok = os.environ.get("RADAR_TOKEN", "").strip()
+    if tok:
+        h["X-Radar-Token"] = tok
+    return h
 
 # YouTube Data API (opcional). Se vazio, pula enrichment.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
@@ -532,6 +567,10 @@ def _ensure_v8_columns():
         ("concursos_monitorados", "radar_enviado_em", "TEXT"),
         ("concursos_monitorados", "marketing_sync_em", "TEXT"),
         ("concursos_monitorados", "pipeline_criado_em", "TEXT"),
+        # id do registro correspondente no radar_concurso do comercial,
+        # devolvido pelo inteligencia-externa - permite linkar a FICHA CANONICA
+        # ({base}/concursos/{id}) direto daqui
+        ("concursos_monitorados", "radar_concurso_id", "INTEGER"),
     ]
     try:
         with db_conn() as conn:
@@ -1326,7 +1365,8 @@ def _sync_concurso_marketing(concurso, acao="upsert"):
     sistema de marketing estiver fora do ar.
 
     Payload enviado (contrato definido pelo painel):
-      { "nome": str,            # identificador do card (upsert por nome)
+      { "nome": str,            # identificador do card
+        "id_painel": int,       # id no painel - o receptor casa por ele primeiro
         "banca": str, "vagas": str,
         "etapa": "urgente" | "importante" | "nao_urgente",
         "acao": "upsert" | "remover",
@@ -1335,12 +1375,12 @@ def _sync_concurso_marketing(concurso, acao="upsert"):
     if not CONCURSOS_MKT_URL:
         return
 
-    prio_map = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
     payload = {
         "nome": (concurso.get("nome") or "").strip(),
+        "id_painel": concurso.get("id"),
         "banca": (concurso.get("banca") or "").strip(),
         "vagas": (concurso.get("vagas") or "").strip(),
-        "etapa": prio_map.get(concurso.get("prioridade", "importante"), "importante"),
+        "etapa": PRIO_ETAPA.get(concurso.get("prioridade", "importante"), "importante"),
         "acao": acao,
         "origem": "painel-oportunidades",
     }
@@ -1352,9 +1392,9 @@ def _sync_concurso_marketing(concurso, acao="upsert"):
     def _send():
         try:
             req = urllib.request.Request(
-                CONCURSOS_MKT_URL,
+                URL_SINCRONIZAR_MKT,
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                headers=_headers_comercial(),
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
@@ -3192,16 +3232,16 @@ def api_concursos_sincronizar_marketing():
                 ).fetchall()
             concursos = [_dict_from_row(r) for r in rows]
 
-        prio_map = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
         confirmados = 0
         falhas = 0
         primeiro_erro = ""
         for c in concursos:
             payload = {
                 "nome": (c.get("nome") or "").strip(),
+                "id_painel": c.get("id"),
                 "banca": (c.get("banca") or "").strip(),
                 "vagas": (c.get("vagas") or "").strip(),
-                "etapa": prio_map.get(c.get("prioridade", "importante"), "importante"),
+                "etapa": PRIO_ETAPA.get(c.get("prioridade", "importante"), "importante"),
                 "acao": "upsert",
                 "origem": "painel-oportunidades",
             }
@@ -3209,9 +3249,9 @@ def api_concursos_sincronizar_marketing():
                 continue
             try:
                 req = urllib.request.Request(
-                    CONCURSOS_MKT_URL,
+                    URL_SINCRONIZAR_MKT,
                     data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
+                    headers=_headers_comercial(),
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=25) as resp:
@@ -3245,7 +3285,7 @@ def api_concursos_sincronizar_marketing():
             "confirmados": confirmados,
             "falhas": falhas,
             "erro_detalhe": primeiro_erro,
-            "destino": CONCURSOS_MKT_URL,
+            "destino": URL_SINCRONIZAR_MKT,
         })
     except Exception as e:
         log.error("api_concursos_sincronizar_marketing erro: %s", e)
@@ -4215,7 +4255,7 @@ def api_enviar_radar(concurso_id):
     RADAR do sistema comercial. Os dados juridicos/comerciais (honorarios, docs)
     ficam SO no comercial - aqui so mandamos o que o Mapa sabe.
 
-    Reusa CONCURSOS_MKT_URL como base; manda pra rota /radar/inteligencia-externa.
+    Usa a base unica do comercial (_comercial_base); manda pra URL_RADAR_MKT.
     """
     try:
         with db_conn() as conn:
@@ -4241,16 +4281,9 @@ def api_enviar_radar(concurso_id):
                 raiox = None
         rx = raiox or {}
 
-        # Monta o destino: base do CONCURSOS_MKT_URL + rota de inteligencia do RADAR
-        if "/api/" in CONCURSOS_MKT_URL:
-            base = CONCURSOS_MKT_URL.rsplit("/api/", 1)[0]
-        elif "/marketing/" in CONCURSOS_MKT_URL:
-            base = CONCURSOS_MKT_URL.rsplit("/marketing/", 1)[0]
-        else:
-            base = "https://silvapinto-comercial.onrender.com"
-        url_radar = base + "/api/radar/inteligencia-externa"
+        # Destino: base unica do comercial + rota de inteligencia do RADAR
+        url_radar = URL_RADAR_MKT
 
-        prio_map = {"urgente": "urgente", "importante": "importante", "naourgente": "nao_urgente"}
         # Helper: prefere o dado salvo no concurso; se vazio, usa o do raio-x
         def campo(nome_concurso, nome_raiox):
             v = (concurso.get(nome_concurso) or "").strip() if concurso.get(nome_concurso) else ""
@@ -4272,7 +4305,7 @@ def api_enviar_radar(concurso_id):
             "nota_minima_aprovacao": rx.get("nota_minima_aprovacao", ""),
             "nota_minima_qualificado": rx.get("nota_minima_qualificado", ""),
             "link_concurso": concurso.get("link_concurso", ""),
-            "etapa": prio_map.get(concurso.get("prioridade", "importante"), "importante"),
+            "etapa": PRIO_ETAPA.get(concurso.get("prioridade", "importante"), "importante"),
             # Notas de corte por modalidade
             "notas_corte_modalidade": rx.get("notas_corte_modalidade", []),
             # Inteligencia / Raio-X
@@ -4292,19 +4325,33 @@ def api_enviar_radar(concurso_id):
             req = urllib.request.Request(
                 url_radar,
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                headers=_headers_comercial(),
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=25) as resp:
                 ok = resp.status < 300
-                corpo = resp.read().decode("utf-8", "ignore")[:200]
+                corpo_full = resp.read().decode("utf-8", "ignore")
+                corpo = corpo_full[:200]
             if ok:
+                # o comercial devolve o id do registro em radar_concurso -
+                # guardamos para linkar a ficha canonica de la
+                radar_id = None
+                try:
+                    radar_id = (json.loads(corpo_full) or {}).get("id")
+                except Exception:
+                    pass
                 try:
                     with db_conn() as conn:
-                        conn.execute(
-                            "UPDATE concursos_monitorados SET radar_enviado_em = ? WHERE id = ?",
-                            (datetime.now(timezone.utc).isoformat(), concurso_id),
-                        )
+                        if radar_id:
+                            conn.execute(
+                                "UPDATE concursos_monitorados SET radar_enviado_em = ?, radar_concurso_id = ? WHERE id = ?",
+                                (datetime.now(timezone.utc).isoformat(), radar_id, concurso_id),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE concursos_monitorados SET radar_enviado_em = ? WHERE id = ?",
+                                (datetime.now(timezone.utc).isoformat(), concurso_id),
+                            )
                 except Exception as e_ts:
                     log.warning("enviar-radar: aceito mas falhou gravar timestamp: %s", e_ts)
             return jsonify({"ok": ok, "destino": url_radar, "resposta": corpo})
@@ -4334,6 +4381,45 @@ def api_marcar_pipeline(concurso_id):
     except Exception as e:
         log.error("api_marcar_pipeline erro: %s", e)
         return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/pipeline/enviar", methods=["POST"])
+def api_pipeline_enviar():
+    """v9: o pipeline sai do navegador. O front manda {titulo, descricao, tipo,
+    link} pra ca, e o POST pro comercial (criar-externo) acontece server-side,
+    pela base unica e com o X-Radar-Token quando configurado."""
+    try:
+        body = request.get_json(silent=True) or {}
+        payload = {
+            "titulo": str(body.get("titulo") or "").strip(),
+            "descricao": str(body.get("descricao") or "").strip(),
+            "tipo": str(body.get("tipo") or "operacional").strip(),
+            "link": str(body.get("link") or "").strip(),
+        }
+        if not payload["titulo"]:
+            return jsonify({"ok": False, "erro": "titulo vazio"}), 400
+        req = urllib.request.Request(
+            URL_PIPELINE_MKT,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=_headers_comercial(),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.status
+            corpo = resp.read().decode("utf-8", "ignore")[:300]
+        if status < 300:
+            return jsonify({"ok": True, "destino": URL_PIPELINE_MKT, "resposta": corpo})
+        return jsonify({"ok": False, "erro": f"status HTTP {status}"}), 502
+    except urllib.error.HTTPError as he:
+        try:
+            corpo = he.read().decode("utf-8", "ignore")[:200]
+        except Exception:
+            corpo = ""
+        log.warning("pipeline/enviar: HTTP %s (%s)", he.code, corpo)
+        return jsonify({"ok": False, "erro": f"HTTP {he.code} - {corpo}".strip(" -")}), 502
+    except Exception as e:
+        log.warning("pipeline/enviar: falha (%s)", e)
+        return jsonify({"ok": False, "erro": str(e)[:200]}), 502
 
 
 @app.route("/api/giro", methods=["POST"])
@@ -4671,44 +4757,46 @@ HTML_INDEX = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Painel de Oportunidades v7 &#8212; Silva Pinto</title>
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="__COMERCIAL_BASE__/static/tokens.css">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900&family=Manrope:wght@300..800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
-    /* Paleta oficial Silva Pinto (manual de marca) */
-    --bege: #D9D7C5;           /* fundo principal */
-    --bege-claro: #e4e2d4;     /* cards / superficie clara */
-    --bege-escuro: #c9c6b2;    /* linhas, divisores */
-    --gold: #BB904C;           /* dourado - acentos */
-    --gold-light: #d0a866;
+    /* Paleta Silva Pinto - mapeada nos tokens do comercial (tokens.css),
+       com fallback local: se o link falhar, nada quebra */
+    --bege: var(--sp-paper, #f5f1e8);          /* fundo principal */
+    --bege-claro: var(--sp-surface-2, #faf8f3);/* cards / superficie clara */
+    --bege-escuro: var(--sp-rule-2, #ddd6c4);  /* linhas, divisores */
+    --gold: var(--sp-gold, #b8860b);           /* dourado - acentos */
+    --gold-light: var(--sp-gold-soft, #c9a84c);
     --gold-dark: #9a7438;
-    --gold-pale: #ece3d0;
-    --cinza: #7A7A7A;          /* cinza medio - texto secundario */
-    --preto: #1A1A1A;          /* preto - autoridade, texto, fundos escuros */
+    --gold-pale: var(--sp-gold-bg, #f0e8d6);
+    --cinza: var(--sp-muted, #7a7570);         /* cinza medio - texto secundario */
+    --preto: var(--sp-ink, #141414);           /* preto - autoridade, texto, fundos escuros */
     --preto-soft: #2a2a2a;
-    --cream: #D9D7C5;
-    --navy: #1A1A1A;           /* mapeado pro preto da marca */
-    --line: #c9c6b2;
-    --text: #1A1A1A;
-    --muted: #7A7A7A;
-    --urgente: #c0392b;        /* SEMAFORO vermelho vivo - so as bolinhas */
-    --importante: #BB904C;     /* SEMAFORO amarelo = dourado da marca */
-    --naourgente: #2e9e5b;     /* SEMAFORO verde vivo - so as bolinhas */
+    --cream: var(--sp-paper, #f5f1e8);
+    --navy: var(--sp-ink, #141414);            /* mapeado pro preto da marca */
+    --line: var(--sp-rule-2, #ddd6c4);
+    --text: var(--sp-ink, #141414);
+    --muted: var(--sp-muted, #7a7570);
+    --urgente: var(--sp-verm, #c0392b);        /* SEMAFORO vermelho - so as bolinhas */
+    --importante: var(--sp-ambar, #b07010);    /* SEMAFORO amarelo/ambar */
+    --naourgente: var(--sp-verde, #2d7a4f);    /* SEMAFORO verde - so as bolinhas */
     /* acoes e chrome usam SO a paleta da marca abaixo */
-    --acao: #1A1A1A;           /* botoes de acao = preto */
-    --acao-ok: #BB904C;        /* confirmado = dourado */
+    --acao: var(--sp-ink, #141414);            /* botoes de acao = preto */
+    --acao-ok: var(--sp-gold, #b8860b);        /* confirmado = dourado */
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    font-family: 'DM Sans', sans-serif;
+    font-family: 'Manrope', sans-serif;
     background: var(--cream);
     color: var(--text);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
   }
-  .serif { font-family: 'Cormorant Garamond', serif; }
+  .serif { font-family: 'Fraunces', serif; }
 
   .mockup-banner {
-    background: repeating-linear-gradient(45deg, #1A1A1A, #1A1A1A 12px, #2a2a2a 12px, #2a2a2a 24px);
+    background: repeating-linear-gradient(45deg, var(--sp-ink, #141414), var(--sp-ink, #141414) 12px, #2a2a2a 12px, #2a2a2a 24px);
     color: #fff; text-align: center; padding: 7px 16px; font-size: 11.5px;
     letter-spacing: 0.4px; font-weight: 600;
   }
@@ -4721,25 +4809,25 @@ HTML_INDEX = r"""<!DOCTYPE html>
   }
   .logo-circ {
     width: 44px; height: 44px; border-radius: 50%; border: 2px solid var(--gold);
-    display: grid; place-items: center; font-family: 'Cormorant Garamond', serif;
+    display: grid; place-items: center; font-family: 'Fraunces', serif;
     font-weight: 700; color: var(--gold); font-size: 17px; flex-shrink: 0;
   }
-  .brand h1 { font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 22px; }
+  .brand h1 { font-family: 'Fraunces', serif; font-weight: 600; font-size: 22px; }
   .brand .sub { font-size: 9px; letter-spacing: 3px; text-transform: uppercase; color: var(--gold); opacity: 0.85; margin-top: 1px; }
 
   .search-wrap { flex: 1; min-width: 260px; display: flex; justify-content: center; }
   .search-box { width: 100%; max-width: 480px; position: relative; }
   .search-box input {
     width: 100%; padding: 12px 16px 12px 42px; border-radius: 28px; border: none;
-    font-family: 'DM Sans'; font-size: 13.5px; background: rgba(255,255,255,0.96); color: var(--navy); font-weight: 500;
+    font-family: 'Manrope', sans-serif; font-size: 13.5px; background: rgba(255,255,255,0.96); color: var(--navy); font-weight: 500;
   }
   .search-box .icon { position: absolute; left: 15px; top: 50%; transform: translateY(-50%); color: var(--gold); }
-  .search-box .hint { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font-size: 9px; color: #7A7A7A; background: var(--gold-pale); padding: 3px 8px; border-radius: 10px; font-weight: 700; }
+  .search-box .hint { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font-size: 9px; color: var(--sp-muted, #7a7570); background: var(--gold-pale); padding: 3px 8px; border-radius: 10px; font-weight: 700; }
 
   /* ===== Nav principal (3 lugares) ===== */
   .mainnav { background: var(--navy); border-top: 1px solid rgba(255,255,255,0.1); padding: 0 26px; display: flex; gap: 2px; }
   .mainnav button {
-    background: none; border: none; color: rgba(255,255,255,0.6); font-family: 'DM Sans';
+    background: none; border: none; color: rgba(255,255,255,0.6); font-family: 'Manrope', sans-serif;
     font-size: 12.5px; font-weight: 700; padding: 13px 18px; cursor: pointer; letter-spacing: 0.4px;
     border-bottom: 3px solid transparent; transition: all 0.15s; display: flex; align-items: center; gap: 8px;
   }
@@ -4761,7 +4849,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   /* ===== Ficha viva de concurso ===== */
   .ficha {
-    background: #fdfcf9; border: 1px solid var(--line); border-radius: 12px; margin-bottom: 16px;
+    background: var(--sp-surface, #fdfcf9); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 16px;
     overflow: hidden; box-shadow: 0 1px 3px rgba(40,30,10,0.04);
   }
   .ficha-head {
@@ -4771,7 +4859,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .ficha-head.urgente { border-left-color: var(--urgente); }
   .ficha-head.importante { border-left-color: var(--importante); }
   .ficha-head.naourgente { border-left-color: var(--naourgente); }
-  .ficha-head:hover { background: #e4e2d4; }
+  .ficha-head:hover { background: var(--sp-surface-2, #faf8f3); }
 
   /* Selo de prioridade: so cor (semaforo), sem texto */
   .stage-dot {
@@ -4781,7 +4869,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   }
   .stage-dot:hover { transform: scale(1.2); }
   .ficha-tit { flex: 1; }
-  .ficha-tit h3 { font-family: 'Cormorant Garamond'; font-size: 19px; font-weight: 600; color: var(--navy); }
+  .ficha-tit h3 { font-family: 'Fraunces', serif; font-size: 19px; font-weight: 600; color: var(--navy); }
   .ficha-tit .meta { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
   .chev { color: var(--muted); transition: transform 0.2s; font-size: 13px; }
   .ficha.aberta .chev { transform: rotate(90deg); }
@@ -4793,7 +4881,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .ficha-body { padding: 0 18px 14px 23px; display: none; }
   .ficha.aberta .ficha-body { display: block; }
 
-  .linha { display: flex; align-items: flex-start; gap: 11px; padding: 12px 0; border-top: 1px solid #c9c6b2; }
+  .linha { display: flex; align-items: flex-start; gap: 11px; padding: 12px 0; border-top: 1px solid var(--sp-rule-2, #ddd6c4); }
   .ntag { font-size: 8.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; padding: 4px 8px; border-radius: 5px; white-space: nowrap; margin-top: 2px; }
   .t-gabarito { background: var(--gold-pale); color: var(--preto); }
   .t-recurso { background: var(--gold-pale); color: var(--gold-dark); }
@@ -4805,17 +4893,17 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .ntexto .nd { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .nacts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
 
-  .mini { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; padding: 5px 11px; border-radius: 5px; border: 1px solid var(--line); background: #fdfcf9; color: var(--muted); cursor: pointer; transition: all 0.15s; font-family: 'DM Sans'; }
+  .mini { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; padding: 5px 11px; border-radius: 5px; border: 1px solid var(--line); background: var(--sp-surface, #fdfcf9); color: var(--muted); cursor: pointer; transition: all 0.15s; font-family: 'Manrope', sans-serif; }
   .mini:hover { border-color: var(--gold); color: var(--gold-dark); }
   .mini.gerar { background: var(--navy); color: #fff; border-color: var(--navy); }
   .mini.gerar:hover { background: var(--gold); border-color: var(--gold); color: #fff; }
   .mini.feito { background: var(--gold); color: #fff; border-color: var(--gold); cursor: default; }
 
   /* ===== Lateral temas ===== */
-  .side { background: #fdfcf9; border: 1px solid var(--line); border-radius: 12px; padding: 17px; position: sticky; top: 18px; }
-  .side h4 { font-family: 'Cormorant Garamond'; font-size: 16px; color: var(--navy); }
+  .side { background: var(--sp-surface, #fdfcf9); border: 1px solid var(--line); border-radius: 12px; padding: 17px; position: sticky; top: 18px; }
+  .side h4 { font-family: 'Fraunces', serif; font-size: 16px; color: var(--navy); }
   .side .side-sub { font-size: 10.5px; color: var(--muted); margin: 3px 0 13px; }
-  .sitem { padding: 11px 0; border-top: 1px solid #c9c6b2; }
+  .sitem { padding: 11px 0; border-top: 1px solid var(--sp-rule-2, #ddd6c4); }
   .sitem:first-of-type { border-top: none; }
   .sk { font-size: 8.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; }
   .sk.juris { color: var(--cinza); }
@@ -4825,10 +4913,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   /* ===== Triagem inline (A confirmar) ===== */
   .inbox-grupo { margin-bottom: 28px; }
-  .inbox-grupo > h3 { font-family: 'Cormorant Garamond'; font-size: 18px; color: var(--navy); margin-bottom: 4px; display: flex; align-items: center; gap: 9px; }
+  .inbox-grupo > h3 { font-family: 'Fraunces', serif; font-size: 18px; color: var(--navy); margin-bottom: 4px; display: flex; align-items: center; gap: 9px; }
   .inbox-grupo > .gsub { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
   .triagem-card {
-    background: #fdfcf9; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+    background: var(--sp-surface, #fdfcf9); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
     margin-bottom: 11px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   }
   .triagem-card .tc-main { flex: 1; min-width: 220px; }
@@ -4836,70 +4924,70 @@ HTML_INDEX = r"""<!DOCTYPE html>
   .triagem-card .tc-sug { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
   .triagem-card .tc-sug b { color: var(--navy); }
   .tc-acts { display: flex; gap: 7px; flex-wrap: wrap; }
-  .btn-conf { background: var(--acao); color: #fff; border: none; font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans'; letter-spacing: 0.3px; }
+  .btn-conf { background: var(--acao); color: #fff; border: none; font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'Manrope', sans-serif; letter-spacing: 0.3px; }
   .btn-conf:hover { filter: brightness(1.08); }
-  .btn-rej { background: #fdfcf9; color: var(--muted); border: 1px solid var(--line); font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans'; letter-spacing: 0.3px; }
+  .btn-rej { background: var(--sp-surface, #fdfcf9); color: var(--muted); border: 1px solid var(--line); font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'Manrope', sans-serif; letter-spacing: 0.3px; }
   .btn-rej:hover { border-color: var(--urgente); color: var(--urgente); }
-  .btn-outro { background: #fdfcf9; color: var(--navy); border: 1px solid var(--gold); font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans'; letter-spacing: 0.3px; }
+  .btn-outro { background: var(--sp-surface, #fdfcf9); color: var(--navy); border: 1px solid var(--gold); font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-family: 'Manrope', sans-serif; letter-spacing: 0.3px; }
   .btn-outro:hover { background: var(--gold-pale); }
   .sug-monit { background: var(--gold-pale); border-color: var(--gold-light); }
 
   /* Menu "outro concurso" */
   .outro-menu { display: none; position: fixed; inset: 0; background: rgba(26,40,66,0.5); z-index: 60; align-items: center; justify-content: center; padding: 20px; }
   .outro-menu.show { display: flex; }
-  .outro-box { background: #fdfcf9; border-radius: 14px; padding: 24px; max-width: 420px; width: 100%; }
-  .outro-box h3 { font-family: 'Cormorant Garamond'; font-size: 21px; color: var(--navy); margin-bottom: 3px; }
+  .outro-box { background: var(--sp-surface, #fdfcf9); border-radius: 14px; padding: 24px; max-width: 420px; width: 100%; }
+  .outro-box h3 { font-family: 'Fraunces', serif; font-size: 21px; color: var(--navy); margin-bottom: 3px; }
   .outro-box .obsub { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
   .outro-list { max-height: 240px; overflow-y: auto; margin-bottom: 14px; }
   .outro-item { padding: 11px 13px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 7px; cursor: pointer; font-size: 13px; font-weight: 600; color: var(--navy); transition: all 0.12s; }
   .outro-item:hover { border-color: var(--gold); background: var(--gold-pale); }
   .outro-novo { border-top: 1px dashed var(--line); padding-top: 14px; }
-  .outro-novo input { width: 100%; padding: 9px 12px; border: 1px solid var(--line); border-radius: 7px; font-family: 'DM Sans'; font-size: 13px; margin-bottom: 8px; }
-  .outro-novo button { width: 100%; padding: 10px; background: var(--navy); color: #fff; border: none; border-radius: 7px; font-family: 'DM Sans'; font-weight: 700; font-size: 12px; cursor: pointer; }
+  .outro-novo input { width: 100%; padding: 9px 12px; border: 1px solid var(--line); border-radius: 7px; font-family: 'Manrope', sans-serif; font-size: 13px; margin-bottom: 8px; }
+  .outro-novo button { width: 100%; padding: 10px; background: var(--navy); color: #fff; border: none; border-radius: 7px; font-family: 'Manrope', sans-serif; font-weight: 700; font-size: 12px; cursor: pointer; }
   .outro-novo button:hover { background: var(--gold); }
   .outro-fechar { text-align: center; margin-top: 12px; }
-  .outro-fechar button { background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; text-decoration: underline; font-family: 'DM Sans'; }
+  .outro-fechar button { background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; text-decoration: underline; font-family: 'Manrope', sans-serif; }
 
   /* ===== Concursos monitorados (cadastro) ===== */
   .add-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-  .add-btn { background: var(--navy); color: #fff; border: none; font-family: 'DM Sans'; font-size: 12.5px; font-weight: 700; padding: 11px 20px; border-radius: 8px; cursor: pointer; letter-spacing: 0.3px; }
+  .add-btn { background: var(--navy); color: #fff; border: none; font-family: 'Manrope', sans-serif; font-size: 12.5px; font-weight: 700; padding: 11px 20px; border-radius: 8px; cursor: pointer; letter-spacing: 0.3px; }
   .add-btn:hover { background: var(--gold); }
   .monit-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
-  .monit-card { background: #fdfcf9; border: 1px solid var(--line); border-radius: 10px; padding: 16px; border-top: 4px solid var(--importante); }
+  .monit-card { background: var(--sp-surface, #fdfcf9); border: 1px solid var(--line); border-radius: 10px; padding: 16px; border-top: 4px solid var(--importante); }
   .monit-card.urgente-top { border-top-color: var(--urgente); }
   .monit-card.radar-top { border-top-color: var(--cinza); }
-  .monit-card h4 { font-family: 'Cormorant Garamond'; font-size: 17px; color: var(--navy); }
+  .monit-card h4 { font-family: 'Fraunces', serif; font-size: 17px; color: var(--navy); }
   .monit-card .mc-meta { font-size: 11px; color: var(--muted); margin: 5px 0 10px; }
   .kw { display: inline-block; font-size: 10px; background: var(--gold-pale); color: var(--gold-dark); padding: 2px 8px; border-radius: 10px; margin: 2px 3px 2px 0; font-weight: 600; }
-  .mc-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; padding-top: 11px; border-top: 1px solid #c9c6b2; }
+  .mc-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--sp-rule-2, #ddd6c4); }
   .mc-count { font-size: 11px; color: var(--muted); }
 
   /* ===== Modal ===== */
   .modal-bg { display: none; position: fixed; inset: 0; background: rgba(26,40,66,0.5); z-index: 50; align-items: center; justify-content: center; padding: 20px; }
   .modal-bg.show { display: flex; }
-  .modal { background: #fdfcf9; border-radius: 14px; padding: 26px; max-width: 460px; width: 100%; }
-  .modal h3 { font-family: 'Cormorant Garamond'; font-size: 22px; color: var(--navy); margin-bottom: 4px; }
+  .modal { background: var(--sp-surface, #fdfcf9); border-radius: 14px; padding: 26px; max-width: 460px; width: 100%; }
+  .modal h3 { font-family: 'Fraunces', serif; font-size: 22px; color: var(--navy); margin-bottom: 4px; }
   .modal .msub { font-size: 12px; color: var(--muted); margin-bottom: 18px; }
   .modal label { display: block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); margin: 13px 0 5px; }
-  .modal input { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; font-family: 'DM Sans'; font-size: 13px; }
+  .modal input { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; font-family: 'Manrope', sans-serif; font-size: 13px; }
   .modal input:focus { outline: none; border-color: var(--gold); }
   .modal-acts { display: flex; gap: 10px; margin-top: 22px; }
-  .modal-acts button { flex: 1; padding: 11px; border-radius: 8px; font-family: 'DM Sans'; font-size: 12.5px; font-weight: 700; cursor: pointer; border: none; }
+  .modal-acts button { flex: 1; padding: 11px; border-radius: 8px; font-family: 'Manrope', sans-serif; font-size: 12.5px; font-weight: 700; cursor: pointer; border: none; }
   .modal-salvar { background: var(--navy); color: #fff; }
   .modal-salvar:hover { background: var(--gold); }
-  .modal-cancelar { background: #fdfcf9; color: var(--muted); border: 1px solid var(--line) !important; }
+  .modal-cancelar { background: var(--sp-surface, #fdfcf9); color: var(--muted); border: 1px solid var(--line) !important; }
 
   /* ===== Toast ===== */
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--navy); color: #fff; padding: 13px 22px; border-radius: 30px; font-size: 13px; font-weight: 600; box-shadow: 0 6px 20px rgba(0,0,0,0.25); z-index: 100; opacity: 0; transition: opacity 0.25s; }
   .toast.show { opacity: 1; }
   /* ===== v7.1: Pesquisa sob demanda ===== */
-  .pesq-box { background: #fdfcf9; border: 1px solid var(--line); border-radius: 14px; padding: 26px; margin-bottom: 30px; }
+  .pesq-box { background: var(--sp-surface, #fdfcf9); border: 1px solid var(--line); border-radius: 14px; padding: 26px; margin-bottom: 30px; }
   .pesq-titulo { font-size: 26px; color: var(--preto); margin-bottom: 4px; }
   .pesq-sub { font-size: 13px; color: var(--cinza); margin-bottom: 18px; max-width: 620px; line-height: 1.5; }
   .pesq-input-row { display: flex; gap: 10px; flex-wrap: wrap; }
-  .pesq-input { flex: 1; min-width: 240px; padding: 14px 18px; border: 1.5px solid var(--line); border-radius: 30px; font-family: 'DM Sans', sans-serif; font-size: 15px; color: var(--preto); }
+  .pesq-input { flex: 1; min-width: 240px; padding: 14px 18px; border: 1.5px solid var(--line); border-radius: 30px; font-family: 'Manrope', sans-serif; font-size: 15px; color: var(--preto); }
   .pesq-input:focus { outline: none; border-color: var(--gold); }
-  .pesq-btn { padding: 14px 28px; background: var(--preto); color: #fff; border: none; border-radius: 30px; font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 14px; cursor: pointer; transition: background 0.15s; }
+  .pesq-btn { padding: 14px 28px; background: var(--preto); color: #fff; border: none; border-radius: 30px; font-family: 'Manrope', sans-serif; font-weight: 700; font-size: 14px; cursor: pointer; transition: background 0.15s; }
   .pesq-btn:hover { background: var(--gold); }
   .pesq-loading { padding: 26px; text-align: center; color: var(--cinza); font-size: 14px; font-style: italic; }
   .pesq-erro { padding: 22px; text-align: center; color: var(--urgente); font-size: 14px; }
@@ -4924,7 +5012,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   /* ===== v7.1: Feed de novidades ===== */
   .nov-header { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
   .nov-filtros { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
-  .chip-f { font-size: 11.5px; font-weight: 700; padding: 7px 14px; border-radius: 20px; border: 1.5px solid var(--line); background: #fff; color: var(--cinza); cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.12s; }
+  .chip-f { font-size: 11.5px; font-weight: 700; padding: 7px 14px; border-radius: 20px; border: 1.5px solid var(--line); background: #fff; color: var(--cinza); cursor: pointer; font-family: 'Manrope', sans-serif; transition: all 0.12s; }
   .chip-f:hover { border-color: var(--gold); }
   .chip-f.active { background: var(--preto); color: #fff; border-color: var(--preto); }
   .chip-triagem { border-color: var(--gold); color: var(--gold-dark); }
@@ -4968,10 +5056,10 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   /* ===== v7.2: modos, timeline, giro ===== */
   .modo-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
-  .modo-tab { flex: 1; padding: 12px; border: 1.5px solid var(--line); background: #fff; border-radius: 10px; font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 14px; color: var(--cinza); cursor: pointer; transition: all 0.15s; }
+  .modo-tab { flex: 1; padding: 12px; border: 1.5px solid var(--line); background: #fff; border-radius: 10px; font-family: 'Manrope', sans-serif; font-weight: 700; font-size: 14px; color: var(--cinza); cursor: pointer; transition: all 0.15s; }
   .modo-tab:hover { border-color: var(--gold); }
   .modo-tab.active { background: var(--preto); color: #fff; border-color: var(--preto); }
-  .pesq-select { padding: 14px 18px; border: 1.5px solid var(--line); border-radius: 30px; font-family: 'DM Sans', sans-serif; font-size: 14px; color: var(--preto); background: #fff; cursor: pointer; }
+  .pesq-select { padding: 14px 18px; border: 1.5px solid var(--line); border-radius: 30px; font-family: 'Manrope', sans-serif; font-size: 14px; color: var(--preto); background: #fff; cursor: pointer; }
   .pesq-select:focus { outline: none; border-color: var(--gold); }
 
   .fase-atual { background: var(--preto); color: #fff; border-radius: 10px; padding: 14px 18px; margin-bottom: 18px; font-size: 14.5px; line-height: 1.5; }
@@ -4988,7 +5076,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   .giro-data { font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; color: var(--cinza); margin-bottom: 16px; }
   .giro-grupo { margin-bottom: 24px; }
-  .giro-gtit { font-family: 'DM Sans', sans-serif; font-weight: 800; font-size: 15px; color: var(--preto); padding: 8px 0 8px 14px; border-left: 4px solid var(--gold); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .giro-gtit { font-family: 'Manrope', sans-serif; font-weight: 800; font-size: 15px; color: var(--preto); padding: 8px 0 8px 14px; border-left: 4px solid var(--gold); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
   .giro-bola { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
   .giro-cont { font-size: 12px; color: var(--cinza); font-weight: 700; }
   .giro-card { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }
@@ -5000,7 +5088,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   /* ===== v7.3: selos, grupos, datas, ficha ===== */
   .grupo { background:#fff; border:1px solid var(--line); border-radius:14px; margin-bottom:18px; overflow:hidden; }
   .grupo-head { padding:14px 18px; background:var(--gold-pale); display:flex; align-items:center; gap:12px; border-bottom:1px solid var(--line); }
-  .grupo-head .gnome { font-family:'Cormorant Garamond',serif; font-size:19px; font-weight:700; flex:1; color:var(--preto); }
+  .grupo-head .gnome { font-family:'Fraunces',serif; font-size:19px; font-weight:700; flex:1; color:var(--preto); }
   .grupo-head .gcount { font-size:11px; color:var(--gold-dark); font-weight:700; background:#fff; padding:3px 10px; border-radius:20px; }
   .grupo-head .g-ver { font-size:11px; color:var(--gold-dark); font-weight:700; margin-left:6px; }
   .grupo-head[onclick]:hover { background:#ece3cf; }
@@ -5113,13 +5201,14 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
 <script>
   // ===== v8 (Onda 1): OMNIBOX + FEED FOCO/MERCADO + SCORE DE URGENCIA =====
-  // Constantes de integracao com sistema de marketing
-  const PIPELINE_ENDPOINT = 'https://silvapinto-comercial.onrender.com/marketing/pipeline/criar-externo';
-  // TODO: preencher quando tiver a rota do endpoint de concursos do marketing
-  const CONCURSOS_MKT_ENDPOINT = '';
+  // Integracao com o comercial: o front fala SO com o proprio painel
+  // (POST /api/pipeline/enviar) - a ponte pro comercial e server-side.
 
-  const PRIO_COR = { urgente: '#c0392b', importante: '#BB904C', naourgente: '#2e9e5b' };
-  const PRIO_LABEL = { urgente: 'Urgente', importante: 'Importante', naourgente: 'Nao urgente' };
+  const PRIO_COR = { urgente: 'var(--urgente, #c0392b)', importante: 'var(--importante, #b07010)', naourgente: 'var(--naourgente, #2d7a4f)' };
+  // Vocabulario unificado com o pipeline do comercial: la a prioridade do card
+  // e alta/media/baixa (classe de servico) - aqui nao pode ser outro trio com
+  // outros nomes. As chaves internas ficam por compatibilidade de banco.
+  const PRIO_LABEL = { urgente: 'Prioridade alta', importante: 'Prioridade media', naourgente: 'Prioridade baixa' };
   const PRIO_ORDEM = ['urgente','importante','naourgente'];
   const TAG_CSS = { gabarito:'t-gabarito', recurso:'t-recurso', fase:'t-fase', nomeacao:'t-nomeacao', inscricao:'t-inscricao', busca:'t-recurso' };
 
@@ -5387,7 +5476,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   async function gerarDeGiro(nome, obs) {
     const payload = { titulo: nome, descricao: obs||'', tipo:'operacional', link:'' };
     try {
-      const r = await fetch(PIPELINE_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const r = await fetch('/api/pipeline/enviar', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       toast(r.ok ? 'Enviado ao pipeline' : 'Erro ao enviar');
     } catch(e) { toast('Erro: '+e.message); }
   }
@@ -5395,7 +5484,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
   async function gerarDeRelatorio(nome) {
     const payload = { titulo: nome, descricao: _ultimoRelatorio ? (_ultimoRelatorio.leitura_estrategica||'') : '', tipo:'operacional', link:'' };
     try {
-      const r = await fetch(PIPELINE_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const r = await fetch('/api/pipeline/enviar', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       toast(r.ok ? 'Enviado ao pipeline de conteudo' : 'Erro ao enviar');
     } catch(e) { toast('Erro: '+e.message); }
   }
@@ -5434,7 +5523,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     const c = r.concurso || {};
     let raiox = r.raiox;
     const novidades = r.novidades || [];
-    const PRIO_COR = { urgente:'#c0392b', importante:'#BB904C', naourgente:'#2e9e5b' };
+    const PRIO_COR = { urgente:'var(--urgente, #c0392b)', importante:'var(--importante, #b07010)', naourgente:'var(--naourgente, #2d7a4f)' };
     const cor = PRIO_COR[c.prioridade] || PRIO_COR.importante;
 
     // v7.3.1: se nao tem Raio-X salvo, pesquisa automaticamente UMA vez e salva
@@ -5508,6 +5597,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
         (c.radar_enviado_em
           ? '<button class="pesq-btn alt" onclick="enviarRadar('+concursoId+')" title="Enviado em '+fmtData(c.radar_enviado_em)+'">&#10003; No Radar &middot; reenviar</button>'
           : '<button class="pesq-btn alt" onclick="enviarRadar('+concursoId+')">Enviar ao RADAR</button>') +
+        (c.radar_concurso_id
+          ? '<a class="pesq-btn alt" style="text-decoration:none" href="__COMERCIAL_BASE__/concursos/'+c.radar_concurso_id+'" target="_blank" rel="noopener" title="Abrir a ficha canonica no sistema comercial">Ficha no comercial &#8599;</a>'
+          : '') +
       '</div>' +
       '<div class="ficha-secoes">' +
         '<div class="ficha-col"><h3 class="serif ficha-h">Raio-X</h3>'+raioxHtml+'</div>' +
@@ -5748,7 +5840,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '<div class="ficha-tit"><h3 class="serif">'+esc(c.nome)+'</h3>' +
         '<div class="meta">Banca '+esc(c.banca||'-')+' &middot; '+esc(c.vagas||'-')+' vagas &middot; '+c.noticias.length+' noticia(s)</div></div>' +
         (novas > 0 ? '<span class="novelty"><span class="dot"></span> '+novas+' novas</span>' : '') +
-        '<button class="stage-dot" title="'+PRIO_LABEL[c.prioridade]+'" style="background:'+cor+'" onclick="event.stopPropagation();ciclarPrio('+c.id+',this)"></button>' +
+        '<button class="stage-dot" title="'+PRIO_LABEL[c.prioridade]+' &middot; clique para mudar" data-prio="'+esc(c.prioridade||'importante')+'" style="background:'+cor+'" onclick="event.stopPropagation();ciclarPrio('+c.id+',this)"></button>' +
         '</div><div class="ficha-body">'+nots+'</div></div>';
     }
 
@@ -5765,9 +5857,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(!temasHtml) temasHtml = '<div style="color:var(--cinza);font-size:12px;padding:14px 0">Nenhum tema transversal recente.</div>';
 
     cont.innerHTML = '<div class="tela active">' +
-      '<div class="legenda"><span><span class="sq" style="background:var(--urgente)"></span>Urgente</span>' +
-      '<span><span class="sq" style="background:var(--importante)"></span>Importante</span>' +
-      '<span><span class="sq" style="background:var(--naourgente)"></span>Nao urgente</span>' +
+      '<div class="legenda"><span><span class="sq" style="background:var(--urgente)"></span>Prioridade alta</span>' +
+      '<span><span class="sq" style="background:var(--importante)"></span>Prioridade media</span>' +
+      '<span><span class="sq" style="background:var(--naourgente)"></span>Prioridade baixa</span>' +
       '<button class="add-btn" style="margin-left:auto;padding:8px 16px;font-size:11px" onclick="coletarTudo()">&#8635; Coletar agora</button></div>' +
       '<div class="split"><div class="split-main">'+fichasHtml+'</div>' +
       '<aside class="side"><h4 class="serif">Temas do momento</h4>' +
@@ -5842,6 +5934,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
     if(chip) chip.textContent = (encaixes.length + novos.length);
 
     cont.innerHTML =
+      '<div style="margin-bottom:14px"><input class="pesq-input" style="width:100%;box-sizing:border-box;padding:11px 16px;font-size:14px" type="search" placeholder="Buscar na caixa de entrada (titulo, concurso, sugestao)..." oninput="filtrarTriagem(this.value)" autocomplete="off"></div>' +
       '<div class="inbox-grupo"><h3 class="serif">Encaixes a confirmar <span class="nav-badge">'+encaixes.length+'</span></h3>' +
       '<div class="gsub">Casos ambiguos: a coleta nao teve certeza sozinha. Confirme para entrarem na ficha.</div>'+encHtml+'</div>' +
       '<div class="inbox-grupo"><h3 class="serif">Concursos novos sugeridos <span class="nav-badge cinza">'+novos.length+'</span></h3>' +
@@ -5849,6 +5942,15 @@ HTML_INDEX = r"""<!DOCTYPE html>
       '<div class="inbox-grupo"><h3 class="serif">Auto-encaixes recentes <span class="nav-badge cinza">'+autos.length+'</span></h3>' +
       '<div class="gsub">Encaixados sozinhos pela coleta nos ultimos 7 dias. Errou? Desfazer devolve pra fila.</div>'+autoHtml+'</div>' +
       '<div style="margin-top:20px"><button class="add-btn" onclick="rodarTriagemRetroativa()">Rodar triagem retroativa (acervo antigo)</button></div>';
+  }
+  // Busca da caixa de entrada: recorte instantaneo sobre os tres grupos,
+  // sem sair do modo triagem (uma decisao de cada vez, mas achavel).
+  function filtrarTriagem(q) {
+    const nq = String(q||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
+    document.querySelectorAll('.triagem-card').forEach(function(card){
+      const txt = (card.textContent||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+      card.style.display = (!nq || txt.indexOf(nq) >= 0) ? '' : 'none';
+    });
   }
   async function desfazerAutoEnc(aeId) {
     const r = await POST('/api/auto-encaixes/'+aeId+'/desfazer');
@@ -5945,6 +6047,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         '<div class="add-bar" style="margin:0">' +
           '<button class="add-btn" onclick="abrirModal()">+ Acompanhar novo</button>' +
           barra +
+          '<a class="add-btn" style="background:#fff;color:var(--preto);border:1px solid var(--gold);text-decoration:none" href="__COMERCIAL_BASE__/radar#lente=intel" target="_blank" rel="noopener" title="O pipeline de certames e um so e mora no comercial - aqui e a lente de inteligencia">&#129517; Pipeline unificado &#8599;</a>' +
         '</div>' +
         '<div class="mc-ordem"><span style="font-size:11px;color:var(--cinza);font-weight:700">Ordenar:</span>' +
           '<select class="pesq-select" style="padding:8px 14px;font-size:12px" onchange="_ordemConcursos=this.value;desenharMeusConcursos()">' +
@@ -6042,20 +6145,19 @@ HTML_INDEX = r"""<!DOCTYPE html>
   function toggleFicha(head) { head.closest('.ficha').classList.toggle('aberta'); }
 
   async function ciclarPrio(cid, btn) {
-    const cur = PRIO_ORDEM.find(p=>PRIO_COR[p]===btn.style.background.includes(PRIO_COR[p])) || 'importante';
-    // Detecta prioridade atual pelo titulo
-    const curTitle = (btn.title||'').toLowerCase();
-    let idx = PRIO_ORDEM.findIndex(p=>curTitle.includes(p));
+    // A prioridade atual vive num data-attribute do botao (os rotulos agora
+    // sao "Prioridade alta/media/baixa" e nao contem mais a chave interna).
+    let idx = PRIO_ORDEM.indexOf(btn.dataset.prio || '');
     if(idx<0) idx = 1;
     const nova = PRIO_ORDEM[(idx+1)%PRIO_ORDEM.length];
     const r = await POST('/api/concursos/'+cid+'/prioridade', {prioridade:nova});
     if(r.ok) {
       btn.style.background = PRIO_COR[nova];
       btn.title = PRIO_LABEL[nova];
+      btn.dataset.prio = nova;
       const head = btn.closest('.ficha-head');
       if(head) { PRIO_ORDEM.forEach(p=>head.classList.remove(p)); head.classList.add(nova); }
       toast('Prioridade: '+PRIO_LABEL[nova]);
-      // TODO: quando CONCURSOS_MKT_ENDPOINT estiver definido, atualizar etapa no marketing
     }
   }
 
@@ -6072,7 +6174,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
         tipo: 'operacional',
         link: String((item&&item.link)||'').trim(),
       };
-      const r = await fetch(PIPELINE_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const r = await fetch('/api/pipeline/enviar', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       if(r.ok) {
         await POST('/api/oportunidades/'+itemId+'/marcar_selecionado');
         if(item && item.concurso_id) POST('/api/concursos/'+item.concurso_id+'/marcar-pipeline', {});
@@ -6205,7 +6307,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 
   // v7.0.4: sync completo SINCRONO - reporta resultado real de cada envio
   async function sincronizarMarketing() {
-    if(!confirm('Enviar todos os concursos monitorados para a pagina Concursos do sistema de marketing?\n\nCada concurso vira/atualiza um card na etapa da sua cor (Urgente / Importante / Nao Urgente).')) return;
+    if(!confirm('Enviar todos os concursos monitorados para o pipeline unificado do comercial?\n\nCada concurso vira/atualiza um card com a prioridade da sua cor (alta / media / baixa).')) return;
     toast('Sincronizando... aguarde, estou confirmando cada envio', 15000);
     const r = await POST('/api/concursos/sincronizar-marketing');
     if(r.ok) {
@@ -6274,6 +6376,9 @@ HTML_INDEX = r"""<!DOCTYPE html>
 </body>
 </html>
 """
+
+# Resolve no boot a base do comercial dentro do HTML (link do tokens.css)
+HTML_INDEX = HTML_INDEX.replace("__COMERCIAL_BASE__", _comercial_base())
 
 
 if __name__ == "__main__":
