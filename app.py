@@ -23,8 +23,10 @@ from pathlib import Path
 from flask import Flask, request, jsonify, Response
 import anthropic
 
+from redes import init_redes
+
 # Config
-APP_VERSION = "v8.2.0-onda3-triagem"
+APP_VERSION = "v8.3.0-redes-instagram"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -4738,6 +4740,7 @@ def health():
 
 # Init
 init_db()
+init_redes(app, db_path=DB_PATH, conn_factory=db_conn)
 _ensure_metricas_column()
 _ensure_selecionado_column()
 _ensure_triagem_columns()
@@ -4833,6 +4836,11 @@ HTML_INDEX = r"""<!DOCTYPE html>
   }
   .mainnav button:hover { color: #fff; }
   .mainnav button.active { color: var(--gold); border-bottom-color: var(--gold); }
+  .mainnav .navlink {
+    margin-left: auto; color: rgba(255,255,255,0.6); font-family: 'Manrope', sans-serif; font-size: 12.5px;
+    font-weight: 700; padding: 13px 18px; letter-spacing: 0.4px; text-decoration: none; border-bottom: 3px solid transparent;
+  }
+  .mainnav .navlink:hover { color: var(--gold); }
   .nav-badge { font-size: 10px; background: var(--urgente); color: #fff; padding: 1px 7px; border-radius: 9px; font-weight: 800; }
   .nav-badge.cinza { background: rgba(255,255,255,0.18); }
 
@@ -5162,6 +5170,7 @@ HTML_INDEX = r"""<!DOCTYPE html>
 <nav class="mainnav">
   <button class="active" onclick="showTela('pesquisa', this)">Not&iacute;cias</button>
   <button onclick="showTela('gerenciar', this)">Meus concursos</button>
+  <a class="navlink" href="/redes">Redes</a>
 </nav>
 
 <!-- conte&#250;do das telas vem na parte 2 -->
