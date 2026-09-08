@@ -423,7 +423,13 @@ CREATE TABLE IF NOT EXISTS sugestoes_concurso (
     ultima_evidencia TEXT,
     primeira_aparicao TEXT NOT NULL,
     ultima_aparicao TEXT NOT NULL,
-    status TEXT DEFAULT 'pendente'
+    status TEXT DEFAULT 'pendente',
+    -- Regra do descarte: uma sugestao descartada so volta a caixa quando chega
+    -- evidencia de movimento relevante do certame numa etapa DIFERENTE da que
+    -- estava na noticia no momento do descarte.
+    etapa_evidencia TEXT,   -- etapa da ultima evidencia (classificador de novidade)
+    etapa_descarte TEXT,    -- etapa congelada no clique de Ignorar
+    descartado_em TEXT      -- quando o usuario descartou (NULL = nunca)
 );
 CREATE INDEX IF NOT EXISTS idx_sugest_status ON sugestoes_concurso(status);
 
@@ -573,6 +579,10 @@ def _ensure_v8_columns():
         # devolvido pelo inteligencia-externa - permite linkar a FICHA CANONICA
         # ({base}/concursos/{id}) direto daqui
         ("concursos_monitorados", "radar_concurso_id", "INTEGER"),
+        # Regra do descarte na triagem (ver CREATE TABLE sugestoes_concurso)
+        ("sugestoes_concurso", "etapa_evidencia", "TEXT"),
+        ("sugestoes_concurso", "etapa_descarte", "TEXT"),
+        ("sugestoes_concurso", "descartado_em", "TEXT"),
     ]
     try:
         with db_conn() as conn:
@@ -1906,13 +1916,15 @@ def _classificar_tipo_novidade(item):
 
     titulo = (item.get("titulo") or "").lower()
     desc = (item.get("descricao") or "").lower()
-    txt = f"{titulo} {desc}"
+    # espaco na frente permite ancorar termos em inicio de palavra: " liminar"
+    # nao casa dentro de "resultado preliminar" (que e gabarito, nao juridico)
+    txt = f" {titulo} {desc}"
 
     def tem(*termos):
         return any(t in txt for t in termos)
 
     # 1. Jurisprudencia
-    if tem("liminar", "sentenca", "decisao judicial", "mandado de seguranca", "stf", "stj",
+    if tem(" liminar", "sentenca", "decisao judicial", "mandado de seguranca", "stf", "stj",
            "tj-", "tribunal", "justica determinou", "acao judicial", "desembargador", "acordao",
            "decisao da justica", "judicializ"):
         return "jurisprudencia"
@@ -2237,8 +2249,25 @@ def triar_itens(item_ids=None):
     return stats
 
 
+# Etapas que contam como MOVIMENTO RELEVANTE do certame para ressuscitar uma
+# sugestao descartada: divulgacao de edital, inscricoes, prova, resultado,
+# convocacao de fase, nomeacao. Ruido pre-edital ("previsto/autorizado"),
+# jurisprudencia, concorrencia e o fallback generico NAO trazem de volta.
+ETAPAS_RELEVANTES = {
+    "edital_aberto", "inscricoes_abertas", "inscricoes_encerradas",
+    "prova_em_breve", "gabarito", "convocacao", "nomeacao",
+}
+
+
 def _registrar_sugestao_concurso(conn, item, agora):
-    """Registra/incrementa um concurso candidato a monitoramento (apareceu sem encaixe)."""
+    """Registra/incrementa um concurso candidato a monitoramento (apareceu sem encaixe).
+
+    - O casamento com sugestoes existentes e por nome normalizado OU similar
+      ("PM-RJ" vs "PMERJ"): variacao de grafia nao cria sugestao duplicada.
+    - Regra do descarte: sugestao com status='ignorado' so volta a 'pendente'
+      quando a nova evidencia e um movimento relevante do certame (edital,
+      inscricoes, prova, resultado, convocacao, nomeacao) numa etapa DIFERENTE
+      da registrada no momento do descarte. Fora disso, continua descartada."""
     nome_exib = (item.get("concurso") or item.get("orgao") or "").strip()
     if not nome_exib or len(nome_exib) < 3:
         return
@@ -2247,24 +2276,52 @@ def _registrar_sugestao_concurso(conn, item, agora):
         return
     banca = (item.get("banca") or "").strip()
     evidencia = (item.get("titulo") or "")[:200]
+    etapa = _classificar_tipo_novidade(item)
     try:
         existing = conn.execute(
-            "SELECT id, vezes FROM sugestoes_concurso WHERE nome_normalizado = ?",
+            "SELECT id, vezes, status, etapa_descarte FROM sugestoes_concurso WHERE nome_normalizado = ?",
             (nome_norm,)
         ).fetchone()
+        if not existing:
+            # sem match exato: procura variacao de grafia do mesmo concurso
+            for r in conn.execute(
+                "SELECT id, vezes, status, etapa_descarte, nome_exibicao FROM sugestoes_concurso"
+            ).fetchall():
+                rd = _dict_from_row(r)
+                if _nomes_sao_similares(nome_exib, rd.get("nome_exibicao") or ""):
+                    existing = r
+                    break
         if existing:
             d = _dict_from_row(existing)
-            conn.execute(
-                "UPDATE sugestoes_concurso SET vezes = vezes + 1, ultima_aparicao = ?, "
-                "ultima_evidencia = ?, banca = COALESCE(NULLIF(banca,''), ?) WHERE id = ?",
-                (agora, evidencia, banca, d["id"])
-            )
+            if (d.get("status") or "pendente") == "ignorado":
+                etapa_descarte = (d.get("etapa_descarte") or "").strip()
+                if etapa in ETAPAS_RELEVANTES and etapa != etapa_descarte:
+                    # movimento novo em etapa diferente: volta pra caixa de entrada
+                    conn.execute(
+                        "UPDATE sugestoes_concurso SET status='pendente', vezes = vezes + 1, "
+                        "ultima_aparicao = ?, ultima_evidencia = ?, etapa_evidencia = ?, "
+                        "banca = COALESCE(NULLIF(banca,''), ?) WHERE id = ?",
+                        (agora, evidencia, etapa, banca, d["id"])
+                    )
+                    log.info("sugestao %s voltou a triagem: etapa '%s' (descartada na etapa '%s')",
+                             d["id"], etapa, etapa_descarte or "?")
+                else:
+                    # mesma etapa do descarte (ou ruido): segue descartada
+                    conn.execute("UPDATE sugestoes_concurso SET ultima_aparicao = ? WHERE id = ?",
+                                 (agora, d["id"]))
+            else:
+                conn.execute(
+                    "UPDATE sugestoes_concurso SET vezes = vezes + 1, ultima_aparicao = ?, "
+                    "ultima_evidencia = ?, etapa_evidencia = ?, banca = COALESCE(NULLIF(banca,''), ?) "
+                    "WHERE id = ?",
+                    (agora, evidencia, etapa, banca, d["id"])
+                )
         else:
             conn.execute(
                 "INSERT INTO sugestoes_concurso "
-                "(nome_normalizado, nome_exibicao, banca, vezes, ultima_evidencia, primeira_aparicao, ultima_aparicao, status) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, 'pendente')",
-                (nome_norm, nome_exib, banca, evidencia, agora, agora)
+                "(nome_normalizado, nome_exibicao, banca, vezes, ultima_evidencia, primeira_aparicao, ultima_aparicao, status, etapa_evidencia) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, 'pendente', ?)",
+                (nome_norm, nome_exib, banca, evidencia, agora, agora, etapa)
             )
     except Exception as e:
         log.warning("_registrar_sugestao_concurso erro: %s", e)
@@ -2487,6 +2544,10 @@ def _zeladoria(origem="cron"):
         resultado["duplicados"] = _limpar_duplicados_core()
     except Exception as e:
         log.warning("zeladoria/limpar-duplicados falhou: %s", e)
+    try:
+        resultado["sugestoes_duplicadas"] = _mesclar_sugestoes_duplicadas_core()
+    except Exception as e:
+        log.warning("zeladoria/mesclar-sugestoes falhou: %s", e)
     try:
         resultado["dedupe"] = _dedupe_retroativa_core()
     except Exception as e:
@@ -3202,12 +3263,95 @@ def _limpar_duplicados_core():
         return {"erro": str(e)}
 
 
+def _mesclar_sugestoes_duplicadas_core():
+    """Mescla sugestoes de concurso duplicadas (mesmo certame com grafias
+    diferentes: 'PM-RJ' vs 'PMERJ'). Mantem a mais antiga; soma aparicoes e
+    fica com a evidencia mais recente.
+
+    O status do grupo respeita a regra do descarte:
+      - alguma 'monitorado'  -> monitorado (ja virou concurso acompanhado)
+      - alguma 'ignorado'    -> o descarte prevalece, EXCETO se outra linha do
+        grupo trouxe, DEPOIS do descarte, evidencia de etapa relevante e
+        diferente da etapa congelada -> volta a 'pendente'
+      - caso contrario       -> pendente
+    """
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, nome_normalizado, nome_exibicao, banca, vezes, ultima_evidencia, "
+                "primeira_aparicao, ultima_aparicao, status, etapa_evidencia, etapa_descarte, descartado_em "
+                "FROM sugestoes_concurso ORDER BY id ASC"
+            ).fetchall()
+            sugs = [_dict_from_row(r) for r in rows]
+
+        grupos = []
+        usados = set()
+        for i, s in enumerate(sugs):
+            if s["id"] in usados:
+                continue
+            grupo = [s]
+            usados.add(s["id"])
+            for s2 in sugs[i + 1:]:
+                if s2["id"] in usados:
+                    continue
+                if (s.get("nome_normalizado") and s.get("nome_normalizado") == s2.get("nome_normalizado")) \
+                        or _nomes_sao_similares(s.get("nome_exibicao") or "", s2.get("nome_exibicao") or ""):
+                    grupo.append(s2)
+                    usados.add(s2["id"])
+            if len(grupo) > 1:
+                grupos.append(grupo)
+
+        mescladas = 0
+        with db_conn() as conn:
+            for grupo in grupos:
+                destino = grupo[0]
+                vezes = sum(int(g.get("vezes") or 0) for g in grupo)
+                primeira = min((g.get("primeira_aparicao") or "") for g in grupo) or destino.get("primeira_aparicao")
+                recente = max(grupo, key=lambda g: (g.get("ultima_aparicao") or ""))
+                banca = next((g.get("banca") for g in grupo if (g.get("banca") or "").strip()), "")
+                ignorada = next((g for g in grupo if g.get("status") == "ignorado"), None)
+                if any(g.get("status") == "monitorado" for g in grupo):
+                    status = "monitorado"
+                elif ignorada:
+                    status = "ignorado"
+                    etapa_rec = (recente.get("etapa_evidencia") or "").strip()
+                    depois = (recente.get("ultima_aparicao") or "") > (ignorada.get("descartado_em") or "")
+                    if recente is not ignorada and depois and etapa_rec in ETAPAS_RELEVANTES \
+                            and etapa_rec != (ignorada.get("etapa_descarte") or ""):
+                        status = "pendente"
+                else:
+                    status = "pendente"
+                conn.execute(
+                    "UPDATE sugestoes_concurso SET vezes=?, primeira_aparicao=?, ultima_aparicao=?, "
+                    "ultima_evidencia=?, etapa_evidencia=?, banca=?, status=?, etapa_descarte=?, descartado_em=? "
+                    "WHERE id=?",
+                    (vezes, primeira, recente.get("ultima_aparicao"), recente.get("ultima_evidencia"),
+                     recente.get("etapa_evidencia"), banca, status,
+                     (ignorada or {}).get("etapa_descarte"), (ignorada or {}).get("descartado_em"),
+                     destino["id"])
+                )
+                for g in grupo[1:]:
+                    conn.execute("DELETE FROM sugestoes_concurso WHERE id=?", (g["id"],))
+                    mescladas += 1
+
+        if mescladas:
+            log.info("mesclar-sugestoes -> %d grupos, %d duplicatas mescladas", len(grupos), mescladas)
+        return {"grupos_sugestoes": len(grupos), "sugestoes_mescladas": mescladas}
+    except Exception as e:
+        log.error("_mesclar_sugestoes_duplicadas_core erro: %s", e)
+        return {"erro": str(e)}
+
+
 @app.route("/api/concursos/limpar-duplicados", methods=["POST"])
 def api_concursos_limpar_duplicados():
-    """v7.0.2: rota da Manutencao - delega pro nucleo reutilizavel."""
+    """v7.0.2: rota da Manutencao - delega pros nucleos reutilizaveis
+    (concursos monitorados + sugestoes da triagem)."""
     stats = _limpar_duplicados_core()
     if "erro" in stats:
         return jsonify(stats), 500
+    stats_sug = _mesclar_sugestoes_duplicadas_core()
+    if "erro" not in stats_sug:
+        stats.update(stats_sug)
     return jsonify({"ok": True, **stats})
 
 
@@ -3309,10 +3453,14 @@ def api_inbox():
             ).fetchall()
             encaixes = [_dict_from_row(r) for r in erows]
 
-            # Sugestoes de novos concursos (apareceram >= 2x, ainda nao monitorados)
+            # Sugestoes de novos concursos (apareceram >= 2x, ainda nao monitorados).
+            # Uma sugestao ja descartada que ressuscitou por etapa nova aparece
+            # mesmo com vezes < 2: o movimento relevante e evidencia suficiente.
             srows = conn.execute(
-                "SELECT id, nome_exibicao, banca, vezes, ultima_evidencia "
-                "FROM sugestoes_concurso WHERE status = 'pendente' AND vezes >= 2 "
+                "SELECT id, nome_exibicao, banca, vezes, ultima_evidencia, "
+                "etapa_evidencia, etapa_descarte, descartado_em "
+                "FROM sugestoes_concurso WHERE status = 'pendente' "
+                "AND (vezes >= 2 OR descartado_em IS NOT NULL) "
                 "ORDER BY vezes DESC LIMIT 50"
             ).fetchall()
             novos = [_dict_from_row(r) for r in srows]
@@ -3485,11 +3633,30 @@ def api_sugestao_monitorar(sug_id):
 
 @app.route("/api/sugestoes/<int:sug_id>/ignorar", methods=["POST"])
 def api_sugestao_ignorar(sug_id):
-    """Ignora uma sugestao de concurso (nao aparece mais na caixa de entrada)."""
+    """Descarta uma sugestao de concurso, congelando a etapa da evidencia atual.
+
+    A sugestao so volta a caixa de entrada se uma varredura futura trouxer
+    movimento relevante do certame numa etapa DIFERENTE da congelada aqui
+    (ver _registrar_sugestao_concurso)."""
     try:
+        agora = datetime.now(timezone.utc).isoformat()
         with db_conn() as conn:
-            conn.execute("UPDATE sugestoes_concurso SET status='ignorado' WHERE id=?", (sug_id,))
-        return jsonify({"ok": True, "id": sug_id})
+            row = conn.execute(
+                "SELECT etapa_evidencia, ultima_evidencia FROM sugestoes_concurso WHERE id=?",
+                (sug_id,)
+            ).fetchone()
+            etapa = ""
+            if row:
+                d = _dict_from_row(row)
+                etapa = (d.get("etapa_evidencia") or "").strip()
+                if not etapa:
+                    # sugestao antiga, sem etapa gravada: classifica pela evidencia
+                    etapa = _classificar_tipo_novidade({"titulo": d.get("ultima_evidencia") or ""})
+            conn.execute(
+                "UPDATE sugestoes_concurso SET status='ignorado', etapa_descarte=?, descartado_em=? WHERE id=?",
+                (etapa, agora, sug_id)
+            )
+        return jsonify({"ok": True, "id": sug_id, "etapa_descarte": etapa})
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
@@ -5918,11 +6085,23 @@ HTML_INDEX = r"""<!DOCTYPE html>
     }
     if(!encHtml) encHtml = '<div style="color:var(--cinza);font-size:13px">Nenhum encaixe pendente.</div>';
 
+    const ETAPA_LABEL = {edital_aberto:'Edital publicado', inscricoes_abertas:'Inscricoes abertas',
+      inscricoes_encerradas:'Inscricoes encerradas', prova_em_breve:'Prova marcada',
+      gabarito:'Gabarito/resultado', convocacao:'Convocacao de etapa', nomeacao:'Nomeacao/posse',
+      concurso_previsto:'Previsto/autorizado', concurso_andamento:'Em andamento',
+      jurisprudencia:'Jurisprudencia', concorrentes:'Concorrencia'};
     let novHtml = '';
     for(const n of novos) {
+      const etq = n.etapa_evidencia ? ' &middot; <b>'+esc(ETAPA_LABEL[n.etapa_evidencia]||n.etapa_evidencia)+'</b>' : '';
+      // descartado antes e ressuscitou: diz POR QUE voltou (etapa mudou)
+      const voltou = n.descartado_em
+        ? '<div class="tc-sug" style="color:var(--gold-dark)">&#8635; Voltou: voce descartou em '+esc((n.descartado_em||'').slice(8,10)+'/'+(n.descartado_em||'').slice(5,7))+
+          (n.etapa_descarte?' (etapa: '+esc(ETAPA_LABEL[n.etapa_descarte]||n.etapa_descarte)+')':'')+
+          ' e agora ha movimento novo'+(n.etapa_evidencia?': '+esc(ETAPA_LABEL[n.etapa_evidencia]||n.etapa_evidencia):'')+'</div>'
+        : '';
       novHtml += '<div class="triagem-card sug-monit" data-id="sug-'+n.id+'">' +
         '<div class="tc-main"><div class="tc-tit">'+esc(n.nome_exibicao)+'</div>' +
-        '<div class="tc-sug">Apareceu <b>'+n.vezes+'x</b> &middot; '+esc(n.ultima_evidencia||'')+'</div></div>' +
+        '<div class="tc-sug">Apareceu <b>'+n.vezes+'x</b>'+etq+' &middot; '+esc(n.ultima_evidencia||'')+'</div>' + voltou + '</div>' +
         '<div class="tc-acts"><button class="btn-conf" onclick="monitorarSug('+n.id+')">Monitorar</button>' +
         '<button class="btn-rej" onclick="ignorarSug('+n.id+')">Ignorar</button></div></div>';
     }
