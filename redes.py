@@ -1015,38 +1015,6 @@ def _checar_cron():
     return None
 
 
-# Leitura de perfis publicos de concorrentes (Business Discovery), so leitura.
-# A chave de acesso fica fora do repo; aqui vai apenas o hash SHA-256 dela.
-CONCORRENTES_CHAVE_SHA256 = "8c39180c6c5f2cacdf8a3251fd83294510d793e5827971c13ad47bb31d09cad0"
-
-
-@bp.route("/api/redes/concorrente")
-def api_concorrente():
-    chave = request.headers.get("X-Chave") or ""
-    if not hmac.compare_digest(hashlib.sha256(chave.encode()).hexdigest(), CONCORRENTES_CHAVE_SHA256):
-        return jsonify({"erro": "nao autorizado"}), 403
-    u = (request.args.get("u") or "").strip().lstrip("@")
-    if not u or len(u) > 30 or not all(ch.isalnum() or ch in "._" for ch in u):
-        return jsonify({"erro": "username invalido"}), 400
-    try:
-        n = max(1, min(int(request.args.get("n") or 25), 50))
-    except ValueError:
-        n = 25
-    after = (request.args.get("after") or "").strip()
-    conta = conta_ativa()
-    if not conta:
-        return jsonify({"erro": "sem conta conectada"}), 409
-    media = f"media.limit({n})" + (f".after({after})" if after and all(ch.isalnum() or ch in "-_=" for ch in after) else "")
-    campos = (f"business_discovery.username({u}){{username,name,followers_count,media_count,"
-              f"{media}{{id,media_type,media_product_type,permalink,media_url,thumbnail_url,"
-              f"timestamp,like_count,comments_count,caption}}}}")
-    try:
-        body = graph_get(conta["ig_user_id"], conta["page_token"], {"fields": campos})
-    except GraphError as e:
-        return jsonify({"erro": str(e)}), 502
-    return jsonify(body.get("business_discovery") or {})
-
-
 @bp.route("/api/redes/status")
 def api_status():
     conta = conta_ativa()
