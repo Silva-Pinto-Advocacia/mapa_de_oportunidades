@@ -41,8 +41,9 @@ Câmbio usado: R$ 5,40 por US$.
 
 | Parte | Tokens | % do custo |
 |---|---|---|
-| Adendo do lead + histórico, SEM cache | ~6.400 | 46% |
-| Prompt fixo lido do cache | ~54.900 | 40% |
+| Última mensagem do lead + contexto interno (adendo, checklist, horário), SEM cache | ~6.400 | 46% |
+| (o histórico anterior já é relido do cache, junto com o prompt fixo) | | |
+| Prompt fixo + histórico lidos do cache | ~54.900 | 40% |
 | Gravação de cache | ~1.000 | 9% |
 | Saída | ~144 | 5% |
 
@@ -104,8 +105,8 @@ sem mensagem enviada.
 | # | Corte | US$/dia | R$/mês |
 |---|---|---|---|
 | 0 | Corrigir `PRECO` do claude-sonnet-5 para 2/10 (sem economia; sem isso toda medição sai 50% inflada) | — | — |
-| 1 | Histórico e adendo atrás do cache (hoje 46% do custo da chamada sem cache) | 2,70 | 437 |
-| 2 | Recusa do filtro: no máximo 1 nova geração, depois texto pronto + chamado à SDR | 1,00 | 162 |
+| 1 | Recusa do filtro: no máximo 1 nova geração, depois texto pronto + chamado à SDR (confirmado em 10/10: 9 gerações em 4 min, US$ 0,66 medidos, nenhuma mensagem enviada) | 1,00 | 162 |
+| 2 | Enxugar o contexto interno que vai a preço cheio em TODA chamada (adendo de 7,8–12 mil caracteres; meta: metade) | 1,00 | 162 |
 | 3 | Parar a IA em lead desqualificado/sem caso/prescrito (resposta pronta) | 0,80 | 130 |
 | 4 | Balões de autoridade/relatório/casos uma vez por conversa (estado no adendo) | 0,70 | 113 |
 | 5 | Assistente: fixar prefixo (grava ~10.700 tokens de cache por chamada e lê pouco) | 0,60 | 97 |
@@ -113,8 +114,8 @@ sem mensagem enviada.
 | 7 | Silenciar a Bia após a 1ª mensagem humana; tirar "Bia responder" de SDR/closer | 0,50 | 81 |
 | 8 | Não disparar o laço para "ok", reação e figurinha | 0,15 | 24 |
 
-Soma ≈ US$ 7/dia, com sobreposição: na prática 50–70% do gasto atual da API
-(≈ R$ 750–1.050/mês). Para comparação: Meta Ads ≈ R$ 8.000/mês e Claude Max R$ 1.100/mês.
+Soma ≈ US$ 5,3/dia, com sobreposição: na prática 40–55% do gasto atual da API
+(≈ R$ 600–850/mês). Para comparação: Meta Ads ≈ R$ 8.000/mês e Claude Max R$ 1.100/mês.
 
 ## 6. Método e limites
 
@@ -124,3 +125,19 @@ Soma ≈ US$ 7/dia, com sobreposição: na prática 50–70% do gasto atual da A
 * Parcelas de desperdício e papel da equipe são julgamento de leitura (21 leitores),
   não métrica do sistema; temas de erro contados por palavra-chave nos achados.
 * Somente leitura: nenhuma mensagem enviada, nada gravado no banco, sp_config não lido.
+
+## 7. Correção de 10/10 (dados com anatomia)
+
+* A primeira versão deste resumo dizia que o histórico ia sem cache. Os dados de hoje
+  mostram o contrário: o marcador de `_marcar_historico` funciona (retentativas da mesma
+  conversa releem o mesmo prefixo, sistema + histórico, e não gravam de novo), e os logs
+  do Render não registram "cache do histórico recusado" desde 03/10. Os ~6.400 tokens a
+  preço cheio são a última mensagem do lead mais o contexto interno que `_turnos` põe no
+  fim dela (adendo de 7,8–12 mil caracteres). O corte é encolher esse contexto, não cachear.
+* A primeira chamada depois de mais de 1 hora parada regrava o cache inteiro (~55–58 mil
+  tokens a 2×, janela de 1 h): ≈ US$ 0,23 real por regravação. Em 10/10, 4 das 12
+  chamadas do laço foram regravação. Num dia calmo isso pesa mais que as respostas.
+* Caso medido em 10/10, 12:47–12:51 UTC: lead de PMERJ 2014 respondeu o formulário; o filtro
+  barrou 9 gerações seguidas (6 "dinheiro_cedo", 3 "nao_conduziu_cartao"), nenhuma
+  mensagem saiu, terminou em "para_humano". Laço em `app/routes/sentinela_ops.py`
+  (eventos dinheiro_cedo ~l. 17447 e nao_conduziu_cartao ~l. 17586): 3 rodadas × 3 tentativas.
