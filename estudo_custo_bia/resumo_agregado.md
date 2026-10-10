@@ -37,14 +37,14 @@ Câmbio usado: R$ 5,40 por US$.
 | andamento | 51 | 0,15 | 2% |
 | resumo, rascunho_tecnico, djen, redes, frente | 142 | 0,14 | 2% |
 
-### Anatomia de uma chamada do laço (média, US$ ~0,028 real)
+### Anatomia de uma chamada do laço (média, US$ ~0,029 real)
 
 | Parte | Tokens | % do custo |
 |---|---|---|
-| Última mensagem do lead + contexto interno (adendo, checklist, horário), SEM cache | ~6.400 | 46% |
+| Última mensagem do lead + contexto interno (adendo, checklist, horário), SEM cache | ~6.400 | 44% |
 | (o histórico anterior já é relido do cache, junto com o prompt fixo) | | |
-| Prompt fixo + histórico lidos do cache | ~54.900 | 40% |
-| Gravação de cache | ~1.000 | 9% |
+| Prompt fixo + histórico lidos do cache | ~54.900 | 37% |
+| Gravação de cache (cache de 1 h, cobrada a 2x) | ~1.000 | 14% |
 | Saída | ~144 | 5% |
 
 Anatomia registrada (10/10): prompt de 124.545 caracteres, adendo de 11–12 mil, histórico
